@@ -1,0 +1,26 @@
+# Math example — minimal QGRE config
+# Demonstrates: even with scalar rewards, engine works (falls back to uniform advantages)
+
+model:
+  path: Qwen/Qwen3-1.7B
+  lora_rank: 8
+  lora_alpha: 16
+
+data:
+  train_files:
+    - data/math_train.parquet
+  max_prompt_length: 512
+  max_response_length: 1024
+  train_batch_size: 8
+
+algorithm:
+  mode: grpo
+  grpo:
+    n: 4
+    filter_groups: true
+  clip_ratio_low: 0.2
+  clip_ratio_high: 0.28
+
+training:
+  total_steps: 200
+  lr: 1.0e-5

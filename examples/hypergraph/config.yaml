@@ -1,0 +1,47 @@
+# Hypergraph decomposability — QGRE engine config
+# Domain: hypergraph-scan-v1 (the paper's experiment)
+
+model:
+  path: Qwen/Qwen3-8B
+  tokenizer_path: tokenizer/qwen3-8B-nothink
+  lora_rank: 16
+  lora_alpha: 32
+  load_in_4bit: false
+  fast_inference: true
+  gpu_memory_utilization: 0.45
+
+data:
+  train_files:
+    - data/tier_1_2.parquet
+  max_prompt_length: 3200
+  max_response_length: 2048
+  train_batch_size: 16
+
+algorithm:
+  mode: spo               # or "grpo"
+  spo:
+    lr: 0.1                # EMA learning rate for value tracker
+    n: 1                   # completions per prompt
+  grpo:
+    n: 8
+    filter_groups: true
+
+  clip_ratio_low: 0.2
+  clip_ratio_high: 0.28
+  loss_mode: kl_cov
+  kl_cov_ratio: 0.0002
+  llds_coef: 0.05
+  entropy_coeff: 0.001    # 0.0 on 16GB consumer GPU
+
+training:
+  total_steps: 800
+  lr: 5.0e-6
+  warmup_steps: 10
+  lr_scheduler: cosine
+  save_freq: 50
+  gradient_accumulation_steps: 1
+
+logging:
+  mlflow_experiment: hypergraph-scan-v1
+  completion_dir: output/completions
+  checkpoint_dir: output/checkpoints

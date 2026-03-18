@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qgre-engine"
+version = "0.1.0"
+description = "Quality-Gated Reward Escalation — single-GPU GRPO training engine for novel-domain structured reasoning"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Marcos Paulo Silva", email = "marcos@torad.ai"},
+]
+keywords = ["grpo", "rlhf", "reinforcement-learning", "llm", "training", "qgre"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.4.0",
+    "transformers>=4.45.0",
+    "numpy>=1.24.0",
+    "mlflow>=2.10.0",
+]
+
+[project.optional-dependencies]
+unsloth = [
+    "unsloth>=2026.3.5",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[project.urls]
+Repository = "https://github.com/seek-apps/qgre-engine"
+
+[tool.setuptools.packages.find]
+include = ["qgre*"]
