@@ -243,3 +243,72 @@ def test_config_unknown_key_warns():
         cfg = QGREConfig._from_dict(raw)
         warns = [x for x in w if "Unknown" in str(x.message)]
         assert len(warns) >= 1, "No warning for unknown config key 'typo_key'"
+
+
+# --- Phase advancement tests ---
+
+
+def test_step_records_mastery_and_advances_phase():
+    """Trainer.step() records mastery scores and advances phase when threshold met."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = _cfg()
+        cfg.logging.completion_dir = str(Path(tmpdir) / "comp")
+        cfg.logging.checkpoint_dir = str(Path(tmpdir) / "ckpt")
+
+        from qgre.types import GameState
+        gs = GameState(mastery_threshold=0.7)
+
+        model = MockModel()
+        trainer = QGRETrainer(model=model, tokenizer=None,
+                              reward_fn=lambda *a: None, config=cfg, game_state=gs)
+        trainer.setup_optimizer()
+
+        batch = _make_batch(n_completions=2)
+        tokens = _make_tokens()
+
+        # High scores on step 1 qualities → should eventually advance to phase 2
+        for _ in range(25):
+            rrs = [
+                RewardResult(reward=0.9, scores={
+                    "q_format_tags": 0.95, "q_tag_content": 0.90,
+                    "q_node_in_prompt": 0.85, "q_node_format": 0.90, "q_node_length": 0.88,
+                }),
+                RewardResult(reward=0.8, scores={
+                    "q_format_tags": 0.88, "q_tag_content": 0.85,
+                    "q_node_in_prompt": 0.80, "q_node_format": 0.85, "q_node_length": 0.82,
+                }),
+            ]
+            metrics = trainer.step(batch, [tokens, tokens], rrs)
+
+        # After 25 steps with high step-1 scores, phase should have advanced
+        assert trainer.game_state.phase >= 2, f"Phase should have advanced, got {trainer.game_state.phase}"
+        assert "mastery/step_1" in metrics
+
+
+def test_step_uses_engine_phase_not_reward_phase():
+    """Trainer uses GameState.phase for active qualities, NOT RewardResult.phase."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = _cfg()
+        cfg.logging.completion_dir = str(Path(tmpdir) / "comp")
+        cfg.logging.checkpoint_dir = str(Path(tmpdir) / "ckpt")
+
+        from qgre.types import GameState
+        gs = GameState(phase=1)  # Engine says phase 1
+
+        model = MockModel()
+        trainer = QGRETrainer(model=model, tokenizer=None,
+                              reward_fn=lambda *a: None, config=cfg, game_state=gs)
+        trainer.setup_optimizer()
+
+        batch = _make_batch(n_completions=2)
+        tokens = _make_tokens()
+
+        # RewardResult claims phase=4, but engine should use GameState.phase=1
+        rrs = [
+            RewardResult(reward=0.5, scores={"q_format_tags": 1.0}, phase=4),
+            RewardResult(reward=0.5, scores={"q_format_tags": 1.0}, phase=4),
+        ]
+        metrics = trainer.step(batch, [tokens, tokens], rrs)
+
+        # Phase should still be 1 (engine-managed)
+        assert metrics["phase"] == 1

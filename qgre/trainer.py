@@ -185,18 +185,21 @@ class QGRETrainer:
     ) -> dict[str, float]:
         """Execute one training step given pre-generated completions and rewards.
 
-        This is the algorithm-only path for testing. The full training loop
-        (generate → score → step) is in train().
+        Phase is engine-managed via GameState. The engine:
+        1. Uses game_state.phase to determine active qualities
+        2. Computes per-step advantages via segmenter + step_qualities
+        3. Records per-step mastery scores to GameState
+        4. Checks for phase advancement after each step
 
         Returns metrics dict.
         """
         assert self.optimizer is not None, "Call setup_optimizer() first"
 
-        # Determine active qualities per completion
+        # Phase is engine-managed — use GameState, not RewardResult
+        current_phase = self.game_state.phase
         active_qualities = [
-            self.phase_qualities.get(rr.phase, self.phase_qualities[min(self.phase_qualities)])
-            for rr in reward_results
-        ]
+            self.phase_qualities.get(current_phase, self.phase_qualities[min(self.phase_qualities)])
+        ] * len(reward_results)
 
         # Compute per-token advantages (segment → step rewards → SPO/GRPO → GDPO → broadcast)
         token_advantages = self.advantage_estimator.compute_advantages(
@@ -263,15 +266,42 @@ class QGRETrainer:
         metrics["reward/mean"] = reward_mean
         metrics["global_step"] = self.global_step
 
+        # Record per-step mastery scores to GameState
+        import numpy as np
+        for step_num, quality_keys in self.step_qualities.items():
+            active_keys = [k for k in quality_keys if k in active_qualities[0]]
+            if active_keys:
+                step_scores = [
+                    float(np.mean([rr.scores.get(k, 0.0) for k in active_keys]))
+                    for rr in reward_results
+                ]
+                mean_step_score = float(np.mean(step_scores))
+                self.game_state.record_step_score(step_num, mean_step_score)
+                metrics[f"mastery/step_{step_num}"] = mean_step_score
+
+        # Check phase advancement
+        max_phase = max(self.step_qualities.keys())
+        old_phase = self.game_state.phase
+        if self.game_state.check_phase_advance(max_phase):
+            new_phase = self.game_state.phase
+            metrics["phase_advanced"] = new_phase
+            self.advantage_estimator.on_tier_advance(
+                new_tier=new_phase,
+                prompt_tier_map={pid: new_phase for pid in batch.prompt_ids},
+            )
+
+        self.game_state.step_count = self.global_step
+        metrics["phase"] = self.game_state.phase
+
         # Log completions
         for i, rr in enumerate(reward_results):
             self.completion_logger.log_completion(
                 step=self.global_step,
                 prompt=batch.raw_prompts[i] if i < len(batch.raw_prompts) else "",
-                completion=str(completions[i][:50]),  # Truncated for logging
+                completion=str(completions[i][:50]),
                 reward=rr.reward,
                 reward_components=rr.scores,
-                phase=rr.phase,
+                phase=self.game_state.phase,
             )
 
         self.global_step += 1
@@ -316,3 +346,87 @@ class QGRETrainer:
             torch.set_rng_state(checkpoint["rng_state"])
 
         return True
+
+    def train(
+        self,
+        dataloader: QGREDataLoader,
+        generation_backend: GenerationBackend | None = None,
+    ):
+        """Full end-to-end training loop: generate → score → advantages → loss → backward.
+
+        This is the main entry point for training. It:
+        1. Iterates over batches from the dataloader
+        2. Generates completions via generation_backend
+        3. Scores completions via self.reward_fn
+        4. Calls self.step() for algorithm + backward
+        5. Records mastery, checks phase advancement
+        6. Saves checkpoints every save_freq steps
+        7. Logs metrics to MLflow
+        """
+        backend = generation_backend or self.generation_backend
+        if backend is None:
+            raise RuntimeError(
+                "No generation backend provided. Pass to train() or QGRETrainer constructor."
+            )
+
+        self.setup_optimizer()
+        cfg = self.config.training
+
+        # Try to resume from checkpoint
+        self.resume(self.config.logging.checkpoint_dir)
+
+        for epoch in range(100):  # Outer epoch loop — stops when total_steps reached
+            for batch in dataloader:
+                if self.global_step >= cfg.total_steps:
+                    break
+
+                # 1. Generate (inference mode)
+                if hasattr(backend, "set_inference_mode"):
+                    backend.set_inference_mode()
+                output = backend.generate(
+                    batch.input_ids.to(next(self.model.parameters()).device),
+                    batch.attention_mask.to(next(self.model.parameters()).device),
+                )
+
+                # 2. Score via reward_fn
+                reward_results = []
+                for i in range(len(output.texts)):
+                    prompt = batch.raw_prompts[i] if i < len(batch.raw_prompts) else ""
+                    meta = batch.metadata[i] if i < len(batch.metadata) else {}
+                    rr = self.reward_fn(prompt, output.texts[i], meta)
+                    reward_results.append(rr)
+
+                # 3. Train step (training mode)
+                if hasattr(backend, "set_training_mode"):
+                    backend.set_training_mode()
+                metrics = self.step(batch, output.token_ids, reward_results)
+
+                # 4. Log to MLflow
+                try:
+                    log_step_metrics(
+                        step=self.global_step - 1,
+                        reward_mean=metrics.get("reward/mean", 0.0),
+                        loss=metrics.get("loss", 0.0),
+                        extra={k: v for k, v in metrics.items()
+                               if k.startswith("mastery/") or k == "phase"},
+                    )
+                except Exception:
+                    pass  # MLflow may not be configured
+
+                # 5. Save checkpoint
+                if self.global_step % cfg.save_freq == 0:
+                    self.save()
+
+                # 6. LoRA sync (for vLLM weight update)
+                if hasattr(backend, "save_weights") and hasattr(backend, "load_weights"):
+                    from pathlib import Path
+                    lora_path = Path(self.config.logging.checkpoint_dir) / "lora_latest"
+                    backend.save_weights(lora_path)
+                    backend.load_weights(lora_path)
+
+            if self.global_step >= cfg.total_steps:
+                break
+
+        # Final checkpoint
+        self.save()
+        self.completion_logger.close()
