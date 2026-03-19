@@ -256,6 +256,18 @@ class QGRETrainer:
         for i, c in enumerate(completions):
             comp_tensor[i, :len(c)] = torch.tensor(c, dtype=torch.long, device=device)
 
+        # Build KL region weights from segmenter regions (THR-style, PLAN.md lines 798-802)
+        alg = self.config.algorithm
+        kl_region_weights = torch.ones(len(completions), max_comp_len, device=device)
+        region_map = {"THINK": alg.kl_think_multiplier, "FORMAT": alg.kl_format_multiplier}
+        for i, regions in enumerate(batch_regions):
+            for t, region in enumerate(regions):
+                if t < max_comp_len:
+                    if region in region_map:
+                        kl_region_weights[i, t] = region_map[region]
+                    elif region.startswith("STEP_"):
+                        kl_region_weights[i, t] = alg.kl_step_multiplier
+
         # SPO low-advantage filter: skip sequences with near-zero signal (PLAN.md lines 658-671)
         if self.config.algorithm.mode == "spo":
             useful = (padded_advs.abs() > 0.01).any(dim=-1)
@@ -309,11 +321,13 @@ class QGRETrainer:
             mb_old_lp = mb_lp.detach()
 
             min_len = min(mb_lp.shape[1], mb_advs.shape[1] - 1, mb_mask.shape[1])
+            mb_kl_weights = kl_region_weights[mb_start:mb_end, 1:min_len+1] if kl_region_weights is not None else None
             mb_loss, mb_metrics = self.loss_fn(
                 curr_logprobs=mb_lp[:, :min_len],
                 prev_logprobs=mb_old_lp[:, :min_len],
                 advantages=mb_advs[:, :min_len],
                 mask=mb_mask[:, :min_len].float(),
+                kl_region_weights=mb_kl_weights,
             )
 
             # LLDS auxiliary loss — prevents Lazy Likelihood Displacement death spiral

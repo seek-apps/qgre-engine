@@ -113,12 +113,18 @@ class ClippedPGLossFn:
         else:
             importance_weights = torch.ones_like(prev_logprobs)
 
-        # Aggregate loss
+        # Aggregate loss — seq-mean-token-sum-norm (verl core_algos.py lines 1172-1184)
+        # Equal weight to each sequence, then normalize by horizon length
+        weighted_loss = importance_weights * clip_loss
         if self.token_level_loss:
-            actor_loss = masked_mean(importance_weights * clip_loss, mask, global_normalization_factor=global_valid_toks)
+            # seq-mean-token-sum-norm: sum per-token, mean per-seq, normalize by horizon
+            seq_losses = torch.sum(weighted_loss * mask, dim=-1)
+            seq_mask = (mask.sum(dim=-1) > 0).float()
+            n_valid_seqs = seq_mask.sum().clamp(min=1)
+            actor_loss = (seq_losses * seq_mask).sum() / n_valid_seqs / max(mask.shape[-1], 1)
         else:
             actor_loss = masked_mean(
-                masked_mean(importance_weights * clip_loss, mask, dim=-1),
+                masked_mean(weighted_loss, mask, dim=-1),
                 (mask.sum(dim=-1) > 0).float(),
                 global_normalization_factor=(mask.sum(dim=-1) > 0).float().sum(),
             )
