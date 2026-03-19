@@ -74,25 +74,21 @@ def test_segment_malformed_tags():
     assert regions[8] == "STEP_1"
 
 
-def test_segment_all_four_steps():
-    """Full completion with steps 1-4 → 4 STEP regions."""
+def test_segment_all_steps():
+    """Full completion with steps 1-N → N STEP regions."""
+    num_steps = len(STEP_NUM_TOKENS)
     tokens = []
     for step_num_tok, step_num in STEP_NUM_TOKENS.items():
-        # Opening tag
         tokens.extend([OPEN_ANGLE, STEP_TOKEN, step_num_tok, 9999, CLOSE_ANGLE])
-        # Content
         tokens.extend([100 + step_num, 200 + step_num])
-        # Closing tag
         tokens.extend([CLOSE_SLASH, STEP_TOKEN, step_num_tok, 9999, CLOSE_ANGLE])
 
     regions = segment_completion(tokens)
 
-    # Each step has 12 tokens: 5 opening + 2 content + 5 closing
-    for step_num in range(1, 5):
+    for step_num in range(1, num_steps + 1):
         assert f"STEP_{step_num}" in regions, f"STEP_{step_num} not found"
 
-    # Format tokens exist (opening/closing tags)
-    assert regions.count("FORMAT") == 4 * 10  # 4 steps × (5 open + 5 close)
+    assert regions.count("FORMAT") == num_steps * 10
 
 
 def test_segment_empty_input():

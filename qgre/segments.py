@@ -18,7 +18,7 @@ STEP_TOKEN = 9520
 OPEN_ANGLE = 27
 CLOSE_SLASH = 522
 CLOSE_ANGLE = 29
-STEP_NUM_TOKENS = {16: 1, 17: 2, 18: 3, 19: 4}
+STEP_NUM_TOKENS = {16: 1, 17: 2, 18: 3, 19: 4, 20: 5, 21: 6, 22: 7, 23: 8, 24: 9}
 
 
 def qwen3_xml_segmenter(token_ids: list[int]) -> list[str]:

@@ -35,7 +35,7 @@ No Ray. No verl. No TRL. Just: generate → score → advantages → loss → ba
 | **Model + LoRA** | `generation.py` (Unsloth) | Loads QLoRA model (4-bit base + full-precision adapters). Switches between `for_training()` and `for_inference()` mode. Manages vLLM engine lifecycle. |
 | **Generation** | `generation.py` (vLLM) | `fast_generate()` produces completions via in-process vLLM. Decodes prompts, returns token IDs + text. Handles SamplingParams (temperature, top_p, stop tokens). |
 | **Reward** | Your `reward_fn` | Scores completions → `RewardResult(reward, scores, phase)`. You provide this. The engine consumes `.scores` per quality and `.phase` for curriculum gating. |
-| **Segmentation** | `segments.py` | `segment_completion()` splits token IDs into regions: THINK, STEP_1..4, FORMAT, OTHER. Uses Qwen3 token ID patterns (not regex). Assigns each token to its step. |
+| **Segmentation** | `segments.py` | Pluggable segmenter splits token IDs into regions: THINK, STEP_1..N, FORMAT, OTHER. Built-in: `qwen3_xml_segmenter` (1-9 steps), `uniform_segmenter`, or your own. |
 | **Advantages** | `advantages.py` | `QGREStepAdvantageEstimator` computes per-token advantages. Four techniques unified: SPO baseline, GDPO normalization, VPRM segment propagation, QGRE phase gating. |
 | **Loss** | `nemo_extracted/loss_functions.py` | `ClippedPGLossFn` from NeMo RL (Apache-2.0). Clipped PG loss with DAPO-style asymmetric clipping, KL regularization, importance sampling. |
 | **Backward** | `trainer.py` (PyTorch) | Standard `loss.backward()` + `optimizer.step()`. NaN guard, gradient clipping, gradient accumulation. Unsloth's `for_training()` mode disables inplace ops for autograd compatibility. |
