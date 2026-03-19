@@ -32,6 +32,7 @@ def test_three_steps_no_crash():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         cfg = QGREConfig()
+        cfg.algorithm.step_qualities = STEP_QUALITIES
         cfg.model.path = "unsloth/Qwen3-1.7B-unsloth-bnb-4bit"
         cfg.model.load_in_4bit = True
         cfg.model.fast_inference = True
@@ -158,6 +159,7 @@ def test_vram_does_not_grow():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         cfg = QGREConfig()
+        cfg.algorithm.step_qualities = STEP_QUALITIES
         cfg.model.path = "unsloth/Qwen3-1.7B-unsloth-bnb-4bit"
         cfg.model.load_in_4bit = True
         cfg.model.fast_inference = True

@@ -17,6 +17,17 @@ from qgre.types import RewardResult
 from qgre.segments import OPEN_ANGLE, STEP_TOKEN, CLOSE_ANGLE, CLOSE_SLASH
 
 
+TEST_SQ = HYPERGRAPH_V1_STEP_QUALITIES
+
+
+def _cfg() -> QGREConfig:
+    """Create a QGREConfig with step_qualities set for testing."""
+    cfg = QGREConfig()
+    cfg.algorithm.step_qualities = TEST_SQ
+    cfg.model.path = "test-model"
+    return cfg
+
+
 class MockModel(nn.Module):
     """Minimal model that returns random logits."""
 
@@ -66,7 +77,7 @@ def test_config_from_yaml():
 
 def test_config_defaults():
     """Default config has sensible values."""
-    cfg = QGREConfig()
+    cfg = _cfg()
     assert cfg.algorithm.mode == "spo"
     assert cfg.training.lr == 5e-6
     assert cfg.generation.temperature == 1.0
@@ -85,7 +96,7 @@ def test_config_math_example():
 def test_trainer_forward_finite_loss():
     """Synthetic batch → loss is finite, non-zero."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        cfg = QGREConfig()
+        cfg = _cfg()
         cfg.logging.completion_dir = str(Path(tmpdir) / "completions")
         cfg.logging.checkpoint_dir = str(Path(tmpdir) / "checkpoints")
 
@@ -113,7 +124,7 @@ def test_trainer_forward_finite_loss():
 
 def test_response_mask_masks_padding():
     """Response mask: 0 for prompt, 1 for response, 0 after EOS."""
-    cfg = QGREConfig()
+    cfg = _cfg()
     model = MockModel()
     trainer = QGRETrainer(model=model, tokenizer=None, reward_fn=lambda *a: None, config=cfg)
 
@@ -131,12 +142,12 @@ def test_response_mask_masks_padding():
 
 def test_mode_switch_spo_vs_grpo():
     """Config mode='spo' vs 'grpo' → different estimator mode."""
-    cfg_spo = QGREConfig()
+    cfg_spo = _cfg()
     cfg_spo.algorithm.mode = "spo"
     trainer_spo = QGRETrainer(model=MockModel(), tokenizer=None, reward_fn=lambda *a: None, config=cfg_spo)
     assert trainer_spo.advantage_estimator.mode == "spo"
 
-    cfg_grpo = QGREConfig()
+    cfg_grpo = _cfg()
     cfg_grpo.algorithm.mode = "grpo"
     trainer_grpo = QGRETrainer(model=MockModel(), tokenizer=None, reward_fn=lambda *a: None, config=cfg_grpo)
     assert trainer_grpo.advantage_estimator.mode == "grpo"
@@ -171,7 +182,7 @@ def test_phase_qualities_non_cumulative():
 def test_trainer_accepts_custom_step_qualities():
     """QGRETrainer accepts step_qualities parameter."""
     custom_sq = {1: ["q_json_valid"], 2: ["q_grounding"], 3: ["q_accuracy"]}
-    cfg = QGREConfig()
+    cfg = _cfg()
     trainer = QGRETrainer(
         model=MockModel(), tokenizer=None, reward_fn=lambda *a: None,
         config=cfg, step_qualities=custom_sq,
@@ -184,7 +195,7 @@ def test_trainer_accepts_custom_segmenter():
     """QGRETrainer accepts segmenter parameter."""
     from qgre.segments import uniform_segmenter
 
-    cfg = QGREConfig()
+    cfg = _cfg()
     trainer = QGRETrainer(
         model=MockModel(), tokenizer=None, reward_fn=lambda *a: None,
         config=cfg, segmenter=uniform_segmenter,
@@ -206,7 +217,7 @@ def test_resume_without_model_state_raises():
         path = Path(tmpdir) / "global_step_5.pt"
         _torch.save({"global_step": 5, "model_state_dict": None}, path)
 
-        cfg = QGREConfig()
+        cfg = _cfg()
         cfg.logging.checkpoint_dir = tmpdir
         cfg.logging.completion_dir = str(Path(tmpdir) / "comp")
 

@@ -6,7 +6,7 @@ from typing import Callable
 import numpy as np
 import torch
 
-from qgre.segments import HYPERGRAPH_V1_STEP_QUALITIES, Segmenter, qwen3_xml_segmenter
+from qgre.segments import Segmenter, uniform_segmenter
 from qgre.types import RewardResult
 
 
@@ -69,8 +69,14 @@ class QGREStepAdvantageEstimator:
     ):
         self.lr = lr
         self.mode = mode
-        self.step_qualities = step_qualities or HYPERGRAPH_V1_STEP_QUALITIES
-        self.segmenter = segmenter or qwen3_xml_segmenter
+        if step_qualities is None:
+            raise ValueError(
+                "step_qualities is required. Pass a dict mapping step numbers to quality names, e.g.:\n"
+                "  {1: ['q_format'], 2: ['q_grounding'], 3: ['q_accuracy']}\n"
+                "See examples/ for domain-specific configs."
+            )
+        self.step_qualities = step_qualities
+        self.segmenter = segmenter or uniform_segmenter
         self._step_nums = sorted(self.step_qualities.keys())
         self.V: dict[int, dict[int, float]] = defaultdict(lambda: defaultdict(float))
         self._step_seen: dict[int, set[int]] = defaultdict(set)

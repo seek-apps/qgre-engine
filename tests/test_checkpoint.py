@@ -206,6 +206,7 @@ def test_trainer_save_load_step_counter(mock_game_state):
     from unittest.mock import MagicMock
     from qgre.config import QGREConfig
     from qgre.trainer import QGRETrainer
+    from qgre.segments import HYPERGRAPH_V1_STEP_QUALITIES
 
     class TinyModel(nn.Module):
         def __init__(self):
@@ -216,6 +217,7 @@ def test_trainer_save_load_step_counter(mock_game_state):
 
     with tempfile.TemporaryDirectory() as tmpdir:
         cfg = QGREConfig()
+        cfg.algorithm.step_qualities = HYPERGRAPH_V1_STEP_QUALITIES
         cfg.logging.checkpoint_dir = tmpdir
         cfg.logging.completion_dir = str(Path(tmpdir) / "completions")
 
@@ -248,6 +250,7 @@ def test_v_tracker_persists_across_checkpoint():
     import torch.nn as nn
     from unittest.mock import MagicMock
     from qgre.config import QGREConfig
+    from qgre.segments import HYPERGRAPH_V1_STEP_QUALITIES
     from qgre.trainer import QGRETrainer
 
     class TinyModel(nn.Module):
@@ -259,6 +262,7 @@ def test_v_tracker_persists_across_checkpoint():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         cfg = QGREConfig()
+        cfg.algorithm.step_qualities = HYPERGRAPH_V1_STEP_QUALITIES
         cfg.logging.checkpoint_dir = tmpdir
         cfg.logging.completion_dir = str(Path(tmpdir) / "completions")
 

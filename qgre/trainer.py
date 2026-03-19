@@ -18,7 +18,7 @@ from qgre.logging import CompletionLogger, log_step_metrics
 from qgre.nemo_extracted.kl import masked_mean
 from qgre.nemo_extracted.logits import logprobs_from_logits
 from qgre.nemo_extracted.loss_functions import ClippedPGLossFn
-from qgre.segments import HYPERGRAPH_V1_STEP_QUALITIES, Segmenter, qwen3_xml_segmenter
+from qgre.segments import Segmenter, uniform_segmenter
 from qgre.types import GameState, RewardResult
 
 
@@ -61,7 +61,16 @@ class QGRETrainer:
         self.game_state = game_state or GameState()
 
         # Step qualities and phase mapping — configurable per domain
-        sq = step_qualities or HYPERGRAPH_V1_STEP_QUALITIES
+        # step_qualities: from constructor arg, config YAML, or error
+        sq = step_qualities or config.algorithm.step_qualities
+        if sq is None:
+            raise ValueError(
+                "step_qualities is required. Pass to QGRETrainer constructor or set in config YAML:\n"
+                "  algorithm:\n"
+                "    step_qualities:\n"
+                "      1: [q_format]\n"
+                "      2: [q_accuracy]"
+            )
         self.step_qualities = sq
         self.phase_qualities = build_phase_qualities(sq)
 
@@ -72,7 +81,7 @@ class QGRETrainer:
         self.advantage_estimator = QGREStepAdvantageEstimator(
             lr=spo_lr, mode=mode,
             step_qualities=sq,
-            segmenter=segmenter or qwen3_xml_segmenter,
+            segmenter=segmenter or uniform_segmenter,
         )
 
         # Loss function (NeMo RL extracted)
@@ -151,7 +160,7 @@ class QGRETrainer:
         self,
         input_ids: torch.Tensor,
         prompt_lengths: list[int],
-        eos_token_id: int = 151643,
+        eos_token_id: int | None = None,
     ) -> torch.Tensor:
         """Compute response mask: 1 for response tokens, 0 for prompt + padding after EOS."""
         batch_size, seq_len = input_ids.shape
@@ -159,10 +168,9 @@ class QGRETrainer:
 
         for i in range(batch_size):
             start = prompt_lengths[i]
-            # Find first EOS after prompt
-            eos_positions = (input_ids[i, start:] == eos_token_id).nonzero(as_tuple=True)[0]
-            if len(eos_positions) > 0:
-                end = start + eos_positions[0].item() + 1  # Include EOS
+            if eos_token_id is not None:
+                eos_positions = (input_ids[i, start:] == eos_token_id).nonzero(as_tuple=True)[0]
+                end = start + eos_positions[0].item() + 1 if len(eos_positions) > 0 else seq_len
             else:
                 end = seq_len
             mask[i, start:end] = 1.0

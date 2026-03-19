@@ -9,7 +9,7 @@ import yaml
 
 @dataclass
 class ModelConfig:
-    path: str = "unsloth/Qwen3-1.7B-unsloth-bnb-4bit"
+    path: str = ""  # Required — set in YAML or constructor
     tokenizer_path: str | None = None
     lora_rank: int = 8
     lora_alpha: int = 16
@@ -34,7 +34,7 @@ class GenerationConfig:
     top_p: float = 1.0
     top_k: int = -1
     max_tokens: int = 4096
-    stop_token_ids: list[int] = field(default_factory=lambda: [151643, 151645])
+    stop_token_ids: list[int] = field(default_factory=list)  # Set from tokenizer or YAML
 
 
 @dataclass

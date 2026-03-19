@@ -7,10 +7,11 @@ import pytest
 from qgre.advantages import QGREStepAdvantageEstimator, build_batch_reward_tensors
 from qgre.segments import (
     CLOSE_ANGLE, CLOSE_SLASH, HYPERGRAPH_V1_STEP_QUALITIES, OPEN_ANGLE,
-    STEP_TOKEN, THINK_END, THINK_START, segment_completion,
+    STEP_TOKEN, THINK_END, THINK_START, qwen3_xml_segmenter, segment_completion,
 )
 
 STEP_QUALITIES = HYPERGRAPH_V1_STEP_QUALITIES
+XML_SEG = qwen3_xml_segmenter
 from qgre.types import RewardResult
 
 
@@ -91,7 +92,7 @@ def test_credit_step1_correct_step4_wrong():
 
     Uses GRPO mode where within-group comparison creates measurable advantages.
     """
-    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="grpo")
+    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="grpo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
     tokens = _make_completion_tokens()
 
     # Two completions in one group: one with good step1/bad step4, the other reversed
@@ -119,7 +120,7 @@ def test_credit_step1_correct_step4_wrong():
 
 def test_credit_all_steps_correct():
     """All steps score 1.0 → all advantages similar magnitude."""
-    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="spo")
+    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="spo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
     tokens = _make_completion_tokens()
 
     rr1 = _make_reward_result(step1_score=1.0, step4_score=1.0)
@@ -147,7 +148,7 @@ def test_credit_all_steps_correct():
 
 def test_credit_phase1_format_only():
     """active_qualities = phase 1 only → only step 1 has non-zero advantage."""
-    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="spo")
+    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="spo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
     tokens = _make_completion_tokens()
 
     rr1 = _make_reward_result(step1_score=1.0, step4_score=0.5)
@@ -183,7 +184,7 @@ def test_credit_phase1_format_only():
 
 def test_spo_warmstart_no_spike():
     """First observation: V set to reward, advantage ≈ 0."""
-    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="spo")
+    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="spo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
     tokens = _make_completion_tokens()
     rr = _make_reward_result(step1_score=0.8, step4_score=0.6)
 
@@ -201,7 +202,7 @@ def test_spo_warmstart_no_spike():
 
 def test_spo_second_observation_has_advantage():
     """Second observation with different reward → non-zero advantage."""
-    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="spo")
+    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="spo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
     tokens = _make_completion_tokens()
 
     rr1 = _make_reward_result(step1_score=0.5, step4_score=0.5)
@@ -230,7 +231,7 @@ def test_spo_second_observation_has_advantage():
 
 def test_spo_on_tier_advance_resets_v():
     """on_tier_advance resets V for affected prompts."""
-    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="spo")
+    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="spo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
     tokens = _make_completion_tokens()
     rr = _make_reward_result(step1_score=0.9, step4_score=0.7)
 
@@ -252,7 +253,7 @@ def test_spo_on_tier_advance_resets_v():
 
 def test_spo_value_tracker_ema_convergence():
     """100 identical rewards → V converges to reward value."""
-    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="spo")
+    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="spo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
     tokens = _make_completion_tokens()
     rr = _make_reward_result(step1_score=0.85, step4_score=0.65)
 
@@ -274,7 +275,7 @@ def test_spo_value_tracker_ema_convergence():
 
 def test_grpo_fallback_group_normalize():
     """4 completions with different rewards → mean≈0, std≈1 within group."""
-    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="grpo")
+    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="grpo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
     tokens = _make_completion_tokens()
 
     results = [
@@ -299,7 +300,7 @@ def test_grpo_fallback_group_normalize():
 
 def test_grpo_fallback_degenerate_group():
     """4 identical rewards → all advantages ≈ 0."""
-    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="grpo")
+    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="grpo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
     tokens = _make_completion_tokens()
 
     rr = _make_reward_result(step1_score=0.8, step4_score=0.8)
@@ -323,7 +324,7 @@ def test_grpo_fallback_degenerate_group():
 
 def test_gdpo_per_step_normalize():
     """After normalization, each step's advantages have std≈1 across batch."""
-    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="grpo")
+    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="grpo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
     tokens = _make_completion_tokens()
 
     # Create batch with high variance in step 1, low in step 4
@@ -353,7 +354,7 @@ def test_gdpo_per_step_normalize():
 
 def test_gdpo_preserves_sign():
     """Above-mean completion → positive advantage; below-mean → negative."""
-    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="grpo")
+    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="grpo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
     tokens = _make_completion_tokens()
 
     results = [
@@ -383,7 +384,7 @@ def test_gdpo_preserves_sign():
 
 def test_think_tokens_get_zero_advantage():
     """Tokens in THINK region → advantage == 0."""
-    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="grpo")
+    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="grpo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
 
     tokens = [
         THINK_START, 100, 101, THINK_END,
@@ -412,7 +413,7 @@ def test_think_tokens_get_zero_advantage():
 
 def test_format_tokens_get_zero_advantage():
     """Tokens in FORMAT region (tag tokens) → advantage == 0."""
-    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="grpo")
+    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="grpo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
 
     tokens = [
         OPEN_ANGLE, STEP_TOKEN, 16, 9999, CLOSE_ANGLE,
@@ -443,7 +444,7 @@ def test_format_tokens_get_zero_advantage():
 
 def test_grpo_nondivisible_batch_raises():
     """GRPO with batch_size not divisible by group_size → ValueError."""
-    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="grpo")
+    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="grpo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
     tokens = _make_completion_tokens()
     rr = _make_reward_result(step1_score=0.5, step4_score=0.5)
 
@@ -459,7 +460,7 @@ def test_grpo_nondivisible_batch_raises():
 
 def test_gdpo_batch_size_1_no_nan():
     """GDPO normalization with batch_size=1 → no NaN (uses correction=0)."""
-    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="spo")
+    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="spo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
     tokens = _make_completion_tokens()
     rr = _make_reward_result(step1_score=0.8, step4_score=0.6)
 

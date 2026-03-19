@@ -13,7 +13,7 @@ from qgre.advantages import QGREStepAdvantageEstimator
 from qgre.nemo_extracted.loss_functions import ClippedPGLossFn
 from qgre.nemo_extracted.kl import masked_mean
 from qgre.nemo_extracted.logits import logprobs_from_logits
-from qgre.segments import HYPERGRAPH_V1_STEP_QUALITIES as STEP_QUALITIES, OPEN_ANGLE, STEP_TOKEN, CLOSE_ANGLE, CLOSE_SLASH
+from qgre.segments import HYPERGRAPH_V1_STEP_QUALITIES as STEP_QUALITIES, OPEN_ANGLE, STEP_TOKEN, CLOSE_ANGLE, CLOSE_SLASH, qwen3_xml_segmenter as XML_SEG
 from qgre.types import RewardResult
 
 
@@ -44,7 +44,7 @@ def test_advantages_deterministic():
     ]
 
     # Run twice with fresh estimators
-    est1 = QGREStepAdvantageEstimator(lr=0.1, mode="grpo")
+    est1 = QGREStepAdvantageEstimator(lr=0.1, mode="grpo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
     advs1 = est1.compute_advantages(
         batch_prompt_ids=[1, 2, 3, 4],
         batch_token_ids=[tokens] * 4,
@@ -53,7 +53,7 @@ def test_advantages_deterministic():
         group_size=4,
     )
 
-    est2 = QGREStepAdvantageEstimator(lr=0.1, mode="grpo")
+    est2 = QGREStepAdvantageEstimator(lr=0.1, mode="grpo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
     advs2 = est2.compute_advantages(
         batch_prompt_ids=[1, 2, 3, 4],
         batch_token_ids=[tokens] * 4,
@@ -107,7 +107,7 @@ def test_advantage_loss_pipeline_consistency():
         for r in [0.9, 0.3, 0.7, 0.5]
     ]
 
-    est = QGREStepAdvantageEstimator(lr=0.1, mode="grpo")
+    est = QGREStepAdvantageEstimator(lr=0.1, mode="grpo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
     advs = est.compute_advantages(
         batch_prompt_ids=[1, 1, 1, 1],
         batch_token_ids=[tokens] * batch_size,
@@ -160,13 +160,13 @@ def test_spo_vs_grpo_produce_different_advantages():
     ]
 
     # SPO
-    est_spo = QGREStepAdvantageEstimator(lr=0.1, mode="spo")
+    est_spo = QGREStepAdvantageEstimator(lr=0.1, mode="spo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
     # Warm up SPO
     est_spo.compute_advantages([1, 2], [tokens] * 2, results, [ALL_Q] * 2)
     advs_spo = est_spo.compute_advantages([1, 2], [tokens] * 2, results, [ALL_Q] * 2)
 
     # GRPO
-    est_grpo = QGREStepAdvantageEstimator(lr=0.1, mode="grpo")
+    est_grpo = QGREStepAdvantageEstimator(lr=0.1, mode="grpo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
     advs_grpo = est_grpo.compute_advantages([1, 1], [tokens] * 2, results, [ALL_Q] * 2, group_size=2)
 
     # They should produce different values (different baseline methods)
