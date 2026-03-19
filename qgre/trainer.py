@@ -17,6 +17,7 @@ from qgre.data import PromptBatch, QGREDataLoader
 from qgre.logging import CompletionLogger, log_step_metrics
 from qgre.nemo_extracted.kl import masked_mean
 from qgre.fused_logprobs import chunked_logprobs_from_hidden, get_hidden_states_and_lm_head
+from qgre.nemo_extracted.llds import compute_llds_loss
 from qgre.nemo_extracted.logits import logprobs_from_logits
 from qgre.nemo_extracted.loss_functions import ClippedPGLossFn
 from qgre.segments import Segmenter, uniform_segmenter
@@ -305,6 +306,20 @@ class QGRETrainer:
                 advantages=mb_advs[:, :min_len],
                 mask=mb_mask[:, :min_len].float(),
             )
+
+            # LLDS auxiliary loss — prevents Lazy Likelihood Displacement death spiral
+            # (arXiv:2512.04220, PLAN.md line 504)
+            llds_coef = self.config.algorithm.llds_coef
+            if llds_coef > 0:
+                llds_loss, llds_mask = compute_llds_loss(
+                    log_prob=mb_lp[:, :min_len],
+                    old_log_prob=mb_old_lp[:, :min_len],
+                    advantages=mb_advs[:, :min_len],
+                    response_mask=mb_mask[:, :min_len].float(),
+                )
+                mb_loss = mb_loss + llds_coef * llds_loss
+                mb_metrics["llds_loss"] = llds_loss.item()
+                mb_metrics["llds_mask_ratio"] = llds_mask.sum().item() / max(mb_mask[:, :min_len].sum().item(), 1)
 
             (mb_loss / n_micro).backward()
             total_loss += mb_loss.item() / n_micro
