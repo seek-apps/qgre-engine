@@ -497,44 +497,79 @@ Step G5: Update README and tests
 - After all G steps: run GPU smoke test if GPU free
 - When all pass → commit and push → report FEATURE LOOP COMPLETE
 
-### ACTIVE WORK: Implement ALL plan phases (not just Phase 1)
+### ACTIVE WORK: Implement EVERYTHING from PLAN.md — no deferral
 
-Phase 1 (Eliminate Ray) is done. Phases 2-4 from PLAN.md are NOT optional.
-The OOM on 8×4096 proves Phase 4 is required NOW, not "probably never."
+After thorough re-read of all 2350 lines of plan docs, here is EVERYTHING still missing.
+Phase 1 was declared complete prematurely — several Phase 1 items were never built.
+Phases 2-4 are NOT future work — they are part of the engine specification.
 
 ```
-Phase 2-4 Implementation:
+=== Phase 1 MISSING items (should have been built) ===
 
-Step T1: Fused log_softmax+gather (Triton or Liger) — FIXES OOM
-  - The OOM: logits.to(float32) allocates 2.3GB per sequence (4096 × 151936 × 4B)
-  - Fix: Triton kernel that does log_softmax+gather in one pass, never materializing full tensor
-  - OR: Use Liger Kernel's fused_linear_cross_entropy (NeMo RL supports use_liger_kernel)
-  - Search Exa: "liger kernel fused cross entropy logprobs GRPO memory efficient"
-  - Test: 8 × 4096 tokens fits in 16GB
+Step M1: LLDS loss (Lazy Likelihood Displacement Stabilization)
+  - PLAN.md line 504: "LLDS loss (extract from verl core_algos, ~40 lines)"
+  - Prevents policy collapse by penalizing large likelihood shifts
+  - Config: llds_coef (default 0.05 from v1)
+  - Extract from verl or implement from paper
+  - Wire into ClippedPGLossFn or as separate loss term in trainer.step()
 
-Step T2: torch.compile the advantage computation
-  - Wrap QGREStepAdvantageEstimator.compute_advantages in torch.compile
-  - NOTE: v1 found torch.compile conflicts with Unsloth backward patches
-  - Search Exa for current status of torch.compile + Unsloth compatibility
-  - If incompatible: skip, advantage computation is already fast (pure Python, no GPU)
+Step M2: AdamW8bit optimizer
+  - PLAN.md line 323: "self.optimizer = AdamW8bit(model.parameters(), lr=config.lr)"
+  - v1 config line 76: "optimizer: AdamW8bit" + "optimizer_impl: bitsandbytes.optim"
+  - Saves ~5GB optimizer states (1.7GB instead of 6.8GB for 1.7B model)
+  - CRITICAL for 16GB GPU: regular AdamW uses 2× model size for states
+  - pip install bitsandbytes, then: from bitsandbytes.optim import AdamW8bit
 
-Step T3: Triton kernel for segment_completion
-  - Token ID pattern matching on GPU (scan for STEP_TOKEN, OPEN_ANGLE, etc.)
-  - Currently CPU Python — fine for batch_size≤16, bottleneck at scale
-  - Only implement if profiling shows it's a bottleneck
-  - Search Exa: "triton kernel token pattern matching sequence labeling"
+Step M3: Low-advantage filter for SPO mode
+  - PLAN.md lines 658-671: skip prompts where |advantage| < epsilon
+  - Replaces filter_groups (which is for GRPO only)
+  - Prevents training on zero-signal batches
+  - Config: spo.min_advantage_threshold (default 0.01)
 
-Step T4: GPU memory budget management
-  - Config: memory_budget section with gpu_memory_utilization, training_headroom
-  - Engine computes: model_size + kv_cache + training_overhead
-  - Warns if config exceeds physical VRAM
-  - Auto-adjusts micro_batch_size to fit
-  - Reference: v1 verl-local-full.yaml (gpu_memory_utilization=0.35 for training headroom)
+Step M4: seq-mean-token-sum-norm loss aggregation
+  - v1 config line 72: "loss_agg_mode: seq-mean-token-sum-norm"
+  - Current: token-level mean. Plan: sequence-mean of token-sum, then normalize
+  - This affects gradient scaling and is load-bearing for training stability
 
-Step T5: Stress test passes
-  - 8 prompts × 4096 tokens on RTX 5080 — no OOM
-  - 16 prompts × 4096 tokens — verify throughput
-  - Measure: tokens/sec, VRAM peak, step time
+Step M5: Region-specific KL control (THR-style)
+  - PLAN.md lines 798-802: "HOLD until engine exists" — engine exists now
+  - THINK tokens: LOW KL (explore reasoning freely)
+  - FORMAT tokens: HIGH KL (lock in structure)
+  - CONTENT tokens: MEDIUM KL (focus on quality)
+  - The segmenter already produces THINK/FORMAT/STEP regions — use them for per-region KL
+
+=== Phase 2: Triton kernels ===
+
+Step T1: Fused log_softmax+gather Triton kernel — FIXES OOM
+  - The OOM: full logits tensor = batch × seq × vocab = 2.3GB per sequence in float32
+  - Fix: Triton kernel that does log_softmax+gather in one pass on GPU
+  - Never materializes the full vocab-sized tensor
+  - OR: Use Liger Kernel (NeMo RL supports use_liger_kernel)
+  - Search Exa for: "liger kernel fused cross entropy logprobs", "triton fused log softmax gather"
+  - Test: 8 × 4096 tokens on RTX 5080 — no OOM
+
+Step T2: Triton kernel for segment_completion (if bottleneck)
+  - Token ID pattern matching on GPU
+  - Only implement if profiling shows CPU segmentation is >5% of step time
+
+=== Phase 3: torch.compile ===
+
+Step T3: torch.compile the training forward pass
+  - v1 found: "Unsloth patches backward at Python level; torch.compile traces past them"
+  - Search Exa for current Unsloth + torch.compile compatibility (2026 status)
+  - If compatible now: wrap model forward + logprob computation
+  - If not: document as known limitation, Unsloth's own kernels provide most of the benefit
+
+=== Phase 4: Memory management ===
+
+Step T4: GPU memory budget and auto micro-batching
+  - v1 used gpu_memory_utilization=0.35 for 1.7B on 16GB (leaves headroom for training)
+  - Engine should: estimate VRAM budget, set micro_batch_size automatically
+  - Config: max_micro_batch_size (default: auto based on available VRAM)
+
+Step T5: Stress test — 8-16 prompts × 4096 tokens
+  - MUST pass on RTX 5080 16GB before declaring complete
+  - Measure: tokens/sec, VRAM peak, step time, phase advancement
 ```
 
 **Execution: T1 first (fixes OOM), then T4 (memory management), then T2-T3 if needed.**
@@ -566,19 +601,50 @@ Step T5: Stress test passes
 
 ## Completion Promise
 
-**NEVER report FEATURE LOOP COMPLETE without running this checklist:**
+**NEVER report FEATURE LOOP COMPLETE without running this FULL checklist:**
 
 ```
-COMPLETION CHECKLIST (run every time before reporting done):
-1. Read docs/PLAN.md — list every algorithm/feature described. Check each is implemented.
-2. Read docs/SPECIAL-TOKENS-SUPERPOWER.md — list every technique. Check each is implemented or explicitly deferred.
-3. Read docs/PILLARS.md — list every component per pillar. Check each exists.
-4. grep for TODO/FIXME/STUB/placeholder in qgre/*.py — must be zero.
-5. Run pytest — all tests must pass.
-6. Check GameState is USED (not just stored) — engine must manage phase advancement.
-7. Check reward scores flow into per-step advantages (not just sequence-level).
-8. Check segmenter is called and regions affect advantage computation.
-9. If ANY item fails → there are gaps. Do NOT report complete.
+COMPLETION CHECKLIST — MANDATORY before reporting done:
+
+=== STEP 1: THOROUGHLY READ EVERY PLAN DOCUMENT ===
+Read these files IN FULL (not grep, not skim — read every line):
+  - docs/PLAN.md (all ~1460 lines)
+  - docs/SPECIAL-TOKENS-SUPERPOWER.md (all ~635 lines)
+  - docs/PILLARS.md (all ~258 lines)
+
+For each document, extract EVERY feature, algorithm, technique, component,
+and optimization described. Write them down as a numbered list.
+Then check EACH item against the actual code. Mark as:
+  [x] Implemented and tested
+  [~] Partially implemented (describe what's missing)
+  [ ] Not implemented
+  [HOLD] Explicitly deferred with documented reason
+
+If ANY item is [ ] or [~], there are gaps. Do NOT report complete.
+
+=== STEP 2: VERIFY IMPLEMENTATION MATCHES PLAN SPEC ===
+For each implemented item, verify:
+  - Algorithm matches the pseudocode in PLAN.md exactly
+  - Config parameters match what PLAN.md specifies
+  - Loss computation matches PLAN.md (LLDS, kl_cov, clip ratios, loss_agg_mode)
+  - Optimizer matches PLAN.md (AdamW8bit, not regular AdamW)
+  - Memory optimization matches PLAN.md (Triton kernels, torch.compile, fused ops)
+
+=== STEP 3: CODE CHECKS ===
+  1. grep for TODO/FIXME/STUB/placeholder in qgre/*.py — must be zero
+  2. Run pytest — all tests must pass
+  3. Check GameState is USED by engine (not just stored)
+  4. Check reward scores → per-step advantages (not sequence-level)
+  5. Check segmenter called and regions affect advantages
+  6. Check phase advancement is engine-managed
+  7. Run GPU smoke test: 8 prompts × 4096 tokens — no OOM
+
+=== STEP 4: CONFIRM WITH USER ===
+  List every [HOLD] item and ask user if they accept the deferral.
+  List every [~] item and ask user if partial implementation is acceptable.
+  Only report complete after user confirms.
+
+If ANY step fails → there are gaps. Fix them. Do NOT report complete.
 ```
 
 When ALL gaps are closed and the checklist passes:
