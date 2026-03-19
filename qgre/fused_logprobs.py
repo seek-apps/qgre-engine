@@ -90,13 +90,19 @@ def get_hidden_states_and_lm_head(model: nn.Module, input_ids: torch.Tensor):
     if body is None:
         return None, None
 
-    # Forward through body only
+    # Forward through body only — handle various output formats
     body_output = body(input_ids)
+
+    # BaseModelOutputWithPast (standard HF) → .last_hidden_state
     if hasattr(body_output, "last_hidden_state"):
         hidden_states = body_output.last_hidden_state
-    elif isinstance(body_output, tuple):
+    # Tuple output (Unsloth patched) → first element is hidden states
+    elif isinstance(body_output, tuple) and len(body_output) > 0:
         hidden_states = body_output[0]
-    else:
+    # Raw tensor
+    elif isinstance(body_output, torch.Tensor):
         hidden_states = body_output
+    else:
+        return None, None
 
     return hidden_states, lm_head

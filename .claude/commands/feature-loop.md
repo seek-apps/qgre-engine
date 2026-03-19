@@ -34,6 +34,15 @@ The cost of a wrong assumption: hours of debugging or silent training corruption
 If you catch yourself writing code without having searched Exa for the specific
 technique or API you're using, STOP and search first. No exceptions.
 
+You also have `/tech-scan` — use it for broader research on training techniques,
+GRPO best practices, memory management strategies, and library compatibility.
+Run it whenever you're facing a systemic issue (not just a single bug).
+
+REMEMBER: We are building a CUSTOM ENGINE. We have FULL CONTROL over every line.
+If an existing library function doesn't fit, we don't hack around it — we write
+our own implementation. We have the source code for Unsloth, vLLM, NeMo RL, and
+PyTorch. Any bug, any limitation, any OOM is fixable because we own the pipeline.
+
 ## Input
 
 The user provides a build step name (e.g. `step-0d`, `step-1`) or `all`.
