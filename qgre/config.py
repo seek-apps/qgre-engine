@@ -15,7 +15,7 @@ class ModelConfig:
     lora_alpha: int = 16
     load_in_4bit: bool = True
     fast_inference: bool = True
-    gpu_memory_utilization: float = 0.6
+    gpu_memory_utilization: float = 0.35  # Colocate: leaves ~65% VRAM for training (Leeroopedia heuristic)
 
 
 @dataclass
