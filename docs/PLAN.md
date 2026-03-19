@@ -474,10 +474,23 @@ Step 0f: Checkpoint resume logic (1 hour)
     game_state.to_dict(), global_step, curriculum_tier,
     torch.get_rng_state(), torch.cuda.get_rng_state()
   - Adds: resume detection on startup (find latest checkpoint, restore)
+  - CRITICAL: Must recreate vLLM engine on resume (ms-swift #8233 — LoRA double-counting)
   - Test: train 10 steps, save, resume, verify step 11 produces same loss
+
+Step 0g: LoRA verification harness (1 hour)
+  UNBLOCKS: Silent training death prevention
+  - Problem: LoRA sync can silently fail (unsloth #3802, ms-swift #8233, unsloth #3864)
+  - Build: LoRAVerifier class with three functions:
+    (a) verify_sync(): hash LoRA weight tensors before/after load, assert match
+    (b) verify_active(): generate 1 token from fixed prompt, compare to base-model output
+    (c) periodic_recreate(): tear down and recreate vLLM engine every N steps (default 50)
+  - Integrates into QGRETrainer.step() as post-sync hook
+  - Integrates into QGRETrainer.resume() as mandatory step
+  - Test: mock model where load_lora is a no-op → verify_sync raises
+  - Test: verify_active with real LoRA → output differs from base
 ```
 
-**Total prerequisite effort: ~10 hours. Then build in this order:**
+**Total prerequisite effort: ~11 hours (added 0g). Then build in this order:**
 
 ```
 Step 1: Write QGRETrainer class (~450 lines total with all wiring) — 5 hours
@@ -525,6 +538,14 @@ QGREStepAdvantageEstimator in Step 0d. No separate Step 1 or VPRM wiring needed.
 - [ ] Pin Unsloth + vLLM versions in requirements.txt
 - [ ] Ensure MLflow is initialized BEFORE first compute_score() call in custom engine
       (GameState._init_tier_from_mlflow reads active_run — must exist)
+- [ ] Define `RewardResult` dataclass in `qgre/types.py` — consumed by advantages, trainer, examples (DONE)
+- [ ] Add `generation` section to config schema with temperature, top_p, top_k, stop_token_ids (DONE)
+- [ ] Snapshot SPO implementation from paper (arxiv 2509.13232) — verl PR #3503 is closed/unmerged,
+      author fork may disappear. Implement from paper spec (Algorithm 1), not extraction.
+- [ ] Create stub reward_fn in examples/hypergraph/ for testing (returns RewardResult with synthetic scores)
+- [ ] SPO is primary build path (DECIDED 2026-03-18). GRPO fallback second. Both share 90% of Step 0d.
+- [ ] NeMo RL extraction: clone v0.5.0 tag, extract + strip deps (DECIDED 2026-03-18). Not rewrite.
+- [ ] LoRA verification harness: separate Step 0g (DECIDED 2026-03-18). See build plan.
 
 ### Risks (from two pressure tests + full plan review)
 
@@ -540,7 +561,14 @@ QGREStepAdvantageEstimator in Step 0d. No separate Step 1 or VPRM wiring needed.
 | SPO value tracker spike on phase advance | Medium | Warm-start V with batch mean (see below) |
 | SPO value tracker spike on tier advance | Medium | Reset V for ungated prompts (see below) |
 | n=1 vs n=8 mode switch | Medium | Config flag, both paths tested |
-| LoRA weight sync correctness | Low | Already working, tested in current stack |
+| LoRA weight sync correctness | **High** | Post-sync verification (hash weights before/after) — see Exa findings |
+| LoRA double-counting on resume | **High** | ms-swift #8233: first batch OK, subsequent batches malformed after resume. Must recreate vLLM on resume |
+| VRAM leak during GRPO training | High | unsloth #3864: VRAM increases each step. Recreate vLLM engine every N steps |
+| fast_generate ignoring LoRA | High | unsloth #3802: model-dependent. Verify LoRA applied by comparing outputs to base model |
+| NeMo RL API changes between versions | Medium | loss_functions moved from algorithms.loss_functions to algorithms.loss.loss_functions in nightly. Pin to v0.5.0 |
+| No sampling params in config | Medium | temperature=1.0 critical for diversity. Added to config schema |
+| RewardResult type undefined | Medium | No file defined it — all modules referenced phantom type. Created qgre/types.py |
+| SPO source fragility | Medium | verl PR #3503 closed/unmerged, author fork URL unknown. Implement from paper, not extraction |
 
 ### Hidden dependencies (from two pressure tests)
 
@@ -664,6 +692,80 @@ algorithm:
 Both paths share: generation, reward, loss, backward. They differ ONLY in
 advantage computation (SPO tracker vs group normalize).
 - **F1 (No Ray) at near-equilibrium** — barely positive Net(+0.006). The training loop is the LAST thing to assemble, not the first.
+
+---
+
+### Exa Research Findings (2026-03-18)
+
+Live search across GitHub issues, Unsloth docs, NeMo RL docs, verl PRs, and RL training guides.
+
+**CRITICAL: LoRA sync is NOT "Low risk" — reclassified to High**
+
+1. **ms-swift #8233 (2026-03-06):** `vllm_enable_lora` causes LoRA double-counting after
+   `resume_from_checkpoint` in colocate mode. First rollout batch generates correctly, ALL
+   subsequent batches produce malformed text. Root cause: LoRA weights applied twice after
+   resume. Fix: recreate vLLM engine on resume, not just reload weights.
+   - **Impact on QGRE:** Checkpoint resume (Step 0f) MUST recreate vLLM engine, not just
+     restore model state. Without this, resume silently produces garbage.
+
+2. **unsloth #3802 (2025-12-29):** `fast_generate()` ignores LoRA on some models (Gemma 3).
+   `model.generate()` (HF/torch) uses LoRA correctly, `model.fast_generate()` (vLLM) behaves
+   as base model. Was fixed for Gemma but the pattern may recur with other models.
+   - **Impact on QGRE:** Must verify LoRA is active after every `save_lora`/`load_lora` cycle.
+     Add a post-sync sanity check: generate a known prompt, verify output differs from base.
+
+3. **unsloth #3864 (2026-01-07):** GRPO Training VRAM usage increases with each step → OOM.
+   Confirmed on RTX Quadro 8000 (48GB). The vLLM engine leaks memory during LoRA hot-swap.
+   - **Impact on QGRE:** Add periodic vLLM engine recreation (every 50-100 steps) to trainer
+     loop. Budget ~5s per recreation. Include in Step 1 (QGRETrainer).
+
+4. **ms-swift #3515 (2025-03-15):** Fix for vLLM 0.7.3 memory leak when n>1. Patched in
+   ms-swift but may not be in upstream vLLM. Check vLLM version compatibility.
+
+**SPO source status (confirmed)**
+
+- verl PR #3503 by @dzh19990407: CLOSED (2025-10-15), never merged. 2329 additions, 6 files.
+- Source branch: `feature/spo-implementation`. Author's fork: not publicly linked.
+- Paper PDF available at: https://zhongwen.one/pdfs/SPO.pdf
+- Notion page: https://zhongwenxu.notion.site/
+- **Decision:** Implement SPO from paper spec (Algorithm 1 in paper). The core is ~50 lines:
+  persistent EMA value tracker V(x) += lr * (r - V(x)), global batch normalization, KL-adaptive
+  learning rate. Do NOT depend on the closed PR.
+
+**NeMo RL extraction details (confirmed)**
+
+- Source code for `loss_functions.py` viewable at:
+  https://docs.nvidia.com/nemo/rl/0.2.1/_modules/nemo_rl/algorithms/loss_functions.html
+- `ClippedPGLossFn` requires `ClippedPGLossConfig` TypedDict with fields:
+  reference_policy_kl_penalty, ratio_clip_min, ratio_clip_max, ratio_clip_c,
+  use_on_policy_kl_approximation, use_importance_sampling_correction, token_level_loss
+- Dependencies to strip: `nemo_rl.algorithms.interfaces.LossFunction`,
+  `nemo_rl.algorithms.utils.{calculate_kl_penalty_joschu2020, masked_mean}`,
+  `nemo_rl.distributed.batched_data_dict.BatchedDataDict`,
+  `nemo_rl.models.dtensor.parallelize.get_logprobs_from_vocab_parallel_logits`
+- **API changed in nightly:** `nemo_rl.algorithms.loss_functions` → `nemo_rl.algorithms.loss.loss_functions`.
+  Pin extraction to v0.5.0 tag for stability.
+- NeMo RL loss design note: microbatch normalization requires global token count passed
+  explicitly. Their `masked_mean` handles this. Extract `masked_mean` too.
+
+**Sampling temperature (confirmed)**
+
+- DeepSeek-R1 GRPO: temperature=1.0, num_generations=16, max_length=32768
+- DAPO (verl best practices): temperature=1.0 standard for exploration
+- TRL GRPOConfig: temperature is a first-class parameter
+- vLLM SamplingParams default: temperature=1.0 (offline), 0.7 (API server — different!)
+- **Decision:** temperature=1.0 in config. For SPO with n=1, temperature=1.0 is even more
+  critical — there's no within-group diversity, so each completion must be independently diverse.
+  Added `generation` section to config.yaml.
+
+**Unsloth LoRA hot-swapping pattern (confirmed)**
+
+- Unsloth docs: `VLLM_ALLOW_RUNTIME_LORA_UPDATING=True` for dynamic LoRA loading
+- Standard pattern: `model.save_lora("path")` → reload via vLLM adapter mechanism
+- Known issue: vLLM LoRA loading can silently succeed even with invalid path (vllm #18372)
+- **Decision:** After each `save_lora`/`load_lora`, verify by:
+  (a) checking file exists and has expected size,
+  (b) optionally generating 1 token from a fixed prompt and comparing to expected range
 
 ---
 
@@ -846,6 +948,65 @@ Replace the remaining Python/PyTorch operations with hand-written CUDA/Triton ke
 
 ---
 
+## Build Status (2026-03-18, session progress)
+
+### COMPLETED (77 tests passing)
+
+| Step | Module | Status | Tests |
+|------|--------|--------|-------|
+| 0a | checkpoint.py (GameState serializer) | DONE | 5 |
+| 0b | nemo_extracted/*.py (loss, KL, logits) | DONE | 10 |
+| 0c | advantages.py (batch reward tensors) | DONE | 3 |
+| 0d | segments.py + advantages.py (CORE ALGORITHM) | DONE | 16 |
+| 0e | data.py (DataLoader) | DONE | 9 |
+| 0f | checkpoint.py (save/resume/discover) | DONE | 6 |
+| 0g | lora_verify.py (LoRA verification) | DONE | 7 |
+| 1 | config.py + trainer.py (QGRETrainer) | DONE | 7 |
+| 4 | logging.py (MLflow tracking) | DONE | 2 |
+| 5 | checkpoint wiring in trainer | DONE | 2 |
+| 6 | logging.py (JSONL dump) | DONE | 3 |
+| 7 | test_equivalence.py (algorithm consistency) | DONE | 4 |
+| 8 | test_advantages.py (credit assignment) | DONE | 2 (in advantages tests) |
+
+### REMAINING — GPU wiring + smoke tests
+
+```
+Step 2: Generation backend — Unsloth model loading + vLLM fast_generate
+  - Write qgre/generation.py: UnslothBackend implementing GenerationBackend protocol
+  - Clean rewrite — do NOT copy patterns from training-dojo v1
+  - Smoke test model: unsloth/Qwen3-1.7B-unsloth-bnb-4bit (4-bit, ~1.5GB)
+  - RTX 5080 16GB — 1.7B fits comfortably with vLLM + training
+  - Temperature: 1.0 (standard for GRPO diversity)
+  - Stub-only generation for smoke tests — NOT full training
+  - Test: model loads, generates tokens, LoRA sync works
+
+Step 3: Reward function adapter
+  - Write adapter that imports reward_fn.py from training-dojo (symlink or copy)
+  - For smoke tests: use stub reward_fn already in examples/hypergraph/
+  - For real training (hypergraph-scan-v2): use real reward_fn.py from training-dojo
+  - Test: stub reward_fn returns correct RewardResult type
+
+GPU Smoke Tests (tests/test_smoke.py):
+  - test_model_loads: Unsloth model loads on RTX 5080
+  - test_generate_tokens: fast_generate produces non-empty output
+  - test_lora_sync: save_lora → load_lora → output differs from base
+  - test_three_steps_no_crash: 3 full training steps, no nan, no OOM
+  - test_vram_no_growth: 10 steps, memory growth < 10%
+
+GPU Wiring Tests (tests/test_wiring.py):
+  - test_generation_backend_protocol: UnslothBackend satisfies GenerationBackend
+  - test_reward_result_from_stub: stub reward_fn → RewardResult type check
+  - test_full_step_with_generation: generate → score → advantages → loss → backward
+
+Scope boundary:
+  - We are NOT doing full training runs in this repo
+  - We ARE verifying the engine works end-to-end on 3-5 steps
+  - Real training (hypergraph-scan-v2) happens in training-dojo
+  - This engine must be pip-installable and importable from training-dojo
+```
+
+---
+
 ## Reference Implementations (all Apache-2.0 or MIT)
 
 ### Primary references for our engine
@@ -940,3 +1101,357 @@ scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 - **PRPO** (Shanghai University): arxiv.org/abs/2601.07182 — process + outcome reward alignment (Feb 2026)
 - **StepGRPO**: emergentmind.com/topics/step-wise-group-relative-policy-optimization-stepgrpo — per-step normalization
 - **λ-GRPO (learnable)**: arxiv.org/abs/2510.06870 — learnable token preferences (+1.9% on Qwen2.5-1.5B). ICLR 2026, withdrawn.
+
+---
+
+## Verifiable Tests Per Deliverable
+
+Every build step has CPU-runnable tests that verify correctness WITHOUT requiring a GPU
+or a full training run. GPU-required tests are marked explicitly. Each test file maps to
+one build step. All tests use `pytest` and synthetic data.
+
+### Step 0a: GameState Serializer (`tests/test_checkpoint.py`)
+
+```python
+def test_gamestate_roundtrip():
+    """Create GameState with deque, defaultdict, nested dicts.
+    to_dict() → from_dict() → assert all fields equal."""
+
+def test_gamestate_json_serializable():
+    """to_dict() output passes json.dumps without error."""
+
+def test_gamestate_preserves_deque_maxlen():
+    """After round-trip, deque.maxlen matches original."""
+
+def test_gamestate_preserves_defaultdict_behavior():
+    """After from_dict(), accessing missing key returns default, not KeyError."""
+```
+
+### Step 0b: NeMo RL Extraction (`tests/test_nemo_extracted.py`)
+
+```python
+def test_import_loss_functions():
+    """import qgre.nemo_extracted.loss_functions succeeds with no external deps."""
+
+def test_import_kl():
+    """import qgre.nemo_extracted.kl succeeds."""
+
+def test_import_logits():
+    """import qgre.nemo_extracted.logits succeeds."""
+
+def test_clipped_pg_loss_nonzero():
+    """ClippedPGLossFn on synthetic log_probs + advantages → non-zero, finite loss."""
+    # Synthetic: 4 sequences × 32 tokens, random log_probs, random advantages
+    # Assert: loss.isfinite(), loss != 0
+
+def test_clipped_pg_loss_clip_bounds():
+    """Ratio outside [1-eps_low, 1+eps_high] → loss is clipped, not raw."""
+    # Create old_lp and new_lp with large ratio (>2.0)
+    # Assert: loss matches clipped version, not unclipped
+
+def test_kl_calculation_matches_manual():
+    """KL divergence on small tensors matches manual computation."""
+    # 2 distributions, 4 tokens, compute by hand, assert allclose
+
+def test_masked_mean_correctness():
+    """masked_mean with known mask → matches manual mean over unmasked tokens."""
+```
+
+### Step 0c: Batch Reward Tensor Construction (`tests/test_advantages.py` — partial)
+
+```python
+def test_batch_reward_tensors_shape():
+    """list[dict] with 4 items → dict[str, Tensor] with shape [4] per component."""
+
+def test_batch_reward_tensors_missing_keys():
+    """Dicts with different key sets → missing keys zero-filled."""
+
+def test_batch_reward_tensors_empty():
+    """Empty list → empty dict or dict with zero-length tensors."""
+```
+
+### Step 0d: QGREStepAdvantageEstimator (`tests/test_advantages.py` — main, `tests/test_segments.py`)
+
+**Segmentation tests:**
+```python
+def test_segment_known_sequence():
+    """Hand-crafted token IDs with known step boundaries → correct region labels."""
+    # Construct: [THINK_START, ..., THINK_END, OPEN_ANGLE, STEP_TOKEN, 16, ..., 29, content, CLOSE_SLASH, STEP_TOKEN, 16, ..., 29]
+    # Assert: regions = ["THINK", ..., "THINK", "FORMAT", ..., "FORMAT", "STEP_1", ..., "FORMAT", ...]
+
+def test_segment_no_think_block():
+    """nothink template: no THINK_START/END → no THINK regions, only STEP/FORMAT/OTHER."""
+
+def test_segment_malformed_tags():
+    """Missing closing tag → region extends to end as current type (graceful, not crash)."""
+
+def test_segment_all_four_steps():
+    """Full completion with steps 1-4 → exactly 4 STEP regions + FORMAT regions for tags."""
+```
+
+**Credit assignment tests (the crown tests):**
+```python
+def test_credit_step1_correct_step4_wrong():
+    """Step 1 scores=[1.0, 1.0], step 4 scores=[0.0, 0.0].
+    Assert: step 1 advantage > 0, step 4 advantage < 0."""
+
+def test_credit_all_steps_correct():
+    """All steps score 1.0.
+    Assert: all step advantages similar magnitude (within 0.1 of each other)."""
+
+def test_credit_phase1_format_only():
+    """active_qualities = phase 1 qualities only.
+    Assert: only step 1 has non-zero advantage (format qualities live in step 1)."""
+
+def test_credit_phase4_all_active():
+    """active_qualities = all qualities.
+    Assert: all steps have non-zero advantages."""
+```
+
+**SPO value tracker tests:**
+```python
+def test_spo_warmstart_no_spike():
+    """First observation for a prompt: V is set to reward value, advantage ≈ 0.
+    Assert: |advantage| < 0.01 on first observation."""
+
+def test_spo_second_observation_has_advantage():
+    """Second observation with different reward → advantage = reward - V(old).
+    Assert: advantage ≈ new_reward - old_reward (within EMA tolerance)."""
+
+def test_spo_on_tier_advance_resets_v():
+    """Call on_tier_advance(new_tier=2, prompt_map).
+    Assert: V[affected_prompt] is reset to defaultdict(float)."""
+
+def test_spo_value_tracker_ema_convergence():
+    """Feed 100 identical rewards → V converges to reward value.
+    Assert: |V - reward| < 0.01 after 100 updates."""
+```
+
+**GRPO fallback tests:**
+```python
+def test_grpo_fallback_group_normalize():
+    """4 completions per prompt, different rewards.
+    Assert: advantages have mean≈0 and std≈1 within group."""
+
+def test_grpo_fallback_degenerate_group():
+    """4 completions with identical rewards → all advantages ≈ 0.
+    Assert: no nan, no inf, all advantages < 0.01."""
+```
+
+**GDPO normalization tests:**
+```python
+def test_gdpo_per_step_normalize():
+    """8 completions, step 1 has high variance, step 4 has low variance.
+    After per-step normalization, both steps have std≈1.
+    Assert: step_1_advs.std() ≈ 1.0, step_4_advs.std() ≈ 1.0."""
+
+def test_gdpo_preserves_sign():
+    """Completion with step 1 above batch mean → step 1 advantage > 0.
+    Completion with step 1 below batch mean → step 1 advantage < 0."""
+```
+
+### Step 0e: DataLoader (`tests/test_data.py`)
+
+```python
+def test_load_parquet():
+    """Load small test parquet (5 rows) → 5 prompts returned."""
+
+def test_overlong_filter():
+    """One prompt exceeds max_prompt_length after tokenization → filtered out."""
+
+def test_prompt_expansion():
+    """5 prompts × n=4 → 20 items in expanded batch."""
+
+def test_shuffle_different_epochs():
+    """Epoch 1 and epoch 2 with different seeds → different order."""
+
+def test_batch_assembly():
+    """10 prompts, batch_size=4 → 3 batches (4, 4, 2)."""
+
+def test_epoch_tracker_counts():
+    """After iterating 10 steps → epoch_tracker.total_steps == 10."""
+```
+
+### Step 0f: Checkpoint Resume (`tests/test_checkpoint.py` — continued)
+
+```python
+def test_checkpoint_save_load_roundtrip():
+    """Save full state dict → load → all fields match."""
+    # Includes: model_state_dict (mock), optimizer_state_dict (mock),
+    # game_state, global_step, rng_state
+
+def test_checkpoint_discovery_finds_latest():
+    """Create dir with global_step_10, global_step_50, global_step_30.
+    Assert: discover_latest_checkpoint() returns global_step_50."""
+
+def test_checkpoint_rng_state_restored():
+    """Save RNG → generate 5 random numbers → restore RNG → generate 5 again.
+    Assert: both sequences identical."""
+
+def test_checkpoint_includes_advantage_estimator_state():
+    """V tracker and _step_seen persist through save/load.
+    Assert: V[prompt_id][step_num] matches after round-trip."""
+```
+
+### Step 1: QGRETrainer (`tests/test_trainer.py`)
+
+```python
+def test_trainer_forward_finite_loss():
+    """Synthetic batch through trainer._compute_loss() → loss is finite, non-zero.
+    Uses mock model that returns random logits."""
+
+def test_gradient_accumulation_equivalence():
+    """1 batch of size 8 vs 2 batches of size 4 with accumulation.
+    Assert: final loss within 1e-5."""
+
+def test_response_mask_masks_padding():
+    """Sequence with PAD tokens after EOS → mask is 0 for PAD positions."""
+
+def test_on_policy_mode():
+    """old_log_probs == log_probs.detach().
+    Assert: torch.equal(old_lp, lp.detach())."""
+
+def test_mode_switch_spo_vs_grpo():
+    """Config mode='spo' → uses SPO estimator. mode='grpo' → uses GRPO estimator.
+    Assert: different advantage values for same input."""
+```
+
+### Steps 2-3: Generation + Reward Wiring (`tests/test_wiring.py`) — GPU required
+
+```python
+@pytest.mark.gpu
+def test_model_loads():
+    """Unsloth model loads without error on available GPU."""
+
+@pytest.mark.gpu
+def test_fast_generate_produces_tokens():
+    """fast_generate with 1 prompt → output has >0 tokens."""
+
+@pytest.mark.gpu
+def test_lora_sync_changes_output():
+    """Generate with base → train 1 step → save_lora → load_lora → generate again.
+    Assert: outputs differ (LoRA is actually applied)."""
+
+def test_reward_result_type():
+    """RewardResult has .scores (dict), .phase (int), .reward (float)."""
+
+def test_reward_fn_returns_correct_type():
+    """Mock reward_fn returns RewardResult with expected keys."""
+```
+
+### Step 4: MLflow Logging (`tests/test_logging.py`)
+
+```python
+def test_mlflow_metrics_logged(mock_mlflow):
+    """After 1 trainer step, mlflow.log_metrics called with expected metric names.
+    Assert: 'reward/mean', 'reward/step_1', 'advantage/step_1' in logged keys."""
+
+def test_per_step_metrics_present(mock_mlflow):
+    """Metrics include step_1 through step_4 for both reward and advantage."""
+```
+
+### Step 5: Checkpoint Wiring (`tests/test_checkpoint.py` — continued)
+
+```python
+def test_train_save_load_step_counter():
+    """Train 3 steps → save → new trainer → load → step counter == 3."""
+
+def test_v_tracker_persists_across_checkpoint():
+    """SPO V tracker values present after save/load cycle."""
+```
+
+### Step 6: JSONL Dump (`tests/test_logging.py` — continued)
+
+```python
+def test_completion_jsonl_valid():
+    """Written line parses as valid JSON."""
+
+def test_completion_jsonl_fields():
+    """JSON contains: input, output, score, reward_components, step."""
+```
+
+### Step 7: Equivalence Test (`tests/test_equivalence.py`)
+
+```python
+def test_advantages_match_reference():
+    """Fixed completions + rewards from verl JSONL → advantages within 1% of reference.
+    Load reference data, run through QGREStepAdvantageEstimator, compare."""
+
+def test_loss_matches_reference():
+    """Same fixed data → loss within 1% of reference.
+    Tests algorithm layer only, not generation or reward."""
+```
+
+### Step 8: Credit Assignment Integration (`tests/test_advantages.py` — integration)
+
+```python
+def test_full_pipeline_credit_assignment():
+    """Realistic synthetic data: 8 completions with varied per-step quality.
+    Run through full pipeline: segment → step_rewards → SPO → GDPO → broadcast.
+    Assert: per-token advantages reflect per-step quality, not sequence-level."""
+
+def test_think_tokens_get_zero_advantage():
+    """Tokens in THINK region → advantage == 0."""
+
+def test_format_tokens_get_zero_advantage():
+    """Tokens in FORMAT region (tag tokens) → advantage == 0."""
+```
+
+### GPU Smoke Test (`tests/test_smoke.py`) — THE MISSING TEST
+
+```python
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_three_steps_no_crash():
+    """Load model, run 3 full training steps on GPU.
+    Assert: no crash, no nan loss, no OOM, final loss < initial loss * 2."""
+
+@pytest.mark.gpu
+def test_lora_sync_verification():
+    """After optimizer step + save_lora + load_lora:
+    Hash LoRA weight tensors → generate → verify output is not base-model-like.
+    This catches the ms-swift #8233 failure mode."""
+
+@pytest.mark.gpu
+def test_vram_does_not_grow():
+    """Run 10 steps, measure GPU memory at step 1, 5, 10.
+    Assert: memory_step_10 < memory_step_1 * 1.1 (less than 10% growth).
+    This catches the unsloth #3864 leak."""
+```
+
+### Test Infrastructure
+
+```
+tests/
+  conftest.py          — fixtures: mock_model, mock_tokenizer, synthetic_batch,
+                         synthetic_reward_results, known_token_sequences
+  test_checkpoint.py   — Steps 0a, 0f, 5
+  test_nemo_extracted.py — Step 0b
+  test_segments.py     — Step 0d (segmentation only)
+  test_advantages.py   — Steps 0c, 0d, 8 (advantage computation)
+  test_data.py         — Step 0e
+  test_trainer.py      — Step 1
+  test_wiring.py       — Steps 2-3 (GPU required)
+  test_logging.py      — Steps 4, 6
+  test_equivalence.py  — Step 7
+  test_smoke.py        — GPU smoke test (slow)
+```
+
+**Run order:**
+```bash
+# CPU tests — run after each step, takes seconds
+pytest tests/ -k "not gpu and not slow"
+
+# GPU tests — run after Step 2 wiring complete
+pytest tests/ -m gpu
+
+# Full suite including smoke test
+pytest tests/ -m "gpu and slow"
+```
+
+**Test data fixtures (in conftest.py):**
+- `known_token_ids`: Hand-crafted sequences with known step boundaries using real Qwen3 token IDs
+- `synthetic_reward_results`: List of RewardResult with controlled per-quality scores
+- `synthetic_batch`: Prompt IDs, token IDs, reward results, active qualities — all synthetic
+- `mock_game_state`: GameState with non-trivial state (non-empty deque, nested dicts)
+- `small_parquet`: 5-row parquet file written to tmp dir for DataLoader tests

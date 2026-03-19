@@ -1,14 +1,13 @@
 # Hypergraph decomposability — QGRE engine config
-# Domain: hypergraph-scan-v1 (the paper's experiment)
+# Smoke test model: Qwen3-1.7B (fits on RTX 5080 16GB with vLLM)
 
 model:
-  path: Qwen/Qwen3-8B
-  tokenizer_path: tokenizer/qwen3-8B-nothink
-  lora_rank: 16
-  lora_alpha: 32
-  load_in_4bit: false
+  path: unsloth/Qwen3-1.7B-unsloth-bnb-4bit
+  lora_rank: 8
+  lora_alpha: 16
+  load_in_4bit: true
   fast_inference: true
-  gpu_memory_utilization: 0.45
+  gpu_memory_utilization: 0.6
 
 data:
   train_files:
@@ -16,6 +15,13 @@ data:
   max_prompt_length: 3200
   max_response_length: 2048
   train_batch_size: 16
+
+generation:
+  temperature: 1.0          # GRPO/SPO: 1.0 for diversity (DeepSeek-R1 default)
+  top_p: 1.0               # no nucleus filtering (let temperature control diversity)
+  top_k: -1                # disabled
+  max_tokens: 2048         # matches max_response_length
+  stop_token_ids: [151643, 151645]  # <|endoftext|>, <|im_end|>
 
 algorithm:
   mode: spo               # or "grpo"

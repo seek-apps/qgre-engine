@@ -18,3 +18,6 @@ mlruns/
 wandb/
 *.parquet
 tokenizer/
+unsloth_compiled_cache/
+.claude/scheduled_tasks.lock
+.pytest_cache/

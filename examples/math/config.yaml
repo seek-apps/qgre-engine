@@ -13,6 +13,12 @@ data:
   max_response_length: 1024
   train_batch_size: 8
 
+generation:
+  temperature: 1.0
+  top_p: 1.0
+  top_k: -1
+  max_tokens: 1024
+
 algorithm:
   mode: grpo
   grpo:

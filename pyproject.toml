@@ -40,3 +40,9 @@ Repository = "https://github.com/seek-apps/qgre-engine"
 
 [tool.setuptools.packages.find]
 include = ["qgre*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "gpu: requires CUDA GPU (skip with -m 'not gpu')",
+    "slow: slow tests (skip with -m 'not slow')",
+]
