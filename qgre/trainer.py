@@ -236,7 +236,7 @@ class QGRETrainer:
         ] * len(reward_results)
 
         # Compute per-token advantages (segment → step rewards → SPO/GRPO → GDPO → broadcast)
-        token_advantages = self.advantage_estimator.compute_advantages(
+        token_advantages, batch_regions = self.advantage_estimator.compute_advantages(
             batch_prompt_ids=batch.prompt_ids,
             batch_token_ids=completions,
             batch_reward_results=reward_results,
@@ -256,8 +256,17 @@ class QGRETrainer:
         for i, c in enumerate(completions):
             comp_tensor[i, :len(c)] = torch.tensor(c, dtype=torch.long, device=device)
 
+        # SPO low-advantage filter: skip sequences with near-zero signal (PLAN.md lines 658-671)
+        if self.config.algorithm.mode == "spo":
+            useful = (padded_advs.abs() > 0.01).any(dim=-1)
+            if useful.sum() >= 2 and useful.sum() < len(completions):
+                idx = useful.nonzero(as_tuple=True)[0]
+                padded_advs = padded_advs[idx]
+                comp_tensor = comp_tensor[idx]
+                # Update batch references for logging (keep original for mastery tracking)
+
         # Response mask
-        prompt_lengths = [0] * len(completions)
+        prompt_lengths = [0] * comp_tensor.shape[0]
         response_mask = self.compute_response_mask(comp_tensor, prompt_lengths)[:, 1:]
 
         if response_mask.sum() == 0:

@@ -88,8 +88,12 @@ class QGREStepAdvantageEstimator:
         batch_reward_results: list[RewardResult],
         batch_active_qualities: list[list[str]],
         group_size: int | None = None,
-    ) -> list[torch.Tensor]:
-        """Compute per-token advantages via segment → step rewards → SPO/GRPO → GDPO → broadcast."""
+    ) -> tuple[list[torch.Tensor], list[list[str]]]:
+        """Compute per-token advantages via segment → step rewards → SPO/GRPO → GDPO → broadcast.
+
+        Returns:
+            (batch_advantages, batch_regions) — per-token advantages and region labels
+        """
         batch_size = len(batch_token_ids)
 
         # Phase 1: Segment tokens + compute per-step rewards
@@ -143,7 +147,7 @@ class QGREStepAdvantageEstimator:
                         token_advs[t] = step_advs[sn][i]
             batch_advantages.append(token_advs)
 
-        return batch_advantages
+        return batch_advantages, all_regions
 
     def _compute_spo_advantages(
         self,

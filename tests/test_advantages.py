@@ -99,7 +99,7 @@ def test_credit_step1_correct_step4_wrong():
     rr_good_s1 = _make_reward_result(step1_score=1.0, step4_score=0.0)
     rr_good_s4 = _make_reward_result(step1_score=0.0, step4_score=1.0)
 
-    advs = estimator.compute_advantages(
+    advs, _ = estimator.compute_advantages(
         batch_prompt_ids=[1, 1],
         batch_token_ids=[tokens, tokens],
         batch_reward_results=[rr_good_s1, rr_good_s4],
@@ -134,7 +134,7 @@ def test_credit_all_steps_correct():
         batch_active_qualities=[ALL_QUALITIES, ALL_QUALITIES],
     )
 
-    advs = estimator.compute_advantages(
+    advs, _ = estimator.compute_advantages(
         batch_prompt_ids=[1, 2],
         batch_token_ids=[tokens, tokens],
         batch_reward_results=[rr1, rr2],
@@ -163,7 +163,7 @@ def test_credit_phase1_format_only():
         batch_active_qualities=[phase1_qualities, phase1_qualities],
     )
 
-    advs = estimator.compute_advantages(
+    advs, _ = estimator.compute_advantages(
         batch_prompt_ids=[1, 2],
         batch_token_ids=[tokens, tokens],
         batch_reward_results=[rr1, rr2],
@@ -188,7 +188,7 @@ def test_spo_warmstart_no_spike():
     tokens = _make_completion_tokens()
     rr = _make_reward_result(step1_score=0.8, step4_score=0.6)
 
-    advs = estimator.compute_advantages(
+    advs, _ = estimator.compute_advantages(
         batch_prompt_ids=[1, 1],
         batch_token_ids=[tokens, tokens],
         batch_reward_results=[rr, rr],
@@ -217,7 +217,7 @@ def test_spo_second_observation_has_advantage():
     )
 
     # Second call with different rewards → advantages exist
-    advs = estimator.compute_advantages(
+    advs, _ = estimator.compute_advantages(
         batch_prompt_ids=[1, 2],
         batch_token_ids=[tokens, tokens],
         batch_reward_results=[rr2, rr1],  # swap
@@ -285,7 +285,7 @@ def test_grpo_fallback_group_normalize():
         _make_reward_result(step1_score=0.2, step4_score=0.1),
     ]
 
-    advs = estimator.compute_advantages(
+    advs, _ = estimator.compute_advantages(
         batch_prompt_ids=[1, 1, 1, 1],
         batch_token_ids=[tokens] * 4,
         batch_reward_results=results,
@@ -305,7 +305,7 @@ def test_grpo_fallback_degenerate_group():
 
     rr = _make_reward_result(step1_score=0.8, step4_score=0.8)
 
-    advs = estimator.compute_advantages(
+    advs, _ = estimator.compute_advantages(
         batch_prompt_ids=[1, 1, 1, 1],
         batch_token_ids=[tokens] * 4,
         batch_reward_results=[rr] * 4,
@@ -335,7 +335,7 @@ def test_gdpo_per_step_normalize():
         _make_reward_result(step1_score=0.2, step4_score=0.5),
     ]
 
-    advs = estimator.compute_advantages(
+    advs, _ = estimator.compute_advantages(
         batch_prompt_ids=[1, 2, 3, 4],
         batch_token_ids=[tokens] * 4,
         batch_reward_results=results,
@@ -362,7 +362,7 @@ def test_gdpo_preserves_sign():
         _make_reward_result(step1_score=0.0, step4_score=0.0),  # below mean
     ]
 
-    advs = estimator.compute_advantages(
+    advs, _ = estimator.compute_advantages(
         batch_prompt_ids=[1, 2],
         batch_token_ids=[tokens] * 2,
         batch_reward_results=results,
@@ -396,7 +396,7 @@ def test_think_tokens_get_zero_advantage():
     rr1 = _make_reward_result(step1_score=1.0, step4_score=0.5)
     rr2 = _make_reward_result(step1_score=0.0, step4_score=0.8)
 
-    advs = estimator.compute_advantages(
+    advs, _ = estimator.compute_advantages(
         batch_prompt_ids=[1, 2],
         batch_token_ids=[tokens, tokens],
         batch_reward_results=[rr1, rr2],
@@ -424,7 +424,7 @@ def test_format_tokens_get_zero_advantage():
     rr1 = _make_reward_result(step1_score=1.0, step4_score=0.5)
     rr2 = _make_reward_result(step1_score=0.0, step4_score=0.8)
 
-    advs = estimator.compute_advantages(
+    advs, _ = estimator.compute_advantages(
         batch_prompt_ids=[1, 2],
         batch_token_ids=[tokens, tokens],
         batch_reward_results=[rr1, rr2],
@@ -473,7 +473,7 @@ def test_gdpo_batch_size_1_no_nan():
     )
 
     # Second call with batch_size=1 — must not produce NaN
-    advs = estimator.compute_advantages(
+    advs, _ = estimator.compute_advantages(
         batch_prompt_ids=[1],
         batch_token_ids=[tokens],
         batch_reward_results=[rr],

@@ -61,6 +61,11 @@ class AlgorithmConfig:
     llds_coef: float = 0.05
     entropy_coeff: float = 0.001
     step_qualities: dict | None = None  # {step_num: [quality_names]} — domain-specific
+    # Region-specific KL multipliers (THR-style, PLAN.md lines 798-802)
+    # THINK=explore freely, FORMAT=lock structure, STEP=focus on quality
+    kl_think_multiplier: float = 0.1   # Low KL for think tokens (explore)
+    kl_format_multiplier: float = 2.0  # High KL for format tokens (exploit)
+    kl_step_multiplier: float = 1.0    # Normal KL for step content
 
 
 @dataclass

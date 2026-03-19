@@ -66,6 +66,7 @@ class ClippedPGLossFn:
         advantages: torch.Tensor,
         mask: torch.Tensor,
         reference_logprobs: torch.Tensor | None = None,
+        kl_region_weights: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
         """Compute clipped PG loss.
 
@@ -130,7 +131,10 @@ class ClippedPGLossFn:
             else:
                 kl_weights = torch.ones_like(curr_logprobs)
 
-            kl = kl_weights * self.reference_policy_kl_penalty * calculate_kl(
+            # Region-specific KL: scale penalty per-token by region weights (THR-style)
+            # THINK=0.1 (explore), FORMAT=2.0 (lock), STEP=1.0 (normal)
+            region_scale = kl_region_weights if kl_region_weights is not None else 1.0
+            kl = kl_weights * self.reference_policy_kl_penalty * region_scale * calculate_kl(
                 logprobs=curr_logprobs,
                 logprobs_reference=reference_logprobs,
                 kl_type=self.reference_policy_kl_type,
