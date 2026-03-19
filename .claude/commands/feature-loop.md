@@ -358,7 +358,7 @@ Known deferred items (not bugs, design decisions for v2):
   - CompletionLogger file handle leak on crash (flush() mitigates, __del__ would be cleaner)
 ```
 
-### ACTIVE WORK: Generalize engine (remove v1 hardcoding)
+### COMPLETED: Generalize engine (remove v1 hardcoding) — committed de2a74c + 5471ee0
 
 The engine is currently hardcoded to 4 XML steps with v1-specific quality names.
 This must be generalized so any domain can use the engine.
