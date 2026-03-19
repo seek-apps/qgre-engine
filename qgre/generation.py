@@ -55,6 +55,21 @@ class UnslothBackend:
             use_gradient_checkpointing="unsloth",
         )
 
+        # Verify pad token setup after Unsloth load.
+        # Unsloth assigns <|PAD_TOKEN|> (151669) for Qwen3 — this is correct:
+        #   - It's a real token in the vocab (not None)
+        #   - It's NOT a stop token (151643, 151645 are stop tokens)
+        #   - It's NOT the EOS token (151645)
+        # Do NOT use <|endoftext|> (151643) as pad — it's a stop token!
+        # The Unsloth warning "does not have a padding token" is cosmetic.
+        if tokenizer.pad_token_id is not None and tokenizer.pad_token_id == tokenizer.eos_token_id:
+            # PAD aliased to EOS — fix by using Unsloth's <|PAD_TOKEN|> or <|vision_pad|>
+            tokenizer.pad_token = "<|PAD_TOKEN|>"
+            tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids("<|PAD_TOKEN|>")
+            if tokenizer.pad_token_id is None:
+                tokenizer.pad_token = "<|vision_pad|>"
+                tokenizer.pad_token_id = 151654
+
         self.model = model
         self.tokenizer = tokenizer
         self._FastLanguageModel = FastLanguageModel

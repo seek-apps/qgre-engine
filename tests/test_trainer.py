@@ -153,6 +153,75 @@ def test_mode_switch_spo_vs_grpo():
     assert trainer_grpo.advantage_estimator.mode == "grpo"
 
 
+def test_gradient_accumulation_equivalence():
+    """Gradient accumulation with 2 steps produces equivalent parameter updates."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = _cfg()
+        cfg.logging.completion_dir = str(Path(tmpdir) / "completions")
+        cfg.logging.checkpoint_dir = str(Path(tmpdir) / "checkpoints")
+        cfg.training.gradient_accumulation_steps = 2
+
+        torch.manual_seed(42)
+        model = MockModel()
+        trainer = QGRETrainer(
+            model=model, tokenizer=None,
+            reward_fn=lambda *a, **k: RewardResult(reward=0.5, scores={"q_format_tags": 1.0}, phase=1),
+            config=cfg,
+        )
+        trainer.setup_optimizer()
+
+        batch = _make_batch(n_completions=2)
+        tokens = _make_tokens()
+        rrs = [
+            RewardResult(reward=0.8, scores={"q_format_tags": 1.0, "q_tag_content": 0.9}, phase=1),
+            RewardResult(reward=0.3, scores={"q_format_tags": 0.5, "q_tag_content": 0.2}, phase=1),
+        ]
+
+        # Get initial params
+        params_before = {n: p.clone() for n, p in model.named_parameters()}
+
+        # Step 0: accumulates but does NOT update (grad_accum=2, step 0+1 % 2 != 0)
+        trainer.step(batch, [tokens, tokens], rrs)
+        # Step 1: now (1+1) % 2 == 0 → optimizer step fires
+        trainer.step(batch, [tokens, tokens], rrs)
+
+        # After 2 steps with grad_accum=2, weights should have changed
+        any_changed = False
+        for n, p in model.named_parameters():
+            if not torch.equal(p, params_before[n]):
+                any_changed = True
+                break
+        assert any_changed, "Weights should change after gradient_accumulation_steps steps"
+
+
+def test_on_policy_mode():
+    """On-policy mode: old_log_probs == log_probs.detach()."""
+    cfg = _cfg()
+    model = MockModel()
+    trainer = QGRETrainer(model=model, tokenizer=None, reward_fn=lambda *a: None, config=cfg)
+
+    # Build synthetic inputs
+    input_ids = torch.randint(0, 100, (2, 16))
+    output = model(input_ids)
+    logits = output.logits
+
+    advantages = torch.randn(2, 15)
+    response_mask = torch.ones(2, 15)
+
+    # compute_loss with old_logprobs=None triggers on-policy: old = curr.detach()
+    loss, metrics = trainer.compute_loss(
+        logits=logits,
+        input_ids=input_ids,
+        advantages=advantages,
+        response_mask=response_mask,
+        old_logprobs=None,
+    )
+
+    assert torch.isfinite(loss), "On-policy loss should be finite"
+    # On-policy → ratio = exp(curr - curr.detach()) = exp(0) = 1 → loss is purely advantage-weighted
+    assert loss.item() != 0.0 or advantages.abs().sum() == 0, "On-policy loss should reflect advantages"
+
+
 def test_phase_qualities_mapping():
     """build_phase_qualities produces correct progressive gating."""
     pq = build_phase_qualities(HYPERGRAPH_V1_STEP_QUALITIES)

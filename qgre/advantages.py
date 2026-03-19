@@ -66,9 +66,11 @@ class QGREStepAdvantageEstimator:
         mode: str = "spo",
         step_qualities: dict[int, list[str]] | None = None,
         segmenter: Segmenter | None = None,
+        normalize_advantages: bool = True,
     ):
         self.lr = lr
         self.mode = mode
+        self.normalize_advantages = normalize_advantages
         if step_qualities is None:
             raise ValueError(
                 "step_qualities is required. Pass a dict mapping step numbers to quality names, e.g.:\n"
@@ -128,11 +130,15 @@ class QGREStepAdvantageEstimator:
             )
 
         # GDPO-style: normalize each step's advantages across the batch
+        # When normalize_advantages=False (Dr.GRPO), skip std division to avoid bias
         for step_num in self._step_nums:
             mean = step_advs[step_num].mean()
-            std = step_advs[step_num].std(correction=0)
-            if std > 1e-8:
-                step_advs[step_num] = (step_advs[step_num] - mean) / (std + 1e-8)
+            if self.normalize_advantages:
+                std = step_advs[step_num].std(correction=0)
+                if std > 1e-8:
+                    step_advs[step_num] = (step_advs[step_num] - mean) / (std + 1e-8)
+                else:
+                    step_advs[step_num] = step_advs[step_num] - mean
             else:
                 step_advs[step_num] = step_advs[step_num] - mean
 
@@ -196,15 +202,21 @@ class QGREStepAdvantageEstimator:
                 end = start + group_size
                 group_rewards = [all_step_rewards[i].get(step_num, 0.0) for i in range(start, end)]
                 mean = float(np.mean(group_rewards))
-                std = float(np.std(group_rewards)) + 1e-8
-                for i in range(start, end):
-                    step_advs[step_num][i] = (all_step_rewards[i].get(step_num, 0.0) - mean) / std
+                std = float(np.std(group_rewards))
+                if std < 1e-8:
+                    # DAPO Dynamic Sampling: all-identical rewards → zero advantage (no signal)
+                    for i in range(start, end):
+                        step_advs[step_num][i] = 0.0
+                else:
+                    for i in range(start, end):
+                        step_advs[step_num][i] = (all_step_rewards[i].get(step_num, 0.0) - mean) / (std + 1e-8)
 
     def on_tier_advance(self, new_tier: int, prompt_tier_map: dict[int, int]):
+        """Reset SPO baseline for the NEW step only — preserve learned baselines for mastered steps."""
         for pid, tier in prompt_tier_map.items():
             if tier == new_tier:
-                self.V[pid] = defaultdict(float)
-                self._step_seen[pid] = set()
+                self.V[pid][new_tier] = 0.0
+                self._step_seen[pid].discard(new_tier)
 
     def state_dict(self) -> dict:
         return {

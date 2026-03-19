@@ -113,5 +113,10 @@ MATH_STEP_QUALITIES: dict[int, list[str]] = {
     1: ["q_correct_answer"],
 }
 
+# Global qualities: not step-specific, contribute to overall sequence reward only.
+# These are tracked in RewardResult.scores but not assigned to per-token advantages.
+# (SPECIAL-TOKENS-SUPERPOWER.md line 104-106)
+HYPERGRAPH_V1_GLOBAL_QUALITIES: list[str] = ["q_eos_correct"]
+
 # Backward compatibility alias
 STEP_QUALITIES = HYPERGRAPH_V1_STEP_QUALITIES

@@ -201,6 +201,22 @@ def test_checkpoint_includes_advantage_estimator_state(mock_game_state):
         assert loaded["advantage_estimator_state"]["step_seen"][42] == [1, 2, 4]
 
 
+def test_gamestate_preserves_defaultdict_behavior():
+    """After from_dict(), accessing missing key returns default, not KeyError."""
+    gs = GameState()
+    gs.record_step_score(1, 0.9)
+    d = gamestate_to_dict(gs)
+    restored = gamestate_from_dict(d)
+
+    # step_mastery is a plain dict after from_dict, but GameState.record_step_score
+    # handles missing keys internally, so accessing via get_step_mastery should work
+    assert restored.get_step_mastery(99) == 0.0  # missing step → 0.0, not KeyError
+
+    # record_step_score on a new step should also work without KeyError
+    restored.record_step_score(99, 0.5)
+    assert restored.get_step_mastery(99) == 0.5
+
+
 # --- Step 5: Trainer checkpoint wiring ---
 
 

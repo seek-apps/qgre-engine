@@ -149,3 +149,81 @@ def test_logprobs_from_logits():
     expected = torch.tensor([[lp[0, 0, 2].item(), lp[0, 1, 1].item()]])
 
     assert torch.allclose(result, expected, atol=1e-6)
+
+
+def test_selective_log_softmax_fp32_equivalence():
+    """selective_log_softmax (fp32 path) matches naive log_softmax + gather."""
+    from qgre.nemo_extracted.logits import selective_log_softmax
+
+    torch.manual_seed(42)
+    batch, seq, vocab = 4, 64, 1024
+    logits = torch.randn(batch, seq, vocab, dtype=torch.float32)
+    labels = torch.randint(0, vocab, (batch, seq))
+
+    result = selective_log_softmax(logits, labels)
+
+    # Naive reference: full log_softmax + gather
+    lp = torch.nn.functional.log_softmax(logits, dim=-1)
+    expected = lp.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+
+    assert torch.allclose(result, expected, atol=1e-5), (
+        f"max diff: {(result - expected).abs().max().item()}"
+    )
+    assert (result <= 0).all(), "log probs must be ≤ 0"
+
+
+def test_selective_log_softmax_bf16_equivalence():
+    """selective_log_softmax (bf16 path) matches naive within bf16 tolerance."""
+    from qgre.nemo_extracted.logits import selective_log_softmax
+
+    torch.manual_seed(42)
+    batch, seq, vocab = 4, 64, 1024
+    logits = torch.randn(batch, seq, vocab, dtype=torch.bfloat16)
+    labels = torch.randint(0, vocab, (batch, seq))
+
+    result = selective_log_softmax(logits, labels)
+
+    # Naive reference in fp32 for comparison
+    lp = torch.nn.functional.log_softmax(logits.float(), dim=-1)
+    expected = lp.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1).float()
+
+    # bf16 log_softmax has ~0.05 max error vs fp32 reference (expected for half precision)
+    assert torch.allclose(result, expected, atol=0.05), (
+        f"max diff: {(result - expected).abs().max().item()}"
+    )
+    assert (result <= 0).all(), "log probs must be ≤ 0"
+
+
+def test_selective_log_softmax_large_vocab():
+    """selective_log_softmax works with Qwen3-sized vocab (151936)."""
+    from qgre.nemo_extracted.logits import selective_log_softmax
+
+    batch, seq, vocab = 1, 8, 151936  # Qwen3 vocab
+    logits = torch.randn(batch, seq, vocab, dtype=torch.float32) * 0.1 - 3.0
+    labels = torch.randint(0, vocab, (batch, seq))
+
+    result = selective_log_softmax(logits, labels)
+
+    assert result.shape == (batch, seq)
+    assert result.isfinite().all()
+    assert (result <= 0).all(), "log probs must be ≤ 0"
+
+
+def test_logprobs_from_logits_selective_vs_old():
+    """logprobs_from_logits (using selective) matches old naive implementation numerically."""
+    from qgre.nemo_extracted.logits import logprobs_from_logits
+
+    torch.manual_seed(42)
+    batch, seq, vocab = 2, 128, 512
+    logits = torch.randn(batch, seq, vocab, dtype=torch.float32)
+    labels = torch.randint(0, vocab, (batch, seq))
+
+    result = logprobs_from_logits(logits, labels, chunk_size=32)
+
+    # Reference: full naive log_softmax + gather (no chunking)
+    lp = torch.nn.functional.log_softmax(logits, dim=-1)
+    expected = lp.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1).float()
+
+    assert torch.allclose(result, expected, atol=1e-5), (
+        f"max diff: {(result - expected).abs().max().item()}"
+    )

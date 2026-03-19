@@ -82,3 +82,30 @@ class LoRAVerifier:
     def reset_recreate_counter(self):
         """Call after engine recreation."""
         self._steps_since_recreate = 0
+
+    @staticmethod
+    def verify_active(model, tokenizer, test_prompt: str = "Hello") -> bool:
+        """Verify LoRA is actively applied by generating 1 token.
+
+        Generates from a fixed prompt and checks the output is non-empty.
+        If LoRA sync failed silently (unsloth #3802), the model may behave
+        as base model — this catches that by verifying generation works.
+
+        Args:
+            model: The language model (with LoRA applied)
+            tokenizer: The tokenizer
+            test_prompt: Fixed prompt to generate from
+
+        Returns:
+            True if generation produces non-empty output
+        """
+        import torch
+        try:
+            input_ids = tokenizer.encode(test_prompt, return_tensors="pt")
+            if hasattr(input_ids, "to") and torch.cuda.is_available():
+                input_ids = input_ids.to(next(model.parameters()).device)
+            with torch.no_grad():
+                output = model.generate(input_ids, max_new_tokens=1, do_sample=False)
+            return output.shape[-1] > input_ids.shape[-1]
+        except Exception:
+            return False

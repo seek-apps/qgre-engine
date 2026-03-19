@@ -36,6 +36,7 @@ class ClippedPGLossConfig(TypedDict):
     truncated_importance_sampling_ratio: float | None
     token_level_loss: bool
     force_on_policy_ratio: NotRequired[bool]
+    remove_length_normalization: NotRequired[bool]  # Dr.GRPO: skip horizon division
 
 
 class ClippedPGLossFn:
@@ -58,6 +59,7 @@ class ClippedPGLossFn:
         self.use_importance_sampling_correction = cfg["use_importance_sampling_correction"]
         self.truncated_importance_sampling_ratio = cfg["truncated_importance_sampling_ratio"]
         self.token_level_loss = cfg["token_level_loss"]
+        self.remove_length_normalization = cfg.get("remove_length_normalization", False)
 
     def __call__(
         self,
@@ -117,11 +119,15 @@ class ClippedPGLossFn:
         # Equal weight to each sequence, then normalize by horizon length
         weighted_loss = importance_weights * clip_loss
         if self.token_level_loss:
-            # seq-mean-token-sum-norm: sum per-token, mean per-seq, normalize by horizon
             seq_losses = torch.sum(weighted_loss * mask, dim=-1)
             seq_mask = (mask.sum(dim=-1) > 0).float()
             n_valid_seqs = seq_mask.sum().clamp(min=1)
-            actor_loss = (seq_losses * seq_mask).sum() / n_valid_seqs / max(mask.shape[-1], 1)
+            if self.remove_length_normalization:
+                # Dr.GRPO (arXiv:2503.20783): no horizon division — unbiased gradients
+                actor_loss = (seq_losses * seq_mask).sum() / n_valid_seqs
+            else:
+                # seq-mean-token-sum-norm: sum per-token, mean per-seq, normalize by horizon
+                actor_loss = (seq_losses * seq_mask).sum() / n_valid_seqs / max(mask.shape[-1], 1)
         else:
             actor_loss = masked_mean(
                 masked_mean(weighted_loss, mask, dim=-1),

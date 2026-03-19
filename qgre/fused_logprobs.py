@@ -16,6 +16,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from qgre.nemo_extracted.logits import selective_log_softmax
+
 
 def chunked_logprobs_from_hidden(
     hidden_states: torch.Tensor,
@@ -24,6 +26,13 @@ def chunked_logprobs_from_hidden(
     chunk_size: int = 256,
 ) -> torch.Tensor:
     """Compute log probs from hidden states via chunked lm_head projection.
+
+    Uses selective_log_softmax: never materializes a [chunk, vocab] log-prob tensor.
+    For fp32: uses logsumexp identity (zero vocab-sized allocations).
+    For bf16: per-row log_softmax fallback (one [vocab] allocation at a time).
+
+    Peak VRAM per chunk: batch × chunk_size (just the gathered scalars)
+    vs old approach: batch × chunk_size × vocab (74MB per chunk for Qwen3).
 
     Args:
         hidden_states: [batch, seq, hidden] — output of model body (before lm_head)
@@ -39,19 +48,16 @@ def chunked_logprobs_from_hidden(
 
     for start in range(0, seq_len, chunk_size):
         end = min(start + chunk_size, seq_len)
-        chunk_hidden = hidden_states[:, start:end, :]  # [batch, chunk, hidden]
+        chunk_hidden = hidden_states[:, start:end, :]
 
         # Apply lm_head to chunk only — [batch, chunk, vocab]
         chunk_logits = lm_head(chunk_hidden)
 
-        # log_softmax in native dtype (bf16), gather, cast to float32
-        chunk_lp = torch.nn.functional.log_softmax(chunk_logits, dim=-1)
+        # selective_log_softmax: gathers without materializing full log-prob tensor
         chunk_labels = labels[:, start:end]
-        result[:, start:end] = chunk_lp.gather(
-            dim=-1, index=chunk_labels.unsqueeze(-1)
-        ).squeeze(-1).to(torch.float32)
+        result[:, start:end] = selective_log_softmax(chunk_logits, chunk_labels)
 
-        del chunk_logits, chunk_lp  # Free immediately
+        del chunk_logits
 
     return result
 

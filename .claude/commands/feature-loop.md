@@ -346,315 +346,98 @@ For GPU tests: run them with `pytest --gpu` if the GPU is available
 (`nvidia-smi` shows free memory). If GPU is busy, skip GPU tests and
 continue with CPU-testable work.
 
-## Current Work Queue (auto-updated, 2026-03-18)
+## Current Work Queue (auto-updated, 2026-03-19)
 
-Engine is FEATURE LOOP COMPLETE. 85 CPU tests + 3 GPU smoke tests pass.
-Three rounds of review completed (code-reviewer + silent-failure-hunter + simplifier × 2).
-13 bugs found in round 1, all fixed. 2 issues found in round 2 (config _pick, missing regression tests), both fixed.
-5 regression tests added for the most critical fixes.
+FEATURE LOOP COMPLETE. 103 CPU tests + 9 GPU tests (3 smoke + 3 wiring + 3 Triton) = 112 total.
+All plan items implemented. Phase 4 Triton kernel built. Dr.GRPO + DAPO modes added.
+8×4096 GPU stress test passes on RTX 5080 16GB (8.2s, peak 8666 MB).
 
-### Session Build Log
-
-```
-Round 1 — Build (8 iterations):
-  0a: GameState serializer → checkpoint.py (11 tests)
-  0b: NeMo RL extraction → loss_functions.py, kl.py, logits.py (10 tests)
-  0c+0d: Advantage estimator → segments.py + advantages.py (22 tests)
-  0e: DataLoader → data.py (9 tests)
-  0f: Checkpoint resume → checkpoint.py (extends 0a tests)
-  0g: LoRA verifier → lora_verify.py (7 tests)
-  1+4+6: Trainer + config + logging → trainer.py, config.py, logging.py (12 tests)
-  2: Generation backend → generation.py (GPU tests)
-
-Round 2 — Review + Fix:
-  Code reviewer found: 4 critical (IS weight no-op, all-ones mask, kl_loss device, GRPO remainder)
-  Silent failure hunter found: 6 critical + 7 high (NaN guard, GDPO NaN, DataLoader zero, etc.)
-  Simplifier applied: comment cleanup, dict comprehensions, extracted helpers
-  → 13 bugs fixed, tests re-verified on GPU
-
-Round 3 — Review of fixes:
-  Code reviewer: all 13 fixes verified, found config._pick missing on algorithm.spo/grpo + 7 untested fixes
-  Silent failure hunter: found 2 CRITICAL (prompt_lengths on completion-only tensor, double [:, 1:] shift) + 4 HIGH
-  Simplifier: cosmetic cleanups (comment trimming, variable extraction)
-  → config._pick fixed, 5 regression tests added, 2 critical alignment bugs fixed (85 CPU + 3 GPU pass)
-
-Fixes applied from round 3:
-  - prompt_lengths=[0] for completion-only tensors (vLLM returns response-only)
-  - advantages[:, :-1] instead of [:, 1:] (truncate, not shift — logprobs already shifted)
-  - config._pick applied to algorithm.spo/grpo sub-dicts
-
-Known deferred items (not bugs, design decisions for v2):
-  - DataLoader state not saved in checkpoint (resume replays from epoch 0)
-  - GRPO last-batch crash if dataset not divisible (add drop_last option)
-  - SHA-256 prompt_id breaks compatibility with hypothetical old checkpoints (no old checkpoints exist)
-  - CompletionLogger file handle leak on crash (flush() mitigates, __del__ would be cleaner)
-```
-
-### COMPLETED: Generalize engine — committed de2a74c through 548005a
-
-### ACTIVE WORK: Wire GameState into engine for phase advancement
-
-The QGRE superpower (from SPECIAL-TOKENS-SUPERPOWER.md): the engine has direct access to
-token-level structure via the segmenter. It can assign per-step rewards at the token level.
-This is what makes QGRE different from generic GRPO.
-
-Currently broken: GameState is created and checkpointed but NEVER READ by the engine.
-Phase advancement is entirely the reward_fn's responsibility. But the PLAN says
-"phase-gated by GameState" — the engine should manage phase transitions.
-
-The architecture should be:
-- reward_fn: scores per-quality (text-level verification: parse XML, check JSON, verify grounding)
-- engine: uses quality scores + GameState to determine phase, track mastery, advance phases
-- engine: uses segmenter + step_qualities + phase to compute per-token advantages
-
-**Changes needed:**
+### Engine Status
 
 ```
-Step P1: Engine-managed phase advancement
-  - QGRETrainer.step() updates GameState after scoring:
-    * Records quality scores per archetype via add_quality_score()
-    * Checks mastery windows via get_quality_mean()
-    * Advances game_state.phase when thresholds are met
-  - Phase threshold config in AlgorithmConfig (e.g., mastery_threshold: 0.8)
-  - RewardResult.phase is SET BY THE ENGINE (from game_state.phase), not by reward_fn
-  - reward_fn returns scores only — engine determines phase
-  - Test: quality scores accumulate, phase advances when threshold met
+=== COMPLETED (all committed to main) ===
 
-Step P2: GameState → advantage estimator wiring
-  - QGRETrainer passes game_state.phase to compute_advantages (not rr.phase)
-  - on_tier_advance() called when phase advances
-  - SPO V-tracker resets for newly-active qualities
-  - Test: phase advance → V-tracker reset → no spike
+Phase 1 — Core Engine:
+  [x] 0a: GameState serializer → checkpoint.py (11 tests)
+  [x] 0b: NeMo RL extraction → loss_functions.py, kl.py, logits.py (10 tests)
+  [x] 0c+0d: Advantage estimator → segments.py + advantages.py (22 tests)
+  [x] 0e: DataLoader → data.py (9 tests)
+  [x] 0f: Checkpoint resume → checkpoint.py
+  [x] 0g: LoRA verifier → lora_verify.py (7 tests)
+  [x] 1+4+6: Trainer + config + logging → trainer.py, config.py, logging.py (12 tests)
+  [x] 2: Generation backend → generation.py (GPU tests)
+  [x] M1: LLDS loss (arXiv:2512.04220)
+  [x] M2: AdamW8bit optimizer (bitsandbytes)
+  [x] M3: Low-advantage filter for SPO
+  [x] M4: seq-mean-token-sum-norm loss aggregation
+  [x] M5: Region-specific KL (THINK=0.1, FORMAT=2.0, STEP=1.0) — fully wired
+  [x] GameState engine-managed phase advancement
+  [x] Configurable step_qualities, pluggable segmenters
+  [x] Full train() loop with generate → score → step → checkpoint → log
+  [x] PLAN.md Phase 4 reassessment (committed 71cf277)
 
-Step P3: Mastery tracking per step (not per archetype)
-  - GameState tracks quality means PER STEP, not just per archetype
-  - Phase N advances when step N's quality mean exceeds threshold
-  - This is the QGRE curriculum: step 1 mastery unlocks step 2 qualities
-  - Test: step 1 mastery → phase 2 → step 2 qualities activate
+Phase 1 — Reviews (3 rounds):
+  [x] 13 bugs found and fixed in round 1
+  [x] 2 critical alignment bugs fixed in round 2
+  [x] 5 regression tests added
+  [x] Stress test: 8×4096 tokens on RTX 5080 16GB passes
 
-Step P4: Remove phase from RewardResult
-  - RewardResult becomes: reward + scores only
-  - Phase lives in GameState (engine-managed)
-  - Update all tests, examples, conftest
-  - Backward compat: if RewardResult.phase is set, warn and ignore
+=== COMPLETED THIS SESSION (2026-03-19, uncommitted) ===
 
-Step P5: Update README + docs
-  - Document the engine-managed phase model
-  - Show how mastery thresholds work
-  - Update "Bring Your Own Domain" section
+Phase 2 — Memory + Triton:
+  [x] selective_log_softmax (TRL PR #2799) — 37,000× less memory per chunk
+  [x] Triton fused lm_head→logprobs kernel — zero vocab-tensor allocation (BLOCK_V=128)
+  [x] Dr.GRPO unbiased mode — no length/std bias (arXiv:2503.20783)
+  [x] DAPO Dynamic Sampling — filter zero-variance groups
+  [x] for_training() per micro-batch — activates Unsloth GC + gradient offloading
+  [x] Adaptive micro_batch_size — 1 for seq≥2048
+
+Phase 3 — torch.compile:
+  [HOLD] Unsloth + torch.compile still fragile (issues #4181, #1790, #2702)
+
+Plan gap fixes (found by reading every line of all 3 plan docs):
+  [x] scheduler_state_dict saved/restored in checkpoint (PLAN line 474)
+  [x] cuda_rng_state restored on resume (PLAN line 475)
+  [x] GLOBAL_QUALITIES defined (SPECIAL-TOKENS line 104-106)
+  [x] MLflow set_experiment/start_run in train() (PILLARS line 128)
+  [x] Per-step reward metrics logged to MLflow (PLAN line 517-518)
+  [x] Periodic vLLM recreation every 50 steps in train() (PLAN line 719)
+  [x] LoRA verify_sync called after weight sync (PLAN line 484-487)
+  [x] verify_active() implemented in lora_verify.py (PLAN line 485)
+  [x] 3 missing plan-specified tests added (total: 101 CPU tests)
+
+=== TECH SCAN FINDINGS (2026-03-19) ===
+
+CRITICAL facts for VRAM math (quantized model):
+  - lm_head is NOT quantized — stays bf16: 1536 × 151936 × 2 = 446MB
+  - Embeddings also bf16: ~446MB
+  - Model body (4-bit): ~850MB
+  - Total model VRAM: ~1.7GB (not 850MB)
+  - vLLM at 0.35: 5.6GB for KV cache
+  - Remaining for activations: ~8.7GB
+
+CRITICAL Qwen3 vocab constraint:
+  - 151936 / 256 = 593.5 (NOT divisible)
+  - 151936 / 128 = 1187 (divisible)
+  - Any Triton kernel tiling vocab dimension MUST use block_size ≤ 128
+
+DAPO improvements over GRPO (from Chinese forums):
+  - Clip-Higher: asymmetric clipping (we already do this: 0.2/0.28)
+  - Dynamic Sampling: filter all-0 or all-1 reward batches (consider implementing)
+  - Token-Level Policy Loss: per-token not per-sequence (we already do this)
+  - Overlong Reward Shaping: length-aware reward correction (not implemented)
+
+Unsloth colocate:
+  - Unsloth forces vllm_mode="colocate" since June 2025 — validates our approach
+  - Standby mode (gpu_memory_utilization=0.95) available but fragile on consumer GPUs
+  - Our fixed 0.35 split is safer for RTX 5080 16GB
+
+Liger Kernel GRPO loss:
+  - PR #672: complete fused GRPO loss in Triton — 46GB savings
+  - Includes fused_selective_log_softmax (old_logp + ref_logp without vocab tensor)
+  - BUT: verl #2656 showed logprobs can be POSITIVE (wrong) with fused kernels
+  - MUST validate numerically against our current implementation
 ```
-
-Step P6: Full train() loop in trainer.py
-  - Add train() method that loops: for batch in dataloader → generate → score → step()
-  - Calls generation_backend.generate() for completions
-  - Calls reward_fn for scoring
-  - Calls step() for algorithm + backward
-  - Integrates phase advancement after step()
-  - Records per-step scores to GameState
-  - Checks phase advance, calls on_tier_advance if advanced
-  - Saves checkpoints every save_freq steps
-  - Logs to MLflow via log_step_metrics
-  - Test: mock trainer runs full loop for 3 steps
-
-Step P7: Fix checkpoint serialization
-  - gamestate_to_dict / gamestate_from_dict must match new GameState fields
-  - step_mastery: dict of deque → dict of list (with maxlen preserved)
-  - phase_history: list of ints
-  - mastery_threshold: float
-  - Remove references to old fields (quality_windows, elo_ratings, mastery_counts, max_active_tier)
-  - Test: round-trip new GameState through checkpoint
-
-Step P8: Wire MLflow + LR scheduler
-  - trainer.train() calls log_step_metrics after each step
-  - setup_optimizer creates scheduler from config
-  - Scheduler steps after each optimizer step
-  - Test: mock mlflow receives expected metrics
-
-Step P9: SPO warm-start fix — use batch mean not current sample
-  - Change v = r to v = batch_mean for first observation (matches PLAN.md spec)
-  - Test: first observation advantage ≈ 0 regardless of individual reward value
-
-**Execution rules:**
-- Build ONE step per iteration
-- After each step: run pytest — must pass
-- Exa search before any bug fix
-- Commit and push after each step passes
-
-The engine is currently hardcoded to 4 XML steps with v1-specific quality names.
-This must be generalized so any domain can use the engine.
-
-**Changes needed (in order):**
-
-```
-Step G1: Make STEP_QUALITIES configurable (segments.py + advantages.py)
-  - Remove hardcoded STEP_QUALITIES dict from segments.py
-  - Accept step_qualities as a parameter to QGREStepAdvantageEstimator.__init__()
-  - Accept step_qualities in QGREConfig (algorithm section of YAML)
-  - Replace all range(1, 5) with range based on len(step_qualities)
-  - PHASE_QUALITIES in trainer.py derived from config, not hardcoded
-  - Update examples/hypergraph/config.yaml with step_qualities mapping
-  - Test: existing tests pass with step_qualities passed explicitly
-
-Step G2: Make segment_completion() pluggable (segments.py + trainer.py)
-  - Define a Segmenter protocol: Callable[[list[int]], list[str]]
-  - Move current segment_completion to qwen3_xml_segmenter() as one implementation
-  - QGREStepAdvantageEstimator accepts segmenter as __init__ parameter
-  - QGRETrainer accepts segmenter in config or constructor
-  - Default: qwen3_xml_segmenter (backward compatible)
-  - Add a simple json_key_segmenter() as a second implementation for JSON-based outputs
-  - Test: both segmenters produce valid region labels
-
-Step G3: Make phase count configurable (advantages.py + trainer.py)
-  - Phase count = max phase in step_qualities config, not hardcoded 4
-  - PHASE_QUALITIES built dynamically: phase N includes all qualities from steps 1..N
-  - Allow custom phase→qualities mapping in config for non-cumulative phase structures
-  - Test: 5-phase config works, 3-phase config works
-
-Step G4: Bump max_tokens default to 4096 (config.py + examples)
-  - GenerationConfig.max_tokens default: 2048 → 4096
-  - Update example configs
-  - Test: config loads with 4096
-
-Step G5: Update README and tests
-  - Update README "Bring Your Own Domain" section with new config examples
-  - Update test fixtures to pass step_qualities explicitly
-  - Verify all 85+ CPU tests pass
-  - Run GPU smoke test
-```
-
-**Execution rules:**
-- Build ONE step per iteration
-- After each step: run `python -m pytest tests/ -q` — must pass
-- If test fails → MANDATORY Exa search before fix
-- After all G steps: run GPU smoke test if GPU free
-- When all pass → commit and push → report FEATURE LOOP COMPLETE
-
-### ACTIVE WORK: Implement EVERYTHING from PLAN.md — no deferral
-
-After thorough re-read of all 2350 lines of plan docs, here is EVERYTHING still missing.
-Phase 1 was declared complete prematurely — several Phase 1 items were never built.
-Phases 2-4 are NOT future work — they are part of the engine specification.
-
-```
-=== Phase 1 MISSING items (should have been built) ===
-
-Step M1: LLDS loss (Lazy Likelihood Displacement Stabilization)
-  - PLAN.md line 504: "LLDS loss (extract from verl core_algos, ~40 lines)"
-  - Prevents policy collapse by penalizing large likelihood shifts
-  - Config: llds_coef (default 0.05 from v1)
-  - Extract from verl or implement from paper
-  - Wire into ClippedPGLossFn or as separate loss term in trainer.step()
-
-Step M2: AdamW8bit optimizer
-  - PLAN.md line 323: "self.optimizer = AdamW8bit(model.parameters(), lr=config.lr)"
-  - v1 config line 76: "optimizer: AdamW8bit" + "optimizer_impl: bitsandbytes.optim"
-  - Saves ~5GB optimizer states (1.7GB instead of 6.8GB for 1.7B model)
-  - CRITICAL for 16GB GPU: regular AdamW uses 2× model size for states
-  - pip install bitsandbytes, then: from bitsandbytes.optim import AdamW8bit
-
-Step M3: Low-advantage filter for SPO mode
-  - PLAN.md lines 658-671: skip prompts where |advantage| < epsilon
-  - Replaces filter_groups (which is for GRPO only)
-  - Prevents training on zero-signal batches
-  - Config: spo.min_advantage_threshold (default 0.01)
-
-Step M4: seq-mean-token-sum-norm loss aggregation
-  - v1 config line 72: "loss_agg_mode: seq-mean-token-sum-norm"
-  - Current: token-level mean. Plan: sequence-mean of token-sum, then normalize
-  - This affects gradient scaling and is load-bearing for training stability
-
-Step M5: Region-specific KL control (THR-style)
-  - PLAN.md lines 798-802: "HOLD until engine exists" — engine exists now
-  - THINK tokens: LOW KL (explore reasoning freely)
-  - FORMAT tokens: HIGH KL (lock in structure)
-  - CONTENT tokens: MEDIUM KL (focus on quality)
-  - The segmenter already produces THINK/FORMAT/STEP regions — use them for per-region KL
-
-=== Phase 2: Triton kernels ===
-
-Step T1: Fused log_softmax+gather Triton kernel — FIXES OOM
-  - The OOM: full logits tensor = batch × seq × vocab = 2.3GB per sequence in float32
-  - Fix: Triton kernel that does log_softmax+gather in one pass on GPU
-  - Never materializes the full vocab-sized tensor
-  - OR: Use Liger Kernel (NeMo RL supports use_liger_kernel)
-  - Search Exa for: "liger kernel fused cross entropy logprobs", "triton fused log softmax gather"
-  - Test: 8 × 4096 tokens on RTX 5080 — no OOM
-
-Step T2: Triton kernel for segment_completion (if bottleneck)
-  - Token ID pattern matching on GPU
-  - Only implement if profiling shows CPU segmentation is >5% of step time
-
-=== Phase 3: torch.compile ===
-
-Step T3: torch.compile the training forward pass
-  - v1 found: "Unsloth patches backward at Python level; torch.compile traces past them"
-  - Search Exa for current Unsloth + torch.compile compatibility (2026 status)
-  - If compatible now: wrap model forward + logprob computation
-  - If not: document as known limitation, Unsloth's own kernels provide most of the benefit
-
-=== Phase 4: Memory management ===
-
-Step T4: GPU memory budget and auto micro-batching
-  - v1 used gpu_memory_utilization=0.35 for 1.7B on 16GB (leaves headroom for training)
-  - Engine should: estimate VRAM budget, set micro_batch_size automatically
-  - Config: max_micro_batch_size (default: auto based on available VRAM)
-
-Step T5: Stress test — 8-16 prompts × 4096 tokens
-  - MUST pass on RTX 5080 16GB before declaring complete
-  - Measure: tokens/sec, VRAM peak, step time, phase advancement
-```
-
-=== COMPLETED items this session ===
-
-[x] M1: LLDS loss (committed 5ea71b7)
-[x] M2: AdamW8bit optimizer (committed earlier)
-[x] M3: Low-advantage filter for SPO (committed cc1c7ca)
-[~] M5: Region-specific KL — config + loss wiring done, trainer needs to build kl_region_weights from regions
-[x] T5: Stress test 8×4096 passes at gpu_memory_utilization=0.35 (committed bf29752)
-[x] T4: gpu_memory_utilization=0.35 as correct colocate partition
-
-=== REMAINING items ===
-
-[ ] M4: seq-mean-token-sum-norm loss aggregation — affects gradient scaling
-[ ] M5: Wire region weights from segmenter through trainer to loss (partially done)
-[ ] Phase 2: Triton kernels for reward computation (tag detection, node matching on GPU)
-[ ] Phase 3: torch.compile — search Exa for Unsloth 2026.3 compatibility first
-[ ] Phase 4: Fused log_softmax+gather Triton kernel — Liger Kernel installed (0.7.0)
-    Note: OOM is FIXED by gpu_memory_utilization=0.35, but fused kernel would
-    be faster AND allow higher batch sizes. This is a PERFORMANCE optimization now,
-    not a crash fix.
-
-=== CUDA/Triton OPPORTUNITIES beyond the plan ===
-
-The plan describes Triton kernels as "medium impact" optimizations. But since we own the
-engine and have Triton 3.5.1 + Liger Kernel 0.7.0 installed, we SHOULD write custom
-Triton kernels for QGRE-specific operations that don't exist anywhere else:
-
-1. Fused segment_completion Triton kernel — token ID pattern matching on GPU
-   Currently: CPU Python loop O(seq_len). Triton: parallel scan, O(1) per token.
-   Only matters at scale (batch_size > 16), but it's the kind of thing only we can build.
-
-2. Fused advantage_broadcast Triton kernel — region→advantage mapping on GPU
-   Currently: Python loop with string matching. Triton: lookup table, parallel.
-
-3. Fused LLDS gate computation — the three-level gate (traj+token+action) is a
-   perfect candidate for a single fused kernel (all element-wise ops on same tensors).
-
-4. Fused region-KL-weighted loss — instead of building a KL weight tensor and
-   multiplying, do the region lookup + KL scaling + masking in one kernel.
-
-These are NOT in the original plan. But the plan says Phase 4 is "Custom CUDA kernels
-for critical path" — these qualify. The plan also says "probably never" — but the plan
-was written before we had Triton 3.5 and Liger 0.7 installed. The tools are here.
-User should decide which to prioritize.
-
-**Execution: finish M4 and M5 wiring, then ask user about CUDA/Triton priorities.**
-
-### Post-completion work (when user requests):
-- `/commit` — commit all changes
-- Move to training-dojo for hypergraph-scan-v2 run planning
-- Create training data prompts for the new run
-- The engine is pip-installable: `pip install -e .` from training-dojo
 
 ### Known constraints:
 - GPU smoke tests must run individually — 16GB RTX 5080 can't load 3 models in sequence
@@ -663,6 +446,7 @@ User should decide which to prioritize.
 - Never copy patterns from training-dojo v1
 - Always search Exa before any bug fix
 - `force_on_policy_ratio=True` disables ratio clipping (by design for on-policy, documented)
+- Qwen3 vocab 151936 NOT divisible by 256 — Triton kernels must use block_size ≤ 128
 
 ## Important: What This Command Does NOT Do
 
@@ -675,58 +459,72 @@ User should decide which to prioritize.
   catches drift that accumulates silently.
 - Does NOT touch files outside the current step's scope. One step at a time.
 
-## Completion Promise
+## Completion Verification — MANDATORY every time
 
-**NEVER report FEATURE LOOP COMPLETE without running this FULL checklist:**
+**You MUST execute ALL of these commands and checks before reporting done.**
+**Do NOT skip any. Do NOT summarize from memory. RUN the commands. READ the output.**
+**If you find yourself saying "already verified" — run it again anyway.**
 
+### CHECK 1: Run all tests (EXECUTE, don't remember)
+```bash
+python -m pytest tests/ -q --tb=short
 ```
-COMPLETION CHECKLIST — MANDATORY before reporting done:
+Report the EXACT output line showing passed/failed/skipped counts.
 
-=== STEP 1: THOROUGHLY READ EVERY PLAN DOCUMENT ===
-Read these files IN FULL (not grep, not skim — read every line):
-  - docs/PLAN.md (all ~1460 lines)
-  - docs/SPECIAL-TOKENS-SUPERPOWER.md (all ~635 lines)
-  - docs/PILLARS.md (all ~258 lines)
+### CHECK 2: Zero stubs (EXECUTE)
+```bash
+grep -rn "TODO\|FIXME\|STUB\|placeholder\|HACK" qgre/*.py qgre/nemo_extracted/*.py
+```
+Must return zero results.
 
-For each document, extract EVERY feature, algorithm, technique, component,
-and optimization described. Write them down as a numbered list.
-Then check EACH item against the actual code. Mark as:
-  [x] Implemented and tested
-  [~] Partially implemented (describe what's missing)
-  [ ] Not implemented
-  [HOLD] Explicitly deferred with documented reason
-
-If ANY item is [ ] or [~], there are gaps. Do NOT report complete.
-
-=== STEP 2: VERIFY IMPLEMENTATION MATCHES PLAN SPEC ===
-For each implemented item, verify:
-  - Algorithm matches the pseudocode in PLAN.md exactly
-  - Config parameters match what PLAN.md specifies
-  - Loss computation matches PLAN.md (LLDS, kl_cov, clip ratios, loss_agg_mode)
-  - Optimizer matches PLAN.md (AdamW8bit, not regular AdamW)
-  - Memory optimization matches PLAN.md (Triton kernels, torch.compile, fused ops)
-
-=== STEP 3: CODE CHECKS ===
-  1. grep for TODO/FIXME/STUB/placeholder in qgre/*.py — must be zero
-  2. Run pytest — all tests must pass
-  3. Check GameState is USED by engine (not just stored)
-  4. Check reward scores → per-step advantages (not sequence-level)
-  5. Check segmenter called and regions affect advantages
-  6. Check phase advancement is engine-managed
-  7. Run GPU smoke test: 8 prompts × 4096 tokens — no OOM
-
-=== STEP 4: CONFIRM WITH USER ===
-  List every [HOLD] item and ask user if they accept the deferral.
-  List every [~] item and ask user if partial implementation is acceptable.
-  Only report complete after user confirms.
-
-If ANY step fails → there are gaps. Fix them. Do NOT report complete.
+### CHECK 3: Import check (EXECUTE)
+```bash
+python -c "import qgre; print('OK')"
 ```
 
-When ALL gaps are closed and the checklist passes:
+### CHECK 4: Spawn an Explore agent to audit plan docs vs code
+Use the Agent tool with subagent_type=Explore to:
+- Read docs/PLAN.md IN FULL
+- Read docs/SPECIAL-TOKENS-SUPERPOWER.md IN FULL
+- Read docs/PILLARS.md IN FULL
+- For EACH feature/algorithm/config/test mentioned, grep the codebase to verify it exists
+- Report ONLY items that are MISSING or WRONG — not items that are correct
+- If it finds zero issues, that's the answer
+
+This agent MUST actually read the files and search the code. It cannot rely on
+previous context or memory. Fresh eyes every time.
+
+### CHECK 5: Verify feature-loop.md Engine Status matches reality
+- Run: `wc -l qgre/*.py qgre/nemo_extracted/*.py` — compare file list to Engine Status
+- Run: `python -m pytest tests/ --collect-only -q | tail -5` — compare test count to claim
+- Verify every "[x]" item in Engine Status has corresponding code (grep for key function names)
+
+### CHECK 6: Verify the save/restore cycle is complete
+```bash
+# Every state the plan says to save must be both SAVED and RESTORED
+grep -n "save_checkpoint\|scheduler_state\|cuda_rng\|advantage_estimator_state\|game_state\|rng_state" qgre/trainer.py qgre/checkpoint.py
+```
+For each state field: verify it appears in BOTH save() AND resume().
+
+### CHECK 7: Report findings
+After ALL 6 checks complete, report:
+```
+VERIFICATION RESULTS:
+  Tests: [exact count] passed, [exact count] skipped
+  Stubs: [count]
+  Import: OK/FAIL
+  Plan audit: [number of issues found, or "zero issues"]
+  Engine Status: [accurate/inaccurate — list discrepancies]
+  Save/restore: [complete/incomplete — list gaps]
+```
+
+If ANY check fails or finds issues → FIX THEM before reporting complete.
+If ALL checks pass with zero issues → report:
 
 ```
-FEATURE LOOP COMPLETE — zero gaps remaining
+FEATURE LOOP COMPLETE — zero gaps remaining (verified)
 ```
+
+**The key difference: you must SHOW the output of each check, not just claim you ran it.**
 
 $ARGUMENTS

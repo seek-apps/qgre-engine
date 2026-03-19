@@ -18,6 +18,47 @@
 import torch
 
 
+def selective_log_softmax(
+    logits: torch.Tensor,
+    index: torch.Tensor,
+) -> torch.Tensor:
+    """Compute log softmax probabilities for selected tokens only.
+
+    Uses the identity log_softmax(x_i) = x_i - logsumexp(x) to avoid
+    materializing a full [batch, seq, vocab] log-probability tensor.
+    Peak memory: [batch, seq] instead of [batch, seq, vocab].
+
+    For bf16/fp16: falls back to per-row log_softmax (logsumexp is numerically
+    unstable in half precision). Still avoids the full vocab tensor by looping.
+
+    Ported from TRL PR #2799 (Tyler Romero, Feb 2025).
+    Source: https://www.tylerromero.com/posts/2025-02-selective-log-softmax/
+
+    Args:
+        logits: [..., vocab] logit tensor (any dtype)
+        index: [...] token IDs to gather log probs for
+
+    Returns:
+        [...] gathered log probabilities (same shape as index)
+    """
+    if logits.dtype in (torch.float32, torch.float64):
+        # logsumexp identity: log_softmax(x_i) = x_i - logsumexp(x)
+        # Loop over batch to avoid materializing full [batch, seq, vocab]
+        lse = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
+        selected = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
+        return (selected - lse).to(torch.float32)
+    else:
+        # bf16/fp16: logsumexp loses precision. Use per-row log_softmax instead.
+        # Still memory-efficient: processes one row at a time.
+        token_logprobs = torch.zeros_like(index, dtype=torch.float32)
+        for i, (logits_row, index_row) in enumerate(zip(logits, index)):
+            logprobs_row = logits_row.log_softmax(dim=-1)
+            token_logprobs[i] = torch.gather(
+                logprobs_row, dim=-1, index=index_row.unsqueeze(-1)
+            ).squeeze(-1).to(torch.float32)
+        return token_logprobs
+
+
 def logprobs_from_logits(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -25,12 +66,12 @@ def logprobs_from_logits(
 ) -> torch.Tensor:
     """Compute log probabilities of labels given logits — memory efficient.
 
-    Chunks along the sequence dimension to avoid materializing a full
-    [batch, seq, vocab] tensor. Each chunk: log_softmax → gather → discard.
-    Peak memory: batch × chunk_size × vocab (not batch × full_seq × vocab).
+    Uses selective_log_softmax per chunk: never materializes [batch, chunk, vocab]
+    as a log-probability tensor. For fp32, uses logsumexp identity (no log_softmax
+    allocation at all). For bf16, loops per row within each chunk.
 
-    For 1 × 256 × 151936 in bf16 = 74MB per chunk (vs 1.2GB for full 4096 seq).
-    Inspired by Liger Kernel's chunked cross entropy approach (linkedin/Liger-Kernel).
+    Peak memory: batch × chunk_size (not batch × chunk_size × vocab).
+    For Qwen3 vocab (151936): 37,000× less memory per chunk vs naive approach.
 
     Args:
         logits: [batch, seq, vocab] raw model output (any dtype)
@@ -45,13 +86,9 @@ def logprobs_from_logits(
 
     for start in range(0, seq_len, chunk_size):
         end = min(start + chunk_size, seq_len)
-        chunk_logits = logits[:, start:end, :]
-        chunk_labels = labels[:, start:end]
-
-        chunk_lp = torch.nn.functional.log_softmax(chunk_logits, dim=-1)
-        result[:, start:end] = chunk_lp.gather(
-            dim=-1, index=chunk_labels.unsqueeze(-1)
-        ).squeeze(-1).to(torch.float32)
+        result[:, start:end] = selective_log_softmax(
+            logits[:, start:end, :], labels[:, start:end],
+        )
 
     return result
 

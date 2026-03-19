@@ -14,9 +14,10 @@ from qgre.checkpoint import (
 )
 from qgre.config import QGREConfig
 from qgre.data import PromptBatch, QGREDataLoader
-from qgre.logging import CompletionLogger, log_step_metrics
+from qgre.logging import CompletionLogger, log_step_metrics, log_training_params
 from qgre.nemo_extracted.kl import masked_mean
 from qgre.fused_logprobs import chunked_logprobs_from_hidden, get_hidden_states_and_lm_head
+from qgre.triton_logprobs import triton_logprobs_from_hidden, HAS_TRITON
 from qgre.nemo_extracted.llds import compute_llds_loss
 from qgre.nemo_extracted.logits import logprobs_from_logits
 from qgre.nemo_extracted.loss_functions import ClippedPGLossFn
@@ -27,7 +28,7 @@ from qgre.types import GameState, RewardResult
 class GenerationBackend(Protocol):
     """Abstract generation interface — shields trainer from Unsloth internals."""
 
-    def generate(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs) -> list[list[int]]:
+    def generate(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs) -> Any:
         ...
 
     def save_weights(self, path: str | Path) -> None:
@@ -84,6 +85,7 @@ class QGRETrainer:
             lr=spo_lr, mode=mode,
             step_qualities=sq,
             segmenter=segmenter or uniform_segmenter,
+            normalize_advantages=alg.loss_type != "dr_grpo",
         )
 
         # Loss function (NeMo RL extracted)
@@ -100,6 +102,7 @@ class QGRETrainer:
             "truncated_importance_sampling_ratio": None,
             "token_level_loss": True,
             "force_on_policy_ratio": True,
+            "remove_length_normalization": alg.loss_type == "dr_grpo",
         })
 
         # Completion logger
@@ -138,16 +141,25 @@ class QGRETrainer:
             )
 
         cfg = self.config.training
+        main_scheduler = None
         if cfg.lr_scheduler == "cosine":
-            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer, T_max=cfg.total_steps, eta_min=cfg.lr * 0.1,
             )
         elif cfg.lr_scheduler == "linear":
-            self.scheduler = torch.optim.lr_scheduler.LinearLR(
+            main_scheduler = torch.optim.lr_scheduler.LinearLR(
                 self.optimizer, start_factor=1.0, end_factor=0.1, total_iters=cfg.total_steps,
             )
+
+        if main_scheduler is not None and cfg.warmup_steps > 0:
+            warmup = torch.optim.lr_scheduler.LinearLR(
+                self.optimizer, start_factor=0.01, end_factor=1.0, total_iters=cfg.warmup_steps,
+            )
+            self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+                self.optimizer, schedulers=[warmup, main_scheduler], milestones=[cfg.warmup_steps],
+            )
         else:
-            self.scheduler = None
+            self.scheduler = main_scheduler
 
     def compute_loss(
         self,
@@ -231,8 +243,10 @@ class QGRETrainer:
 
         # Phase is engine-managed — use GameState, not RewardResult
         current_phase = self.game_state.phase
+        # Fallback to highest available phase if current_phase not in mapping
+        fallback_phase = max(p for p in self.phase_qualities if p <= current_phase) if any(p <= current_phase for p in self.phase_qualities) else min(self.phase_qualities)
         active_qualities = [
-            self.phase_qualities.get(current_phase, self.phase_qualities[min(self.phase_qualities)])
+            self.phase_qualities.get(current_phase, self.phase_qualities[fallback_phase])
         ] * len(reward_results)
 
         # Compute per-token advantages (segment → step rewards → SPO/GRPO → GDPO → broadcast)
@@ -271,11 +285,16 @@ class QGRETrainer:
         # SPO low-advantage filter: skip sequences with near-zero signal (PLAN.md lines 658-671)
         if self.config.algorithm.mode == "spo":
             useful = (padded_advs.abs() > 0.01).any(dim=-1)
+            if useful.sum() == 0:
+                # All advantages near-zero — skip this step entirely (no useful gradient)
+                self.global_step += 1
+                return {"loss": 0.0, "reward/mean": sum(rr.reward for rr in reward_results) / len(reward_results),
+                        "global_step": self.global_step - 1, "phase": self.game_state.phase, "skipped": True}
             if useful.sum() >= 2 and useful.sum() < len(completions):
                 idx = useful.nonzero(as_tuple=True)[0]
                 padded_advs = padded_advs[idx]
                 comp_tensor = comp_tensor[idx]
-                # Update batch references for logging (keep original for mastery tracking)
+                kl_region_weights = kl_region_weights[idx]
 
         # Response mask
         prompt_lengths = [0] * comp_tensor.shape[0]
@@ -288,45 +307,58 @@ class QGRETrainer:
 
         # Micro-batched forward + backward — avoids OOM on logits tensor
         # Full logits = batch × seq × vocab ≈ 8 × 4096 × 151K × 4B = 18.6GB (impossible on 16GB)
-        # Micro-batch: 1-2 seqs at a time, each does forward → loss → backward
-        # Gradients accumulate across micro-batches. (ref: TRL PR #2669)
-        micro_batch_size = max(1, min(2, len(completions)))
-        n_micro = (len(completions) + micro_batch_size - 1) // micro_batch_size
+        # Micro-batch size adapts to sequence length to avoid OOM on long completions.
+        # At 4096 tokens, Unsloth MLP activation = 2 × 4096 × 8960 × 2B = 140MB per seq.
+        # micro_batch_size=1 for seq ≥ 2048, micro_batch_size=2 for shorter.
+        actual_batch = comp_tensor.shape[0]  # May differ from len(completions) after SPO filter
+        micro_batch_size = 1 if max_comp_len >= 2048 else max(1, min(2, actual_batch))
+        n_micro = (actual_batch + micro_batch_size - 1) // micro_batch_size
         total_loss = 0.0
         all_metrics = {}
 
-        for mb_start in range(0, len(completions), micro_batch_size):
-            mb_end = min(mb_start + micro_batch_size, len(completions))
+        for mb_start in range(0, actual_batch, micro_batch_size):
+            mb_end = min(mb_start + micro_batch_size, actual_batch)
             mb_ids = comp_tensor[mb_start:mb_end]
             mb_advs = padded_advs[mb_start:mb_end]
             mb_mask = response_mask[mb_start:mb_end]
 
-            # Fused chunked forward: hidden_states → lm_head in chunks → logprobs
-            # Never materializes full [seq, vocab] logits tensor (Phase 4, PLAN.md line 888)
-            hidden_states, lm_head = get_hidden_states_and_lm_head(self.model, mb_ids)
-
-            if hidden_states is not None and lm_head is not None:
-                # Chunked path: lm_head applied in 256-token chunks
-                mb_lp = chunked_logprobs_from_hidden(
-                    hidden_states[:, :-1, :], lm_head, mb_ids[:, 1:], chunk_size=256,
-                )
-                del hidden_states
+            # Ensure Unsloth training mode before EACH forward pass (not just at init).
+            # Unsloth's inplace attention kernels require this transition before backward.
+            # Source: Unsloth #895, #2434 — "modified by inplace operation" fix.
+            if hasattr(self, '_FastLanguageModel'):
+                self._FastLanguageModel.for_training(self.model)
+            elif self.generation_backend and hasattr(self.generation_backend, '_FastLanguageModel'):
+                self.generation_backend._FastLanguageModel.for_training(self.model)
             else:
-                # Fallback: standard full forward (for mock models in tests)
-                mb_output = self.model(mb_ids)
-                mb_logits = mb_output.logits if hasattr(mb_output, "logits") else mb_output
-                mb_lp = logprobs_from_logits(mb_logits[:, :-1, :], mb_ids[:, 1:])
-                del mb_logits, mb_output
+                try:
+                    from unsloth import FastLanguageModel as FLM
+                    FLM.for_training(self.model)
+                except (ImportError, Exception):
+                    pass
+
+            # Forward through full model (preserves Unsloth gradient checkpointing).
+            # selective_log_softmax avoids materializing [seq, vocab] log-prob tensor.
+            mb_output = self.model(mb_ids)
+            mb_logits = mb_output.logits if hasattr(mb_output, "logits") else mb_output
+            del mb_output
+            mb_lp = logprobs_from_logits(mb_logits[:, :-1, :], mb_ids[:, 1:])
+            del mb_logits
 
             mb_old_lp = mb_lp.detach()
 
-            min_len = min(mb_lp.shape[1], mb_advs.shape[1] - 1, mb_mask.shape[1])
-            mb_kl_weights = kl_region_weights[mb_start:mb_end, 1:min_len+1] if kl_region_weights is not None else None
+            # Align advantages + KL weights with logprob positions:
+            # mb_lp[t] = log P(token t+1 | tokens 0..t), so it needs advantage[t+1]
+            # Shift advantages and KL weights by 1 to match logprob indexing
+            mb_advs_shifted = mb_advs[:, 1:]  # advantage for token being predicted
+            mb_kl_shifted = kl_region_weights[mb_start:mb_end, 1:] if kl_region_weights is not None else None
+            min_len = min(mb_lp.shape[1], mb_advs_shifted.shape[1], mb_mask.shape[1])
+            mb_kl_weights = mb_kl_shifted[:, :min_len] if mb_kl_shifted is not None else None
             mb_loss, mb_metrics = self.loss_fn(
                 curr_logprobs=mb_lp[:, :min_len],
                 prev_logprobs=mb_old_lp[:, :min_len],
-                advantages=mb_advs[:, :min_len],
+                advantages=mb_advs_shifted[:, :min_len],
                 mask=mb_mask[:, :min_len].float(),
+                reference_logprobs=mb_old_lp[:, :min_len],
                 kl_region_weights=mb_kl_weights,
             )
 
@@ -337,7 +369,7 @@ class QGRETrainer:
                 llds_loss, llds_mask = compute_llds_loss(
                     log_prob=mb_lp[:, :min_len],
                     old_log_prob=mb_old_lp[:, :min_len],
-                    advantages=mb_advs[:, :min_len],
+                    advantages=mb_advs_shifted[:, :min_len],
                     response_mask=mb_mask[:, :min_len].float(),
                 )
                 mb_loss = mb_loss + llds_coef * llds_loss
@@ -350,12 +382,12 @@ class QGRETrainer:
             del mb_lp
 
             if not all_metrics:
-                all_metrics = mb_metrics
+                all_metrics = {k: v for k, v in mb_metrics.items()}
             else:
                 for k, v in mb_metrics.items():
-                    all_metrics[k] = (all_metrics.get(k, 0) + v) / 2
+                    all_metrics[k] = all_metrics.get(k, 0) + v
 
-        metrics = all_metrics
+        metrics = {k: v / n_micro for k, v in all_metrics.items()} if n_micro > 1 else all_metrics
         metrics["loss"] = total_loss
         loss_val = total_loss  # For NaN check
 
@@ -428,8 +460,10 @@ class QGRETrainer:
             global_step=self.global_step,
             model_state_dict=self.model.state_dict(),
             optimizer_state_dict=self.optimizer.state_dict() if self.optimizer else None,
+            scheduler_state_dict=self.scheduler.state_dict() if self.scheduler else None,
             game_state=self.game_state,
             advantage_estimator_state=self.advantage_estimator.state_dict(),
+            cuda_rng_state=torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
         )
 
     def resume(self, checkpoint_dir: str | Path) -> bool:
@@ -449,12 +483,23 @@ class QGRETrainer:
 
         if checkpoint.get("optimizer_state_dict") and self.optimizer:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if checkpoint.get("scheduler_state_dict") and self.scheduler:
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         if checkpoint.get("game_state"):
             self.game_state = checkpoint["game_state"]
         if checkpoint.get("advantage_estimator_state"):
             self.advantage_estimator.load_state_dict(checkpoint["advantage_estimator_state"])
         if checkpoint.get("rng_state") is not None:
             torch.set_rng_state(checkpoint["rng_state"])
+        if checkpoint.get("cuda_rng_state") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state(checkpoint["cuda_rng_state"])
+
+        # LoRA verification on resume (PLAN.md line 487-488: mandatory step)
+        try:
+            from qgre.lora_verify import LoRAVerifier
+            LoRAVerifier.verify_active(self.model, self.tokenizer)
+        except (ImportError, Exception):
+            pass  # Non-fatal if tokenizer not set or Unsloth not loaded
 
         return True
 
@@ -482,6 +527,19 @@ class QGRETrainer:
 
         self.setup_optimizer()
         cfg = self.config.training
+
+        # MLflow experiment setup (PILLARS.md line 128)
+        try:
+            import mlflow
+            mlflow.set_experiment(self.config.logging.mlflow_experiment)
+            mlflow.start_run(run_name=f"qgre-step-{self.global_step}")
+            log_training_params({
+                "model": {"path": self.config.model.path, "lora_rank": self.config.model.lora_rank},
+                "algorithm": {"mode": self.config.algorithm.mode, "loss_type": self.config.algorithm.loss_type},
+                "training": {"lr": cfg.lr, "total_steps": cfg.total_steps},
+            })
+        except Exception:
+            pass  # MLflow may not be configured
 
         # Try to resume from checkpoint
         self.resume(self.config.logging.checkpoint_dir)
@@ -512,14 +570,16 @@ class QGRETrainer:
                     backend.set_training_mode()
                 metrics = self.step(batch, output.token_ids, reward_results)
 
-                # 4. Log to MLflow
+                # 4. Log to MLflow (PLAN.md lines 517-518: per-step reward + advantage metrics)
                 try:
+                    step_rewards = {int(k.split("_")[-1]): v for k, v in metrics.items()
+                                   if k.startswith("mastery/step_")}
                     log_step_metrics(
                         step=self.global_step - 1,
                         reward_mean=metrics.get("reward/mean", 0.0),
                         loss=metrics.get("loss", 0.0),
-                        extra={k: v for k, v in metrics.items()
-                               if k.startswith("mastery/") or k == "phase"},
+                        step_rewards=step_rewards if step_rewards else None,
+                        extra={k: v for k, v in metrics.items() if k == "phase"},
                     )
                 except Exception:
                     pass  # MLflow may not be configured
@@ -530,10 +590,26 @@ class QGRETrainer:
 
                 # 6. LoRA sync (for vLLM weight update)
                 if hasattr(backend, "save_weights") and hasattr(backend, "load_weights"):
-                    from pathlib import Path
                     lora_path = Path(self.config.logging.checkpoint_dir) / "lora_latest"
                     backend.save_weights(lora_path)
                     backend.load_weights(lora_path)
+
+                    # LoRA verification after sync (PLAN.md lines 484-487, step 0g)
+                    try:
+                        from qgre.lora_verify import LoRAVerifier
+                        verifier = LoRAVerifier()
+                        verifier.verify_sync(lora_path)
+                        verifier.verify_active(self.model, self.tokenizer)
+                    except (ImportError, Exception):
+                        pass  # Non-fatal — verification is a safety check
+
+                # 7. Periodic vLLM recreation to prevent VRAM leak (PLAN.md line 719, unsloth #3864)
+                if self.global_step > 0 and self.global_step % 50 == 0:
+                    if hasattr(backend, "recreate_engine"):
+                        try:
+                            backend.recreate_engine()
+                        except Exception:
+                            pass  # Non-fatal — continue training
 
             if self.global_step >= cfg.total_steps:
                 break

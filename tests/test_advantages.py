@@ -245,10 +245,12 @@ def test_spo_on_tier_advance_resets_v():
     # V should have values for prompt 42
     assert 42 in estimator.V
 
-    # Tier advance resets prompt 42
+    # Tier advance resets ONLY the new step (2) for prompt 42, preserves mastered step (1)
+    old_step1_v = estimator.V[42][1]
     estimator.on_tier_advance(new_tier=2, prompt_tier_map={42: 2, 99: 1})
-    assert estimator.V[42][1] == 0.0
-    assert 42 not in estimator._step_seen or len(estimator._step_seen[42]) == 0
+    assert estimator.V[42][2] == 0.0, "New step should be reset"
+    assert estimator.V[42][1] == old_step1_v, "Mastered step should be preserved"
+    assert 2 not in estimator._step_seen.get(42, set()), "New step should not be in seen set"
 
 
 def test_spo_value_tracker_ema_convergence():
@@ -437,6 +439,55 @@ def test_format_tokens_get_zero_advantage():
         for t, region in enumerate(regions):
             if region == "FORMAT":
                 assert advs[i][t].item() == 0.0, f"FORMAT token at {t} should have 0 advantage"
+
+
+def test_credit_phase4_all_active():
+    """All qualities active (phase 4+): all steps have non-zero advantages."""
+    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="grpo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
+    tokens = _make_completion_tokens()
+    rr1 = _make_reward_result(step1_score=0.9, step4_score=0.8)
+    rr2 = _make_reward_result(step1_score=0.1, step4_score=0.2)
+    advs, regions_batch = estimator.compute_advantages(
+        batch_prompt_ids=[1, 1],
+        batch_token_ids=[tokens, tokens],
+        batch_reward_results=[rr1, rr2],
+        batch_active_qualities=[ALL_QUALITIES, ALL_QUALITIES],
+        group_size=2,
+    )
+    step_seen = set()
+    for t, region in enumerate(regions_batch[0]):
+        if region.startswith("STEP_") and advs[0][t].item() != 0.0:
+            step_seen.add(region)
+    assert len(step_seen) >= 2, f"Expected multiple steps with non-zero advantage, got {step_seen}"
+
+
+def test_full_pipeline_credit_assignment():
+    """8 completions with varied per-step quality through full pipeline."""
+    estimator = QGREStepAdvantageEstimator(lr=0.1, mode="spo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG)
+    tokens = _make_completion_tokens()
+    results = []
+    for i in range(8):
+        results.append(_make_reward_result(
+            step1_score=0.1 * i + 0.1,
+            step4_score=0.9 - 0.1 * i,
+        ))
+    # Warm up SPO
+    estimator.compute_advantages(
+        list(range(8)), [tokens]*8, results, [ALL_QUALITIES]*8,
+    )
+    advs, regions = estimator.compute_advantages(
+        list(range(8)), [tokens]*8, results, [ALL_QUALITIES]*8,
+    )
+    assert len(advs) == 8
+    for a in advs:
+        assert a.isfinite().all()
+        assert len(a) == len(tokens)
+    # High step1 completions should have different step1 advantages than low step1 completions
+    step1_positions = [t for t, r in enumerate(regions[0]) if r == "STEP_1"]
+    if step1_positions:
+        high_adv = advs[7][step1_positions[0]].item()
+        low_adv = advs[0][step1_positions[0]].item()
+        assert high_adv != low_adv, "Varied rewards should produce varied advantages"
 
 
 # --- Regression tests for bug fixes ---

@@ -34,7 +34,7 @@ class GenerationConfig:
     top_p: float = 1.0
     top_k: int = -1
     max_tokens: int = 4096
-    stop_token_ids: list[int] = field(default_factory=list)  # Set from tokenizer or YAML
+    stop_token_ids: list[int] = field(default_factory=lambda: [151643, 151645])  # Qwen3: <|endoftext|> + <|im_end|>
 
 
 @dataclass
@@ -66,6 +66,10 @@ class AlgorithmConfig:
     kl_think_multiplier: float = 0.1   # Low KL for think tokens (explore)
     kl_format_multiplier: float = 2.0  # High KL for format tokens (exploit)
     kl_step_multiplier: float = 1.0    # Normal KL for step content
+    # Dr.GRPO: remove length and std normalization biases (arXiv:2503.20783)
+    # "grpo": standard GRPO (divides by horizon length + normalizes by std)
+    # "dr_grpo": removes both normalizations (unbiased gradients)
+    loss_type: str = "grpo"  # "grpo" or "dr_grpo"
 
 
 @dataclass

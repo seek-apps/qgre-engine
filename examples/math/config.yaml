@@ -26,6 +26,8 @@ algorithm:
     filter_groups: true
   clip_ratio_low: 0.2
   clip_ratio_high: 0.28
+  step_qualities:
+    1: [q_correct_answer]
 
 training:
   total_steps: 200

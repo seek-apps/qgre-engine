@@ -19,6 +19,8 @@ ALL_QUALITIES = [
     # Step 4
     "q_step4_valid_json", "q_step4_has_keys", "q_existence_correct",
     "q_archetype_correct", "q_node_f1",
+    # Global (not step-specific, contributes to overall reward only)
+    "q_eos_correct",
 ]
 
 # Phase → active qualities (progressive gating)

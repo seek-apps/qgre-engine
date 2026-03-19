@@ -176,3 +176,86 @@ def test_spo_vs_grpo_produce_different_advantages():
     # At minimum, both should be finite
     assert spo_flat.isfinite().all()
     assert grpo_flat.isfinite().all()
+
+
+def test_dr_grpo_removes_length_normalization():
+    """Dr.GRPO mode: loss not divided by horizon length (arXiv:2503.20783)."""
+    from qgre.nemo_extracted.loss_functions import ClippedPGLossFn
+
+    base_cfg = {
+        "reference_policy_kl_penalty": 0.0,
+        "reference_policy_kl_type": "k3",
+        "kl_input_clamp_value": 20.0,
+        "kl_output_clamp_value": 10.0,
+        "ratio_clip_min": 0.2,
+        "ratio_clip_max": 0.28,
+        "ratio_clip_c": None,
+        "use_on_policy_kl_approximation": False,
+        "use_importance_sampling_correction": False,
+        "truncated_importance_sampling_ratio": None,
+        "token_level_loss": True,
+        "force_on_policy_ratio": True,
+    }
+
+    torch.manual_seed(42)
+    curr_lp = torch.randn(4, 16) * 0.1 - 3.0
+    prev_lp = curr_lp.detach().clone()
+    advantages = torch.randn(4, 16)
+    mask = torch.ones(4, 16)
+
+    # Standard GRPO: divides by horizon (16)
+    grpo_fn = ClippedPGLossFn({**base_cfg, "remove_length_normalization": False})
+    grpo_loss, _ = grpo_fn(curr_lp, prev_lp, advantages, mask)
+
+    # Dr.GRPO: no horizon division
+    dr_fn = ClippedPGLossFn({**base_cfg, "remove_length_normalization": True})
+    dr_loss, _ = dr_fn(curr_lp, prev_lp, advantages, mask)
+
+    # Dr.GRPO loss should be ~16x larger (horizon length) since it skips the division
+    ratio = dr_loss.item() / grpo_loss.item()
+    assert 14 < ratio < 18, f"Expected ~16x ratio, got {ratio}"
+
+
+def test_dr_grpo_no_std_normalization():
+    """Dr.GRPO: GDPO step skips std division when normalize_advantages=False."""
+    tokens = _make_tokens()
+
+    # Use SPO mode to isolate the GDPO normalization step (no GRPO pre-normalization)
+    # 4 samples with different rewards → varied step advantages
+    results = [
+        RewardResult(reward=0.9, scores={q: 0.9 for q in ALL_Q}, phase=4),
+        RewardResult(reward=0.3, scores={q: 0.3 for q in ALL_Q}, phase=4),
+        RewardResult(reward=0.6, scores={q: 0.6 for q in ALL_Q}, phase=4),
+        RewardResult(reward=0.1, scores={q: 0.1 for q in ALL_Q}, phase=4),
+    ]
+
+    # Standard: normalize by std in GDPO step
+    est_norm = QGREStepAdvantageEstimator(
+        lr=0.1, mode="spo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG,
+        normalize_advantages=True,
+    )
+    est_norm.compute_advantages([1, 2, 3, 4], [tokens] * 4, results, [ALL_Q] * 4)
+    advs_norm, _ = est_norm.compute_advantages([1, 2, 3, 4], [tokens] * 4, results, [ALL_Q] * 4)
+
+    # Dr.GRPO: mean-only in GDPO step
+    est_raw = QGREStepAdvantageEstimator(
+        lr=0.1, mode="spo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG,
+        normalize_advantages=False,
+    )
+    est_raw.compute_advantages([1, 2, 3, 4], [tokens] * 4, results, [ALL_Q] * 4)
+    advs_raw, _ = est_raw.compute_advantages([1, 2, 3, 4], [tokens] * 4, results, [ALL_Q] * 4)
+
+    norm_flat = torch.cat(advs_norm)
+    raw_flat = torch.cat(advs_raw)
+    assert norm_flat.isfinite().all()
+    assert raw_flat.isfinite().all()
+
+    # Key: both should have zero mean (mean-subtracted)
+    assert abs(norm_flat[norm_flat != 0].mean().item()) < 0.05
+    assert abs(raw_flat[raw_flat != 0].mean().item()) < 0.05
+
+    # Normalized should have std ≈ 1, raw should have different std (the raw spread)
+    norm_std = norm_flat[norm_flat != 0].std().item()
+    raw_std = raw_flat[raw_flat != 0].std().item()
+    assert abs(norm_std - 1.0) < 0.3, f"Normalized std should be ≈1, got {norm_std}"
+    assert norm_std != raw_std, f"Normalized and raw should differ: {norm_std} vs {raw_std}"
