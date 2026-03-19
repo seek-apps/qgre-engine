@@ -152,14 +152,21 @@ class QGREStepAdvantageEstimator:
         step_advs: dict[int, torch.Tensor],
         batch_size: int,
     ):
+        # Pre-compute batch mean per step for warm-start (PLAN.md spec: use batch mean, not sample)
+        batch_means: dict[int, float] = {}
+        for step_num in self._step_nums:
+            rewards = [all_step_rewards[i].get(step_num, 0.0) for i in range(batch_size)]
+            batch_means[step_num] = float(np.mean(rewards)) if rewards else 0.0
+
         for step_num in self._step_nums:
             for i in range(batch_size):
                 pid = batch_prompt_ids[i]
                 r = all_step_rewards[i].get(step_num, 0.0)
                 v = self.V[pid][step_num]
 
+                # Warm-start: first observation → set baseline to BATCH MEAN (not sample)
                 if step_num not in self._step_seen[pid]:
-                    v = r
+                    v = batch_means[step_num]
                     self._step_seen[pid].add(step_num)
 
                 step_advs[step_num][i] = r - v

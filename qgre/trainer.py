@@ -109,11 +109,23 @@ class QGRETrainer:
         self.scheduler: Any = None
 
     def setup_optimizer(self):
-        """Create optimizer and scheduler. Call after model is on device."""
+        """Create optimizer and LR scheduler from config."""
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=self.config.training.lr,
         )
+
+        cfg = self.config.training
+        if cfg.lr_scheduler == "cosine":
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=cfg.total_steps, eta_min=cfg.lr * 0.1,
+            )
+        elif cfg.lr_scheduler == "linear":
+            self.scheduler = torch.optim.lr_scheduler.LinearLR(
+                self.optimizer, start_factor=1.0, end_factor=0.1, total_iters=cfg.total_steps,
+            )
+        else:
+            self.scheduler = None
 
     def compute_loss(
         self,
@@ -260,6 +272,8 @@ class QGRETrainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
             self.optimizer.zero_grad()
+            if self.scheduler is not None:
+                self.scheduler.step()
 
         # Log metrics
         reward_mean = sum(rr.reward for rr in reward_results) / len(reward_results)
