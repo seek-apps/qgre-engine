@@ -16,6 +16,7 @@ from qgre.config import QGREConfig
 from qgre.data import PromptBatch, QGREDataLoader
 from qgre.logging import CompletionLogger, log_step_metrics
 from qgre.nemo_extracted.kl import masked_mean
+from qgre.fused_logprobs import chunked_logprobs_from_hidden, get_hidden_states_and_lm_head
 from qgre.nemo_extracted.logits import logprobs_from_logits
 from qgre.nemo_extracted.loss_functions import ClippedPGLossFn
 from qgre.segments import Segmenter, uniform_segmenter
@@ -278,11 +279,24 @@ class QGRETrainer:
             mb_advs = padded_advs[mb_start:mb_end]
             mb_mask = response_mask[mb_start:mb_end]
 
-            mb_output = self.model(mb_ids)
-            mb_logits = mb_output.logits if hasattr(mb_output, "logits") else mb_output
+            # Fused chunked forward: hidden_states → lm_head in chunks → logprobs
+            # Never materializes full [seq, vocab] logits tensor (Phase 4, PLAN.md line 888)
+            hidden_states, lm_head = get_hidden_states_and_lm_head(self.model, mb_ids)
 
-            mb_lp = logprobs_from_logits(mb_logits[:, :-1, :], mb_ids[:, 1:])
-            mb_old_lp = mb_lp.detach()  # On-policy
+            if hidden_states is not None and lm_head is not None:
+                # Chunked path: lm_head applied in 256-token chunks
+                mb_lp = chunked_logprobs_from_hidden(
+                    hidden_states[:, :-1, :], lm_head, mb_ids[:, 1:], chunk_size=256,
+                )
+                del hidden_states
+            else:
+                # Fallback: standard full forward (for mock models in tests)
+                mb_output = self.model(mb_ids)
+                mb_logits = mb_output.logits if hasattr(mb_output, "logits") else mb_output
+                mb_lp = logprobs_from_logits(mb_logits[:, :-1, :], mb_ids[:, 1:])
+                del mb_logits, mb_output
+
+            mb_old_lp = mb_lp.detach()
 
             min_len = min(mb_lp.shape[1], mb_advs.shape[1] - 1, mb_mask.shape[1])
             mb_loss, mb_metrics = self.loss_fn(
@@ -292,11 +306,10 @@ class QGRETrainer:
                 mask=mb_mask[:, :min_len].float(),
             )
 
-            # Scale loss by micro-batch fraction
             (mb_loss / n_micro).backward()
             total_loss += mb_loss.item() / n_micro
 
-            del mb_logits, mb_output, mb_lp  # Free VRAM immediately
+            del mb_lp
 
             if not all_metrics:
                 all_metrics = mb_metrics
