@@ -10,7 +10,7 @@ readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
 authors = [
-    {name = "Marcos Paulo Silva", email = "marcos@torad.ai"},
+    {name = "Marcos Paulo Souza Damasceno", email = "marcos@seekapps.live"},
 ]
 keywords = ["grpo", "rlhf", "reinforcement-learning", "llm", "training", "qgre"]
 classifiers = [
