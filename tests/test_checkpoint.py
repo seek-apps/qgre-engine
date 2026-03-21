@@ -71,6 +71,25 @@ def test_gamestate_empty_roundtrip():
     assert restored.mastery_threshold == 0.8
 
 
+def test_gamestate_stagnation_fields_roundtrip():
+    """Stagnation detection fields survive round-trip and default correctly from old checkpoints."""
+    gs = GameState(stagnation_timeout=150, plateau_window=30, plateau_threshold=0.05, steps_at_phase_start=42)
+    d = gamestate_to_dict(gs)
+    restored = gamestate_from_dict(d)
+
+    assert restored.stagnation_timeout == 150
+    assert restored.plateau_window == 30
+    assert restored.plateau_threshold == 0.05
+    assert restored.steps_at_phase_start == 42
+
+    # Old checkpoint without stagnation fields should use defaults
+    old = gamestate_from_dict({"phase": 2, "step_count": 100})
+    assert old.stagnation_timeout == 200
+    assert old.plateau_window == 50
+    assert old.plateau_threshold == 0.02
+    assert old.steps_at_phase_start == 0
+
+
 def test_gamestate_phase_advance():
     """Phase advances when step mastery exceeds threshold."""
     gs = GameState(mastery_threshold=0.8)

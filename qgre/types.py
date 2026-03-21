@@ -2,6 +2,7 @@
 
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from enum import Enum
 
 
 @dataclass
@@ -19,6 +20,12 @@ class RewardResult:
 
 
 QUALITY_WINDOW_SIZE = 20
+
+
+class StagnationStatus(Enum):
+    NORMAL = "normal"
+    STAGNATING = "stagnating"
+    STUCK = "stuck"
 
 
 @dataclass
@@ -40,6 +47,10 @@ class GameState:
     step_mastery: dict = field(default_factory=dict)
     # {step_num: deque([mean_quality_scores...], maxlen=QUALITY_WINDOW_SIZE)}
     phase_history: list = field(default_factory=list)
+    steps_at_phase_start: int = 0
+    stagnation_timeout: int = 200
+    plateau_window: int = 50
+    plateau_threshold: float = 0.02
 
     def record_step_score(self, step_num: int, score: float):
         """Record a quality score for a step. Used by engine after each training step."""
@@ -67,5 +78,27 @@ class GameState:
         if current_mastery >= self.mastery_threshold:
             self.phase += 1
             self.phase_history.append(self.step_count)
+            self.steps_at_phase_start = self.step_count
             return True
         return False
+
+    def check_stagnation(self) -> StagnationStatus:
+        """Check if training is stagnating in the current phase.
+
+        Returns STUCK if timeout exceeded, STAGNATING if plateau detected, NORMAL otherwise.
+        Detection only — intervention logic lives in the trainer.
+        """
+        steps_in_phase = self.step_count - self.steps_at_phase_start
+        if steps_in_phase >= self.stagnation_timeout:
+            return StagnationStatus.STUCK
+
+        window = self.step_mastery.get(self.phase)
+        if window and len(window) >= self.plateau_window:
+            recent = list(window)[-self.plateau_window:]
+            half = len(recent) // 2
+            first_half_mean = sum(recent[:half]) / half
+            second_half_mean = sum(recent[half:]) / (len(recent) - half)
+            if abs(second_half_mean - first_half_mean) < self.plateau_threshold:
+                return StagnationStatus.STAGNATING
+
+        return StagnationStatus.NORMAL

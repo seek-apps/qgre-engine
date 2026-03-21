@@ -91,3 +91,13 @@ class CompletionLogger:
         if self._file is not None:
             self._file.close()
             self._file = None
+
+    def __del__(self):
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False

@@ -66,6 +66,7 @@ class AlgorithmConfig:
     # generation is zero by definition — no optimizer step occurs between them.
     loss_mode: str = "pg"  # "pg" (no KL) or "kl_cov" (requires multi-epoch)
     kl_cov_ratio: float = 0.0
+    reference_policy_kl_type: str = "k3"  # "k1" (linear/unbiased), "k2" (squared), "k3" (exponential)
     llds_coef: float = 0.05
     # entropy_coeff removed: -mean(logprob) has wrong gradient direction for entropy bonus.
     # neg_logprob_mean is logged as a metric only (no backprop). See Fix 3 notes.
@@ -97,6 +98,9 @@ class TrainingConfig:
     gradient_accumulation_steps: int = 1
     max_grad_norm: float = 1.0
     mastery_threshold: float = 0.8
+    stagnation_timeout: int = 200
+    plateau_window: int = 50
+    plateau_threshold: float = 0.02
 
 
 @dataclass

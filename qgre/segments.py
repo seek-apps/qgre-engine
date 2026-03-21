@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Callable
+import re
+from functools import partial
+from typing import Any, Callable
 
 # --- Segmenter protocol ---
 # A segmenter takes token IDs and returns region labels (same length).
@@ -87,6 +89,102 @@ def uniform_segmenter(token_ids: list[int]) -> list[str]:
     return ["STEP_1"] * len(token_ids)
 
 
+# --- HIF JSON segmenter (decode-and-regex) ---
+
+# Default section patterns for HIF v2 JSON output.
+# Maps regex patterns (matched against decoded text) to step numbers.
+# Order matters — first match wins for overlapping regions.
+HIF_SECTION_PATTERNS: list[tuple[str, str]] = [
+    (r'"(?:network-type|metadata)"', "STEP_1"),
+    (r'"nodes"', "STEP_2"),
+    (r'"(?:edges|incidences)"', "STEP_3"),
+    (r'"(?:scan-results|hamiltonian-score)"', "STEP_4"),
+]
+
+
+def _hif_json_segmenter_impl(token_ids: list[int], tokenizer: Any) -> list[str]:
+    """Segment HIF JSON completions via decoded text + regex.
+
+    Decodes token IDs to text, uses regex to find JSON section boundaries,
+    maps character offsets back to token positions. Handles <think> blocks
+    via the same THINK_START/THINK_END token IDs as the XML segmenter.
+
+    Tokens not matching any section → STEP_5 (catch-all for overall quality).
+    """
+    if not token_ids:
+        return []
+
+    n = len(token_ids)
+    regions = ["STEP_5"] * n  # Default: last step (overall quality)
+
+    # Pass 1: Handle <think> tokens by token ID (same as XML segmenter, no decode needed)
+    in_think = False
+    for i, tid in enumerate(token_ids):
+        if tid == THINK_START:
+            in_think = True
+            regions[i] = "THINK"
+            continue
+        if tid == THINK_END:
+            regions[i] = "THINK"
+            in_think = False
+            continue
+        if in_think:
+            regions[i] = "THINK"
+
+    # Pass 2: Decode non-think tokens and map JSON sections via regex
+    # Build character→token index mapping
+    try:
+        text = tokenizer.decode(token_ids, skip_special_tokens=False)
+    except Exception:
+        return regions  # If decode fails, return think-annotated + STEP_5 default
+
+    # Get per-token text lengths for char→token mapping
+    token_texts = []
+    for tid in token_ids:
+        try:
+            token_texts.append(tokenizer.decode([tid], skip_special_tokens=False))
+        except Exception:
+            token_texts.append("")
+
+    # Build char_offset → token_index mapping
+    char_to_token = []
+    offset = 0
+    for i, tt in enumerate(token_texts):
+        for _ in range(len(tt)):
+            char_to_token.append(i)
+        offset += len(tt)
+
+    # Find section boundaries in decoded text
+    section_spans: list[tuple[int, int, str]] = []  # (start_char, end_char, region)
+    for pattern, region in HIF_SECTION_PATTERNS:
+        for m in re.finditer(pattern, text):
+            section_spans.append((m.start(), m.end(), region))
+
+    # Sort by position and assign regions between section markers
+    section_spans.sort(key=lambda x: x[0])
+
+    for idx, (start_char, end_char, region) in enumerate(section_spans):
+        # Region extends from this key to the next key (or end of text)
+        region_end_char = section_spans[idx + 1][0] if idx + 1 < len(section_spans) else len(text)
+
+        # Map char range to token indices
+        for c in range(start_char, min(region_end_char, len(char_to_token))):
+            tok_idx = char_to_token[c]
+            if regions[tok_idx] != "THINK":  # Don't overwrite think tokens
+                regions[tok_idx] = region
+
+    return regions
+
+
+def make_hif_json_segmenter(tokenizer: Any) -> Segmenter:
+    """Create an HIF JSON segmenter bound to a specific tokenizer.
+
+    Usage in trainer.py registration:
+        segmenter = make_hif_json_segmenter(tokenizer)
+    """
+    return partial(_hif_json_segmenter_impl, tokenizer=tokenizer)
+
+
 # Backward compatibility alias
 segment_completion = qwen3_xml_segmenter
 
@@ -99,18 +197,6 @@ HYPERGRAPH_V1_STEP_QUALITIES: dict[int, list[str]] = {
     3: ["q_chain_s3_refs_s2", "q_self_consistency"],
     4: ["q_step4_valid_json", "q_step4_has_keys", "q_existence_correct",
         "q_archetype_correct", "q_node_f1"],
-}
-
-HIF_V2_STEP_QUALITIES: dict[int, list[str]] = {
-    1: ["q_valid_json", "q_hif_schema"],
-    2: ["q_node_grounding", "q_node_verbatim"],
-    3: ["q_incidence_refs_nodes", "q_internal_consistency"],
-    4: ["q_existence_correct", "q_archetype_correct"],
-    5: ["q_node_f1", "q_edge_f1"],
-}
-
-MATH_STEP_QUALITIES: dict[int, list[str]] = {
-    1: ["q_correct_answer"],
 }
 
 # Global qualities: not step-specific, contribute to overall sequence reward only.

@@ -22,6 +22,10 @@ def gamestate_to_dict(gs: GameState) -> dict:
         "mastery_threshold": gs.mastery_threshold,
         "step_mastery": sm,
         "phase_history": list(gs.phase_history),
+        "steps_at_phase_start": gs.steps_at_phase_start,
+        "stagnation_timeout": gs.stagnation_timeout,
+        "plateau_window": gs.plateau_window,
+        "plateau_threshold": gs.plateau_threshold,
     }
 
 
@@ -35,6 +39,10 @@ def gamestate_from_dict(d: dict) -> GameState:
     gs.step_count = d.get("step_count", 0)
     gs.mastery_threshold = d.get("mastery_threshold", 0.8)
     gs.phase_history = list(d.get("phase_history", []))
+    gs.steps_at_phase_start = d.get("steps_at_phase_start", 0)
+    gs.stagnation_timeout = d.get("stagnation_timeout", 200)
+    gs.plateau_window = d.get("plateau_window", 50)
+    gs.plateau_threshold = d.get("plateau_threshold", 0.02)
 
     sm = d.get("step_mastery", {})
     gs.step_mastery = {}

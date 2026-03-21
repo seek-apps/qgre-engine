@@ -48,11 +48,14 @@ PyTorch. Any bug, any limitation, any OOM is fixable because we own the pipeline
 The user provides a build step name (e.g. `step-0d`, `step-1`) or `all`.
 
 Plan docs live at:
-- `docs/PLAN.md` — the master plan (build order, algorithm design, architecture, risks, issue resolutions, Exa findings)
-- `docs/PILLARS.md` — six pillars decomposition (components per pillar, research findings, dependency graph)
-- `docs/SPECIAL-TOKENS-SUPERPOWER.md` — VPRM spec (segment_completion, step-level rewards, token ID patterns)
+- `docs/PLAN-engine-improvements.md` — ACTIVE improvements plan (Items 0-10, CPA findings, research references)
+- `docs/TECH-SCAN-2026-03-19.md` — live research findings per technology
+- `docs/PLAN.md` — original engine build plan (COMPLETE — reference only)
+- `docs/PILLARS.md` — six pillars decomposition (reference only)
+- `docs/SPECIAL-TOKENS-SUPERPOWER.md` — VPRM spec (reference only)
 
-If a requested step's spec is not in the plan docs, STOP and tell the user.
+The ACTIVE plan is `docs/PLAN-engine-improvements.md`. Read it FIRST every loop iteration.
+If an item's spec is not in the improvements plan, STOP and tell the user.
 
 ## Project Structure
 
@@ -354,117 +357,107 @@ continue with CPU-testable work.
 
 ## Current Work Queue (auto-updated, 2026-03-19)
 
-All plan items implemented. 121 tests collected (112 CPU pass + 9 GPU skip).
-20 source files, 2,872 lines. 19 bugs fixed across 11 adversarial audit rounds.
-Engine is COMPLETE and VERIFIED — all config fields wired, all features tested.
+**Active plan:** docs/PLAN-engine-improvements.md (engine-notes scan + tech scan + CPA pressure test)
+**Plan doc for original build:** docs/PLAN.md (original engine build — COMPLETE)
 
-### What's Done (all committed to main)
+Engine core is COMPLETE and VERIFIED (121 tests, 20 source files, 2,872 lines).
+Now implementing pre-training-run improvements from PLAN-engine-improvements.md.
+
+### Engine Improvements — ACTIVE WORK
 
 ```
-Core Engine (Steps 0a-0g, 1-8):
-  [x] 0a: GameState serializer → checkpoint.py (11 tests)
-  [x] 0b: NeMo RL extraction → loss_functions.py, kl.py, logits.py, llds.py (10 tests)
-  [x] 0c+0d: Advantage estimator → segments.py + advantages.py (22 tests)
-  [x] 0e: DataLoader → data.py (9 tests)
-  [x] 0f: Checkpoint resume → checkpoint.py
-  [x] 0g: LoRA verifier → lora_verify.py (7 tests)
-  [x] 1+4+6: Trainer + config + logging → trainer.py, config.py, logging.py (12 tests)
-  [x] 2: Generation backend → generation.py (GPU tests)
+SHIP NOW (clean spots — no dependencies, ship immediately):
+  [x] Item 0:  vLLM logprob passthrough — BLOCKED by Unsloth
+               unsloth_zoo/vllm_utils.py:1759 hardcodes max_logprobs=0
+               Path A dead. Path B (forward pass in trainer) is the way.
+               Finding: DO NOT touch vLLM init — 5 hours of tuning.
+  [x] Item 2:  Configurable reference_policy_kl_type — DONE
+               config.py: added reference_policy_kl_type field (default "k3")
+               trainer.py:104: replaced hardcoded "k3" with alg.reference_policy_kl_type
+               Verified: config load, YAML override, default value. 123 tests pass.
+  [x] Item 8:  GDPO NaN guard — DONE
+               advantages.py: nanmean for step reward extraction + nan_to_num before GDPO norm
+               Warning emitted when NaN detected. 123 tests pass.
+  [x] Item 10: Monitor output lengths — DONE
+               trainer.py: completion_length/mean,max,min added to step metrics
+               123 tests pass.
+  [x] Item 4:  CompletionLogger context manager — DONE
+               logging.py: added __del__, __enter__, __exit__. 123 tests pass.
+  [x] Item 5:  Remove HIF_V2_STEP_QUALITIES + MATH_STEP_QUALITIES — DONE
+               segments.py: removed both. KEPT: HYPERGRAPH_V1, STEP_QUALITIES alias,
+               segment_completion alias. 123 tests pass.
 
-Optimizations:
-  [x] M1: LLDS loss (arXiv:2512.04220)
-  [x] M2: AdamW8bit optimizer (bitsandbytes)
-  [x] M3: Low-advantage filter for SPO
-  [x] M4: seq-mean-token-sum-norm loss aggregation
-  [x] M5: Region-specific KL (THINK=0.1, FORMAT=2.0, STEP=1.0)
-  [x] selective_log_softmax (TRL PR #2799) — 37,000× less memory per chunk
-  [x] Triton fused lm_head→logprobs kernel (BLOCK_V=128)
-  [x] Dr.GRPO unbiased mode (arXiv:2503.20783)
-  [x] DAPO Dynamic Sampling — filter zero-variance groups
-  [x] for_training() per micro-batch — Unsloth GC + gradient offloading
-  [x] Adaptive micro_batch_size — 1 for seq≥2048
+DONE (this session):
+  [x] Item 3:  HIF JSON region segmenter — DONE
+               segments.py: hif_json_segmenter (decode-and-regex), make_hif_json_segmenter(tokenizer)
+               trainer.py: "hif_json" registered in segmenter resolver with tokenizer binding
+               Tested: mock tokenizer, think blocks, all 5 JSON sections, empty input. 122 tests pass.
+  [x] Item 6:  Stagnation detection — DONE
+               types.py: StagnationStatus enum, check_stagnation() method, 4 new fields on GameState
+               trainer.py: stagnation metric logged (0=normal, 1=stagnating, 2=stuck)
+               config.py: stagnation_timeout, plateau_window, plateau_threshold
+               checkpoint.py: new fields serialized/restored
+               check_phase_advance() now resets steps_at_phase_start. 122 tests pass.
+  [x] Item 9:  Dead code cleanup — DONE
+               trainer.py: removed compute_loss() (never called, step() uses loss_fn directly)
+               tests/test_trainer.py: removed test_on_policy_mode (tested removed method)
+               122 tests pass (was 123 — removed 1 dead test).
+  [x] ENV:    Pin mlflow<3.0 in pyproject.toml — DONE
+  [ ] ENV:    Add PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to launch scripts
 
-Plan compliance fixes:
-  [x] scheduler_state_dict saved/restored in checkpoint
-  [x] cuda_rng_state restored on resume
-  [x] GLOBAL_QUALITIES defined
-  [x] MLflow set_experiment/start_run in train()
-  [x] Per-step reward metrics logged to MLflow
-  [x] Periodic vLLM recreation every 50 steps
-  [x] LoRA verify_sync + verify_active()
-  [x] GameState engine-managed phase advancement
-  [x] Configurable step_qualities, pluggable segmenters
-  [x] Full train() loop: generate → score → step → checkpoint → log
+DEFERRED (no evidence of need):
+  [DEFER] Item 1:  Store generation logprobs — DEFERRED
+               Drift ~10-15%, dropped completions handle it. No collapse.
+               Revisit if collapse observed or drift exceeds drop threshold.
+  [DEFER] Item 7:  Scaffold fading hook — no evidence of need yet
+```
 
-Research-backed features (all opt-in via config, defaults=off):
-  [x] M6: KL-adaptive SPO learning rate (SPO paper Algorithm 1) — spo.kl_adaptive
-  [x] M7: Prioritized prompt sampling (SPO Section 3.2) — set_priorities() in data.py
-  [x] M8: GRPO-λ eligibility traces (ICLR 2026) — algorithm.lambda_return
-  [x] M9: Dynamic length control (Huawei) — algorithm.length_penalty_coef
-  [x] M10: Entropy bonus — algorithm.entropy_coeff (was dead config, now wired)
+### What's Done (original engine build — all committed to main)
 
-Usability:
-  [x] CLI entry point: python -m qgre train --config --reward --segmenter
-  [x] Config-driven segmenter: algorithm.segmenter (uniform/qwen3_xml/custom)
-
-Bug fixes (this session):
-  [x] Math example metadata mismatch (reward_fn used "answer", config defaulted to "ground_truth")
-  [x] Prioritized sampling built but never wired in train()
-  [x] Segmenter not in config — user could get wrong segmenter silently
-  [x] entropy_coeff dead config field — now wired to loss
-  [x] filter_groups dead config field — now controls DAPO filtering
-  [x] max_response_length dead config field — removed
-  [x] tokenizer_path dead config field — removed
-  [x] apply_eligibility_traces had unused logprobs parameter — removed
-
-Reviews:
+```
+Core Engine (Steps 0a-0g, 1-8): ALL COMPLETE
+  [x] GameState, NeMo RL extraction, advantage estimator, dataloader, checkpoint,
+      LoRA verifier, trainer, config, logging, generation backend
+  [x] 121 tests (112 CPU pass + 9 GPU skip)
   [x] 19 bugs fixed across 11 adversarial audit rounds
-  [x] 9 new tests added (121 total)
-  [x] Programmatic config audit: ALL fields wired to code
-  [x] Full-feature smoke test: ALL 10 opt-in features produce metrics
-
-On hold:
-  [HOLD] torch.compile — Unsloth compatibility fragile (issues #4181, #1790, #2702)
+  [x] Real e2e validation: 10 steps on Qwen3-1.7B, VRAM 6.44GB stable, no OOM/NaN
+  [x] All research-backed optimizations: LLDS, AdamW8bit, SPO filter, selective_log_softmax,
+      Triton fused logprobs, Dr.GRPO mode, DAPO dynamic sampling, region-specific KL,
+      KL-adaptive SPO lr, prioritized sampling, λ-return traces, length control
+  [x] CLI: python -m qgre train --config --reward --segmenter
 ```
 
-### Real Validation (2026-03-19)
+### Critical implementation notes (from code review 2026-03-19)
 
 ```
-=== COMPLETED ===
+KL activation requires THREE gates (all must be true):
+  1. loss_mode: "kl_cov"     (config.py:67, default "pg" = KL off)
+  2. kl_cov_ratio: > 0       (config.py:68, default 0.0)
+  3. reference_logprobs != curr_logprobs  (trainer.py:359/373)
+  Item 1 fixes gate 3. Gates 1+2 must be set in training run YAML.
 
-1. [x] REAL end-to-end generation test (scripts/run_e2e_test.py):
-   - Loaded Qwen3-1.7B with vLLM colocated (gpu_memory_utilization=0.35)
-   - Generated 8 completions per step from real prompts (SPO mode, n=1)
-   - Scored with partial reward function (different per-step scores: S1=0.40, S2=0.10, S3=0.15, S4=0.00)
-   - Trained 10 steps — no OOM, no NaN, no crash
-   - Full untruncated prompt + completion + per-step scores output
-   - Phase advancement + mastery tracking working (mastery 0→0.398 over 10 steps)
-   - VRAM peak: 6.44 GB on RTX 5080 16GB (stable, no growth)
+LLDS activation requires TWO gates:
+  1. llds_coef: > 0          (config.py:69, default 0.05 = ON)
+  2. old_log_prob != log_prob (trainer.py:404)
+  Item 1 fixes gate 2. Gate 1 already satisfied. LLDS comes alive for free.
 
-2. [x] Pad token warning suppressed:
-   - Unsloth assigns <|PAD_TOKEN|> 151669 — correct and verified in real generation
-   - Warning filtered in e2e test script
+trainer.py:359 mb_old_lp = mb_lp.detach() — used in FOUR places:
+  Line 370: prev_logprobs (ratio computation)
+  Line 373: reference_logprobs (KL penalty)
+  Line 404: old_log_prob (LLDS gate)
+  All four must use stored generation logprobs.
 
-3. [x] Stop tokens verified:
-   - Configured [151643, 151645] in SamplingParams
-   - Model generates until max_tokens (expected for untrained model)
-   - Stop token config correctly passed through to vLLM
+generation.py:111-117 SamplingParams has NO logprobs= param.
+  vLLM output.outputs[0].logprobs is None because we never request it.
+  Adding logprobs=1 is one line at line 116.
 
-4. [x] LoRA merge/inference checklist — 18/18 checks passed (scripts/verify_lora_checklist.py)
+Segmenter type: Callable[[list[int]], list[str]] — no tokenizer arg.
+  HIF segmenter needs tokenizer for decode. Use functools.partial at registration.
 
-5. [x] Research-backed optimizations implemented (KL-adaptive lr, prioritized sampling,
-   GRPO-λ traces, length control, entropy bonus) — all opt-in, all tested
+CompletionLogger has close(), __del__, __enter__, __exit__ (logging.py:90-103). DONE.
 
-6. [x] CLI entry point: python -m qgre train --config --reward --segmenter
-
-7. [x] Dead config audit: removed max_response_length, tokenizer_path; wired
-   entropy_coeff, filter_groups; added segmenter to config
-
-=== REMAINING (user-directed) ===
-
-8. [ ] Eli Brain MCP review — user triggers this
-9. [ ] Longer training run (50-100 steps) — needs GPU time
-10. [ ] Commit all changes to main — needs user approval
+KEEP these aliases (used by 15+ test files):
+  segment_completion, STEP_QUALITIES, HYPERGRAPH_V1_STEP_QUALITIES
 ```
 
 ### Key Facts (from tech scan)
@@ -617,5 +610,24 @@ Even for small changes — run `pytest tests/ -q`, check import, grep for stubs.
 - Do NOT put next-session tasks in memory — they go in REMAINING above
 - Memory files should only point here: "see feature-loop for active work"
 - Every new session starts by reading THIS file — make sure it's accurate
+
+---
+
+## HARD RULE: Never trust your own status
+
+**Every time this loop fires — even if you reported "complete" last time — you MUST:**
+
+1. **Read the ACTIVE plan** (docs/PLAN-engine-improvements.md) fresh. Do not rely on memory.
+2. **Read the actual code** for every item marked [x]. Verify the implementation matches the plan spec.
+   - Read the file. Check the logic. Confirm it does what the plan says.
+   - "I already verified" is NOT acceptable. Verify AGAIN.
+3. **Run tests.** Show the output. Every time.
+4. **If you find drift between code and plan** — fix it or flag it. Do not skip.
+5. **Never cancel the cron loop** without explicit user permission.
+6. **Never report "FEATURE LOOP COMPLETE"** without having read every modified file
+   against its plan section in THIS iteration. Not a previous one. THIS one.
+
+The purpose of the loop is to catch drift that accumulates silently. If you skip
+verification because "nothing changed since last time," you defeat the purpose.
 
 $ARGUMENTS

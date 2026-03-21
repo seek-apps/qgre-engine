@@ -21,7 +21,7 @@ generation:
   temperature: 1.0
   top_p: 1.0
   top_k: -1
-  max_tokens: 1024          # Hamiltonian derivations are short
+  max_tokens: 4096
   stop_token_ids: [151643, 151645]
 
 algorithm:

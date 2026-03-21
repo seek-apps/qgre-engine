@@ -194,33 +194,6 @@ def test_gradient_accumulation_equivalence():
         assert any_changed, "Weights should change after gradient_accumulation_steps steps"
 
 
-def test_on_policy_mode():
-    """On-policy mode: old_log_probs == log_probs.detach()."""
-    cfg = _cfg()
-    model = MockModel()
-    trainer = QGRETrainer(model=model, tokenizer=None, reward_fn=lambda *a: None, config=cfg)
-
-    # Build synthetic inputs
-    input_ids = torch.randint(0, 100, (2, 16))
-    output = model(input_ids)
-    logits = output.logits
-
-    advantages = torch.randn(2, 15)
-    response_mask = torch.ones(2, 15)
-
-    # compute_loss with old_logprobs=None triggers on-policy: old = curr.detach()
-    loss, metrics = trainer.compute_loss(
-        logits=logits,
-        input_ids=input_ids,
-        advantages=advantages,
-        response_mask=response_mask,
-        old_logprobs=None,
-    )
-
-    assert torch.isfinite(loss), "On-policy loss should be finite"
-    # On-policy → ratio = exp(curr - curr.detach()) = exp(0) = 1 → loss is purely advantage-weighted
-    assert loss.item() != 0.0 or advantages.abs().sum() == 0, "On-policy loss should reflect advantages"
-
 
 def test_phase_qualities_mapping():
     """build_phase_qualities produces correct progressive gating."""

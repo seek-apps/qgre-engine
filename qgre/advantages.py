@@ -129,7 +129,7 @@ class QGREStepAdvantageEstimator:
             for step_num, quality_keys in self.step_qualities.items():
                 active = [k for k in quality_keys if k in batch_active_qualities[i]]
                 if active:
-                    step_rews[step_num] = float(np.mean([
+                    step_rews[step_num] = float(np.nanmean([
                         batch_reward_results[i].scores.get(k, 0.0) for k in active
                     ]))
                 else:
@@ -153,6 +153,15 @@ class QGREStepAdvantageEstimator:
         # GDPO-style: normalize each step's advantages across the batch
         # When normalize_advantages=False (Dr.GRPO), skip std division to avoid bias
         for step_num in self._step_nums:
+            # NaN guard: replace NaN advantages before normalization (ms-swift #8123)
+            if step_advs[step_num].isnan().any():
+                import warnings
+                nan_count = step_advs[step_num].isnan().sum().item()
+                warnings.warn(
+                    f"Step {step_num}: {nan_count}/{len(step_advs[step_num])} advantages are NaN. "
+                    f"Check reward_fn for NaN returns. Replacing with 0.0."
+                )
+                step_advs[step_num] = torch.nan_to_num(step_advs[step_num], nan=0.0)
             mean = step_advs[step_num].mean()
             if self.normalize_advantages:
                 std = step_advs[step_num].std(correction=0)

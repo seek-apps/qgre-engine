@@ -59,7 +59,12 @@ class QGRETrainer:
         self.reward_fn = reward_fn
         self.config = config
         self.generation_backend = generation_backend
-        self.game_state = game_state or GameState(mastery_threshold=config.training.mastery_threshold)
+        self.game_state = game_state or GameState(
+            mastery_threshold=config.training.mastery_threshold,
+            stagnation_timeout=config.training.stagnation_timeout,
+            plateau_window=config.training.plateau_window,
+            plateau_threshold=config.training.plateau_threshold,
+        )
 
         # Step qualities and phase mapping — configurable per domain
         # step_qualities: from constructor arg, config YAML, or error
@@ -85,6 +90,9 @@ class QGRETrainer:
             if alg.segmenter == "qwen3_xml":
                 from qgre.segments import qwen3_xml_segmenter
                 segmenter = qwen3_xml_segmenter
+            elif alg.segmenter == "hif_json":
+                from qgre.segments import make_hif_json_segmenter
+                segmenter = make_hif_json_segmenter(tokenizer)
             elif ":" in alg.segmenter:
                 import importlib
                 mod_path, fn_name = alg.segmenter.rsplit(":", 1)
@@ -101,7 +109,7 @@ class QGRETrainer:
         # Loss function (NeMo RL extracted)
         self.loss_fn = ClippedPGLossFn({
             "reference_policy_kl_penalty": alg.kl_cov_ratio if alg.loss_mode == "kl_cov" else 0.0,
-            "reference_policy_kl_type": "k3",
+            "reference_policy_kl_type": alg.reference_policy_kl_type,
             "kl_input_clamp_value": 20.0,
             "kl_output_clamp_value": 10.0,
             "ratio_clip_min": alg.clip_ratio_low,
@@ -172,47 +180,6 @@ class QGRETrainer:
             )
         else:
             self.scheduler = main_scheduler
-
-    def compute_loss(
-        self,
-        logits: torch.Tensor,
-        input_ids: torch.Tensor,
-        advantages: torch.Tensor,
-        response_mask: torch.Tensor,
-        old_logprobs: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict]:
-        """Compute clipped PG loss from model output.
-
-        Args:
-            logits: [batch, seq, vocab] model output
-            input_ids: [batch, seq] full sequence
-            advantages: [batch, seq-1] per-token advantages
-            response_mask: [batch, seq-1] mask (1 = response token)
-            old_logprobs: [batch, seq-1] log probs from generation (on-policy: detached)
-
-        Returns:
-            (loss, metrics_dict)
-        """
-        curr_logprobs = logprobs_from_logits(logits[:, :-1, :], input_ids[:, 1:])
-
-        if old_logprobs is None:
-            old_logprobs = curr_logprobs.detach()
-
-        # Align lengths
-        min_len = min(curr_logprobs.shape[1], advantages.shape[1], response_mask.shape[1])
-        curr_lp = curr_logprobs[:, :min_len]
-        old_lp = old_logprobs[:, :min_len]
-        advs = advantages[:, :min_len]
-        mask = response_mask[:, :min_len].float()
-
-        loss, metrics = self.loss_fn(
-            curr_logprobs=curr_lp,
-            prev_logprobs=old_lp,
-            advantages=advs,
-            mask=mask,
-        )
-
-        return loss, metrics
 
     def compute_response_mask(
         self,
@@ -461,6 +428,12 @@ class QGRETrainer:
         metrics["reward/mean"] = reward_mean
         metrics["global_step"] = self.global_step
 
+        # Track completion lengths for verbosity drift detection
+        comp_lengths = [len(c) for c in completions]
+        metrics["completion_length/mean"] = float(sum(comp_lengths) / len(comp_lengths))
+        metrics["completion_length/max"] = float(max(comp_lengths))
+        metrics["completion_length/min"] = float(min(comp_lengths))
+
         # Record per-step mastery scores to GameState
         import numpy as np
         for step_num, quality_keys in self.step_qualities.items():
@@ -487,6 +460,10 @@ class QGRETrainer:
 
         self.game_state.step_count = self.global_step
         metrics["phase"] = self.game_state.phase
+
+        # Stagnation detection (detection only — log, don't intervene)
+        stagnation = self.game_state.check_stagnation()
+        metrics["stagnation"] = {"normal": 0, "stagnating": 1, "stuck": 2}[stagnation.value]
 
         # Log completions
         for i, rr in enumerate(reward_results):
