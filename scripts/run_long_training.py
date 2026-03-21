@@ -102,9 +102,25 @@ def main():
     for step in range(N_STEPS):
         # Generate
         backend.set_inference_mode()
-        encoded = tokenizer(PROMPTS, return_tensors="pt", padding=True, truncation=True, max_length=config.data.max_prompt_length)
-        input_ids = encoded["input_ids"].to("cuda")
-        attention_mask = encoded["attention_mask"].to("cuda")
+        # Apply chat template (same as QGREDataLoader) so the model sees proper
+        # <|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n structure.
+        # Without this, raw text produces unconditioned garbage.
+        chat_token_ids = []
+        for p in PROMPTS:
+            messages = [{"role": "user", "content": p}]
+            ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+            chat_token_ids.append(ids)
+
+        max_len = min(max(len(ids) for ids in chat_token_ids), config.data.max_prompt_length)
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        input_ids = torch.full((len(PROMPTS), max_len), pad_id, dtype=torch.long)
+        attention_mask = torch.zeros(len(PROMPTS), max_len, dtype=torch.long)
+        for i, ids in enumerate(chat_token_ids):
+            ids = ids[-max_len:]
+            input_ids[i, max_len - len(ids):] = torch.tensor(ids, dtype=torch.long)
+            attention_mask[i, max_len - len(ids):] = 1
+        input_ids = input_ids.to("cuda")
+        attention_mask = attention_mask.to("cuda")
         gen_output = backend.generate(input_ids, attention_mask)
 
         # Score

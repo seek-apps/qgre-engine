@@ -270,10 +270,12 @@ class QGRETrainer:
         if self.config.algorithm.mode == "spo":
             useful = (padded_advs.abs() > 0.01).any(dim=-1)
             if useful.sum() == 0:
-                # All advantages near-zero — skip this step entirely (no useful gradient)
+                # All advantages near-zero — skip backward pass but still record mastery + check phase
                 self.global_step += 1
-                return {"loss": 0.0, "reward/mean": sum(rr.reward for rr in reward_results) / len(reward_results),
-                        "global_step": self.global_step - 1, "phase": self.game_state.phase, "skipped": True}
+                metrics = {"loss": 0.0, "reward/mean": sum(rr.reward for rr in reward_results) / len(reward_results),
+                           "global_step": self.global_step - 1, "phase": self.game_state.phase, "skipped": True}
+                self._record_mastery_and_advance(reward_results, active_qualities, batch, metrics)
+                return metrics
             if useful.sum() >= 2 and useful.sum() < len(completions):
                 idx = useful.nonzero(as_tuple=True)[0]
                 padded_advs = padded_advs[idx]
@@ -440,36 +442,7 @@ class QGRETrainer:
         metrics["completion_length/max"] = float(max(comp_lengths))
         metrics["completion_length/min"] = float(min(comp_lengths))
 
-        # Record per-step mastery scores to GameState
-        import numpy as np
-        for step_num, quality_keys in self.step_qualities.items():
-            active_keys = [k for k in quality_keys if k in active_qualities[0]]
-            if active_keys:
-                step_scores = [
-                    float(np.mean([rr.scores.get(k, 0.0) for k in active_keys]))
-                    for rr in reward_results
-                ]
-                mean_step_score = float(np.mean(step_scores))
-                self.game_state.record_step_score(step_num, mean_step_score)
-                metrics[f"mastery/step_{step_num}"] = mean_step_score
-
-        # Check phase advancement
-        max_phase = max(self.step_qualities.keys())
-        old_phase = self.game_state.phase
-        if self.game_state.check_phase_advance(max_phase):
-            new_phase = self.game_state.phase
-            metrics["phase_advanced"] = new_phase
-            self.advantage_estimator.on_tier_advance(
-                new_tier=new_phase,
-                prompt_tier_map={pid: new_phase for pid in batch.prompt_ids},
-            )
-
-        self.game_state.step_count = self.global_step
-        metrics["phase"] = self.game_state.phase
-
-        # Stagnation detection (detection only — log, don't intervene)
-        stagnation = self.game_state.check_stagnation()
-        metrics["stagnation"] = {"normal": 0, "stagnating": 1, "stuck": 2}[stagnation.value]
+        self._record_mastery_and_advance(reward_results, active_qualities, batch, metrics)
 
         # Log completions
         for i, rr in enumerate(reward_results):
@@ -544,6 +517,72 @@ class QGRETrainer:
 
         return True
 
+    def _record_mastery_and_advance(self, reward_results, active_qualities, batch, metrics):
+        """Record per-step mastery scores, check phase advancement, update difficulty gate."""
+        import numpy as np
+        for step_num, quality_keys in self.step_qualities.items():
+            active_keys = [k for k in quality_keys if k in active_qualities[0]]
+            if active_keys:
+                step_scores = [
+                    float(np.mean([rr.scores.get(k, 0.0) for k in active_keys]))
+                    for rr in reward_results
+                ]
+                mean_step_score = float(np.mean(step_scores))
+                self.game_state.record_step_score(step_num, mean_step_score)
+                metrics[f"mastery/step_{step_num}"] = mean_step_score
+
+        max_phase = max(self.step_qualities.keys())
+        old_phase = self.game_state.phase
+        if self.game_state.check_phase_advance(max_phase):
+            new_phase = self.game_state.phase
+            metrics["phase_advanced"] = new_phase
+            self.advantage_estimator.on_tier_advance(
+                new_tier=new_phase,
+                prompt_tier_map={pid: new_phase for pid in batch.prompt_ids},
+            )
+            self._apply_difficulty_gate(self._dataloader)
+
+        self.game_state.step_count = self.global_step
+        metrics["phase"] = self.game_state.phase
+
+        stagnation = self.game_state.check_stagnation()
+        metrics["stagnation"] = {"normal": 0, "stagnating": 1, "stuck": 2}[stagnation.value]
+
+    def _apply_difficulty_gate(self, dataloader):
+        """Apply difficulty-gated curriculum: only sample prompts at or below current phase.
+
+        Uses config.data.difficulty_schedule to map phase → allowed difficulty values.
+        Calls dataloader.set_difficulty_gate() to zero out prompts above the gate.
+        Logs the gate change to MLflow.
+        """
+        schedule = self.config.data.difficulty_schedule
+        col = self.config.data.difficulty_column
+        if not schedule or not col or not hasattr(dataloader, "set_difficulty_gate"):
+            return
+
+        phase = self.game_state.phase
+        # Find the highest phase in schedule that's <= current phase
+        valid_phases = [p for p in schedule if p <= phase]
+        if not valid_phases:
+            return
+        active_phase = max(valid_phases)
+        allowed = set(schedule[active_phase])
+        dataloader.set_difficulty_gate(allowed, col)
+
+        # Log to MLflow
+        try:
+            from qgre.mlflow_logger import log_step_metrics
+            log_step_metrics(
+                step=self.global_step,
+                reward_mean=0.0,
+                loss=0.0,
+                extra={"difficulty_gate_phase": active_phase, "difficulty_gate_tiers": len(allowed)},
+            )
+        except Exception:
+            pass
+        import warnings
+        warnings.warn(f"Phase {phase}: difficulty gate → {sorted(allowed)}")
+
     def train(
         self,
         dataloader: QGREDataLoader,
@@ -566,6 +605,7 @@ class QGRETrainer:
                 "No generation backend provided. Pass to train() or QGRETrainer constructor."
             )
 
+        self._dataloader = dataloader  # Store ref for difficulty gate updates
         self.setup_optimizer()
         cfg = self.config.training
 
@@ -584,6 +624,9 @@ class QGRETrainer:
 
         # Try to resume from checkpoint
         self.resume(self.config.logging.checkpoint_dir)
+
+        # Difficulty-gated curriculum: set initial gate based on current phase
+        self._apply_difficulty_gate(dataloader)
 
         for epoch in range(100):  # Outer epoch loop — stops when total_steps reached
             for batch in dataloader:
@@ -621,6 +664,10 @@ class QGRETrainer:
                 try:
                     step_rewards = {int(k.split("_")[-1]): v for k, v in metrics.items()
                                    if k.startswith("mastery/step_")}
+                    # Log mastery and phase to stdout for debugging curriculum
+                    if self.global_step % 10 == 0:
+                        mastery_str = " ".join(f"s{k}={v:.2f}" for k, v in sorted(step_rewards.items()))
+                        print(f"[step {self.global_step}] phase={self.game_state.phase} mastery: {mastery_str}")
                     log_step_metrics(
                         step=self.global_step - 1,
                         reward_mean=metrics.get("reward/mean", 0.0),

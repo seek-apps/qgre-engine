@@ -1,5 +1,5 @@
-# Hamiltonian mechanics — 50-step real training smoke test
-# Verifiable: all answers are symbolic derivatives, ground truth in metadata
+# Hamiltonian mechanics — proper QGRE showcase with phase-gated curriculum
+# 121 sympy-verified problems, 4-phase progressive reward, difficulty-gated prompt release
 
 model:
   path: unsloth/Qwen3-1.7B-unsloth-bnb-4bit
@@ -15,13 +15,28 @@ data:
   max_prompt_length: 512
   train_batch_size: 4
   prompt_column: prompt
-  metadata_columns: [ground_truth, dqdt, dpdt, difficulty, system, H_key]
+  metadata_columns:
+    - ground_truth
+    - H_expr
+    - T_expr
+    - V_expr
+    - dqdt
+    - dpdt
+    - coordinates
+    - difficulty
+    - system
+  difficulty_column: difficulty
+  difficulty_schedule:
+    1: [tier1, edge]
+    2: [tier1, edge, tier2]
+    3: [tier1, edge, tier2, tier3]
+    4: [tier1, edge, tier2, tier3, tier4, adversarial]
 
 generation:
-  temperature: 1.0
-  top_p: 1.0
-  top_k: -1
-  max_tokens: 4096
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+  max_tokens: 2048
   stop_token_ids: [151643, 151645]
 
 algorithm:
@@ -31,23 +46,27 @@ algorithm:
     n: 1
   clip_ratio_low: 0.2
   clip_ratio_high: 0.28
-  llds_coef: 0.0            # Off for smoke test
+  llds_coef: 0.0
   loss_type: grpo
+  segmenter: uniform
 
-  # Uniform segmenter → all tokens are STEP_1 → all qualities must be in step 1
   step_qualities:
-    1: [q_format, q_identifies_T, q_identifies_V, q_correct_dqdt, q_correct_dpdt]
+    1: [q_format, q_has_math]
+    2: [q_identifies_T, q_identifies_V, q_grounding]
+    3: [q_correct_dqdt, q_correct_dpdt]
+    4: [q_correct_H, q_consistency]
 
 training:
-  total_steps: 50
-  lr: 1.0e-5               # Slightly higher lr for short run
-  warmup_steps: 3
+  total_steps: 400
+  lr: 5.0e-6
+  warmup_steps: 10
   lr_scheduler: cosine
-  save_freq: 25
+  save_freq: 50
   gradient_accumulation_steps: 1
-  mastery_threshold: 0.85
+  mastery_threshold: 0.8
+  stagnation_timeout: 100
 
 logging:
-  mlflow_experiment: hamiltonian-smoke-50
+  mlflow_experiment: hamiltonian-curriculum-400
   completion_dir: output/hamiltonian/completions
   checkpoint_dir: output/hamiltonian/checkpoints

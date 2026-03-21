@@ -24,6 +24,11 @@ class DataConfig:
     train_batch_size: int = 16
     prompt_column: str = "prompt"
     metadata_columns: list[str] = field(default_factory=lambda: ["ground_truth", "extra_info"])
+    # Difficulty-gated curriculum: maps GameState phase → allowed difficulty values.
+    # Prompts with difficulty not in the current phase's set get zero sampling weight.
+    # The difficulty value comes from the metadata column named by difficulty_column.
+    difficulty_column: str | None = None  # e.g. "difficulty"
+    difficulty_schedule: dict | None = None  # e.g. {1: ["tier1","edge"], 2: ["tier1","edge","tier2"], ...}
 
 
 @dataclass
@@ -144,7 +149,13 @@ class QGREConfig:
         if "model" in d:
             cfg.model = ModelConfig(**_pick(ModelConfig, d["model"], "model"))
         if "data" in d:
-            cfg.data = DataConfig(**_pick(DataConfig, d["data"], "data"))
+            data_fields = _pick(DataConfig, d["data"], "data")
+            # Ensure difficulty_schedule keys are ints
+            if "difficulty_schedule" in data_fields and data_fields["difficulty_schedule"] is not None:
+                data_fields["difficulty_schedule"] = {
+                    int(k): list(v) for k, v in data_fields["difficulty_schedule"].items()
+                }
+            cfg.data = DataConfig(**data_fields)
         if "generation" in d:
             cfg.generation = GenerationConfig(**_pick(GenerationConfig, d["generation"], "generation"))
         if "algorithm" in d:

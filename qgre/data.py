@@ -76,6 +76,8 @@ class QGREDataLoader:
 
         # Priority-weighted sampling (SPO paper Section 3.2)
         self._priorities: dict[int, float] | None = None
+        # Difficulty-gated curriculum
+        self._difficulty_gate: tuple[set[str], str] | None = None
 
     def _prepare(self, prompts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Tokenize, filter overlong, store results."""
@@ -116,19 +118,42 @@ class QGREDataLoader:
         """
         self._priorities = priorities
 
+    def set_difficulty_gate(self, allowed_difficulties: set[str], difficulty_column: str = "difficulty"):
+        """Gate prompts by difficulty: only prompts with matching difficulty get sampled.
+
+        Prompts outside the allowed set get zero priority weight.
+        Called by the trainer on phase advancement to gradually introduce harder problems.
+        """
+        self._difficulty_gate = (allowed_difficulties, difficulty_column)
+
     def _shuffle(self, epoch: int) -> list[dict[str, Any]]:
         """Deterministic shuffle per epoch, with optional priority-weighted sampling."""
         gen = torch.Generator()
         gen.manual_seed(self.seed + epoch)
 
-        if self._priorities is not None:
-            # Priority-weighted sampling: sample with replacement, weighted by |advantage|
-            weights = torch.tensor(
-                [self._priorities.get(item["prompt_id"], 1.0) for item in self.items],
-                dtype=torch.float64,
-            )
-            # Add small epsilon to avoid zero weights, then normalize
-            weights = weights + 1e-8
+        # Start with base weights
+        weights = torch.tensor(
+            [self._priorities.get(item["prompt_id"], 1.0) if self._priorities else 1.0
+             for item in self.items],
+            dtype=torch.float64,
+        )
+
+        # Apply difficulty gate: zero out prompts above the current phase
+        if hasattr(self, "_difficulty_gate") and self._difficulty_gate is not None:
+            allowed, col = self._difficulty_gate
+            for i, item in enumerate(self.items):
+                difficulty = item["metadata"].get(col, "")
+                if difficulty not in allowed:
+                    weights[i] = 0.0
+
+        if weights.sum() == 0:
+            # Fallback: if all weights are zero (misconfigured gate), use uniform
+            weights = torch.ones(len(self.items), dtype=torch.float64)
+
+        if self._priorities is not None or (hasattr(self, "_difficulty_gate") and self._difficulty_gate is not None):
+            # Add epsilon only to non-zero weights (preserve hard zeros from difficulty gate)
+            mask = weights > 0
+            weights[mask] = weights[mask] + 1e-8
             weights = weights / weights.sum()
             indices = torch.multinomial(
                 weights, len(self.items), replacement=True, generator=gen,
