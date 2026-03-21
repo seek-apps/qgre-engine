@@ -36,7 +36,7 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/seek-apps/qgre-engine"
+Repository = "https://github.com/torad-labs/qgre-engine"
 
 [tool.setuptools.packages.find]
 include = ["qgre*"]

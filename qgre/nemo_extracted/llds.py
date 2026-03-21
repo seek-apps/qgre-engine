@@ -5,7 +5,7 @@
 # Addresses training collapse precursor where reward looks stable but correct-answer
 # log-probs silently decrease.
 #
-# Extracted from seek-apps/verl fork (verl/trainer/ppo/core_algos.py lines 2486-2526).
+# Extracted from torad-labs/verl fork (verl/trainer/ppo/core_algos.py lines 2486-2526).
 # Config: algorithm.llds_coef (default 0.05).
 
 from __future__ import annotations
