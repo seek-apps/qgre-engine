@@ -6,6 +6,28 @@ The core claim: SFT teaches models to *match outputs*. QGRE teaches models to *m
 
 No Ray. No verl. No TRL. Just: generate → score → advantages → loss → backward → update.
 
+## Why Not verl / TRL / OpenRLHF?
+
+Those frameworks solve a different problem. They distribute GRPO across GPU clusters. QGRE solves the problem that comes *before* distribution: how to train on a domain where the model doesn't know the output format, the reasoning protocol, or what "correct" means — and where a single scalar reward cannot teach it.
+
+| | **QGRE Engine** | **verl** | **TRL** | **OpenRLHF** |
+|---|---|---|---|---|
+| **Primary target** | Novel domains, structured reasoning | Math/code (verifiable) | General alignment | General RLHF |
+| **Credit assignment** | Per-token, per-region (VPRM) | Per-completion | Per-completion | Per-completion |
+| **Curriculum** | Phase-gated, automatic advancement | None | None | None |
+| **Baseline** | SPO persistent EMA (n=1) | Group mean (n=8–16) | Group mean (n=8) | PPO critic network |
+| **Cold start** | Phase 1 teaches format first | Assumes model knows format | Assumes model knows format | Assumes model knows format |
+| **GPU requirement** | 1 × 16GB consumer GPU | 4–8 × A100 | 1–4 GPUs | 4–8 GPUs |
+| **Complexity** | ~3K lines, single process | ~50K lines, Ray actors | ~30K lines, Accelerate | ~40K lines, Ray |
+| **Setup** | `pip install -e .` + one YAML | Cluster config, Ray, FSDP | HuggingFace ecosystem | Ray cluster, Docker |
+| **Generation speed** | ~35s/step (n=1, 4096 tokens) | ~280s/step (n=8, 4096 tokens) | ~280s/step (n=8) | ~280s/step (n=8) |
+
+The difference is architectural, not just scale. verl, TRL, and OpenRLHF assign one reward to one completion. If the format is wrong, the grounding is also penalized. If grounding is right, the format also gets credit. The model has no way to separate them.
+
+QGRE decomposes. A segmenter maps every token to its step. Each step has its own quality functions. Each quality has its own advantage. The gradient that teaches format touches only format tokens. The gradient that teaches grounding touches only grounding tokens. And the curriculum decides *when* each gradient turns on.
+
+This is why a 1.7B model learns Hamiltonian mechanics in 50 steps. Not because the model is special. Because the training signal is decomposed.
+
 ## Results
 
 **Hamiltonian mechanics** (Qwen3-1.7B, 4-bit quantized, single RTX 5080 16GB):
@@ -68,6 +90,59 @@ That's it. The engine loads the model, data, creates the trainer, and runs the f
 │                      └──────────────┘                          │
 └─────────────────────────────────────────────────────────────────┘
   One process. One GPU. Direct function calls.
+```
+
+### Training Loop (Mermaid)
+
+```mermaid
+flowchart TB
+    subgraph GENERATE ["1. Generate (inference mode)"]
+        A[Prompts from DataLoader] --> B[vLLM fast_generate]
+        B --> C[Token IDs + Text]
+    end
+
+    subgraph SCORE ["2. Score"]
+        C --> D[Your reward_fn]
+        D --> E["RewardResult(scores={q_format: 0.9, q_ground: 0.4, ...})"]
+    end
+
+    subgraph ADVANTAGE ["3. Compute Advantages"]
+        E --> F[Segmenter → regions per token]
+        F --> G[Step rewards from active qualities]
+        G --> H["SPO baseline: r - V(prompt, step)"]
+        H --> I[GDPO normalize per step]
+        I --> J[Broadcast to per-token advantages]
+    end
+
+    subgraph TRAIN ["4. Train (training mode)"]
+        J --> K[Micro-batched forward pass]
+        K --> L[selective_log_softmax → logprobs]
+        L --> M["ClippedPGLossFn (NeMo RL)"]
+        M --> N[loss.backward + optimizer.step]
+    end
+
+    subgraph CURRICULUM ["5. Curriculum"]
+        N --> O[Record mastery per step]
+        O --> P{mastery > threshold?}
+        P -->|Yes| Q[Advance phase → unlock next qualities]
+        P -->|No| R[Check stagnation]
+        Q --> S[Reset SPO baseline for new step]
+    end
+
+    subgraph SYNC ["6. Sync & Persist"]
+        S --> T[Save LoRA → reload into vLLM]
+        R --> T
+        T --> U[Checkpoint every N steps]
+        U --> V[Recreate vLLM every 50 steps]
+        V --> A
+    end
+
+    style GENERATE fill:#1a1a2e,stroke:#16213e,color:#e0e0e0
+    style SCORE fill:#1a1a2e,stroke:#16213e,color:#e0e0e0
+    style ADVANTAGE fill:#0f3460,stroke:#16213e,color:#e0e0e0
+    style TRAIN fill:#0f3460,stroke:#16213e,color:#e0e0e0
+    style CURRICULUM fill:#533483,stroke:#16213e,color:#e0e0e0
+    style SYNC fill:#1a1a2e,stroke:#16213e,color:#e0e0e0
 ```
 
 ### What each layer does
@@ -142,6 +217,22 @@ Training can stall. The engine monitors two signals:
 - **Timeout**: a phase exceeds 200 steps without advancement. The curriculum is stuck.
 
 Both are logged to MLflow as the `stagnation` metric (0=normal, 1=stagnating, 2=stuck). Detection only — the engine does not intervene. Your training run decides what to do with the signal.
+
+### The Cold Start Problem (and why QGRE exists)
+
+Every RL training framework assumes the model already knows the output format. verl's math recipes work because the base model has seen enough math during pretraining to produce `\boxed{answer}` some percentage of the time. TRL's GRPO works because instruction-tuned models already know how to follow formatting instructions.
+
+But what happens when you train on a domain the model has never seen? A domain where the output is a hypergraph incidence format, or a Hamiltonian derivation with specific symbolic structure, or a JSON schema the model has never encountered?
+
+The model's first completions are garbage. Every completion is garbage. A single scalar reward on garbage is noise. The group mean of 8 garbage completions is still garbage. The gradient from that noise points nowhere.
+
+QGRE solves cold start by gating:
+
+1. **Phase 1**: Only reward format. "Does the output have the right shape?" The model learns: "I should produce something that looks like `{nodes: [...], edges: [...]}`" — regardless of whether the content is correct.
+2. **Phase 2**: Reward format + grounding. "OK, you know the shape. Now: are the nodes actually from the input?" The model already has the format down. It only needs to learn one new thing.
+3. **Phase N**: Reward everything. Full training signal. But by now the model produces well-formatted, well-grounded output. The accuracy signal has clean targets to push against.
+
+This is the cold start solution. No SFT warm-up needed. No hand-crafted easy examples. The curriculum IS the warm-up. The model bootstraps from zero knowledge of the domain in 50 steps because each step only asks it to learn one thing at a time.
 
 ### The n=1 Economics
 
@@ -426,6 +517,25 @@ Full state is saved and restored automatically:
 - PyTorch + CUDA RNG state (exact reproducibility)
 
 Resume is automatic — `trainer.train()` checks for the latest checkpoint and picks up where it left off. Stagnation detection state survives checkpoint/resume with backward-compatible defaults.
+
+## VRAM Budget (Real Numbers)
+
+Measured on RTX 5080 16GB with Qwen3-1.7B 4-bit:
+
+| Component | VRAM | Notes |
+|-----------|------|-------|
+| Model body (4-bit NF4) | ~850 MB | 28 layers quantized |
+| lm_head (bf16, NOT quantized) | ~446 MB | Full precision for logit quality |
+| Embeddings (bf16) | ~446 MB | Full precision |
+| vLLM KV cache (`gpu_memory_utilization=0.35`) | ~3.0 GB | Supports ~6× concurrent 4608-token sequences |
+| LoRA adapters (rank 8) | ~12 MB | 7 target modules per layer |
+| Optimizer states (AdamW8bit) | ~24 MB | 4× savings over fp32 AdamW |
+| **Peak during training** | **6.2 GB** | Micro-batch size 1 at seq ≥ 2048 |
+| **Steady state** | **4.7 GB** | Between forward passes |
+
+The engine never materializes the full `[batch, seq, vocab]` logits tensor. `selective_log_softmax` computes `log_softmax` for only the generated token at each position — 37,000× less memory per position for Qwen3's 151,936 vocab.
+
+Micro-batching adapts to sequence length: `micro_batch_size=1` for sequences ≥ 2048 tokens, `micro_batch_size=2` for shorter. This keeps peak VRAM under 6.5GB regardless of completion length.
 
 ## Known Constraints
 
