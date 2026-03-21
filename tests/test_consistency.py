@@ -1,8 +1,12 @@
-"""Equivalence test: fixed completions through algorithm layer (Step 7).
+"""Internal consistency tests: fixed completions through algorithm layer (Step 7).
 
 Tests the ALGORITHM layer only — not generation or reward.
-When reference data from verl is available, replace synthetic_reference
-with real JSONL data. Until then, tests verify internal consistency.
+Verifies that the same input produces the same output (determinism),
+and that SPO/GRPO modes produce structurally correct advantages.
+
+NOTE: This does NOT test equivalence with verl or any external framework.
+When verl reference data is available, a separate test_verl_equivalence.py
+should be created for cross-framework comparison.
 """
 
 import torch

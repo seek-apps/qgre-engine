@@ -124,6 +124,11 @@ class QGRETrainer:
             "lambda_return": alg.lambda_return,
         })
 
+        # LLDS requires stored generation-time logprobs to be meaningful.
+        # Without them, old_logprob == curr_logprob and all LLDS gates return zero.
+        # This flag is set to True when generation-time logprobs are wired (future work).
+        self._has_stored_logprobs = False
+
         # Completion logger
         self.completion_logger = CompletionLogger(config.logging.completion_dir)
 
@@ -363,9 +368,10 @@ class QGRETrainer:
                     mb_metrics["length_penalty"] = length_penalty.item()
 
             # LLDS auxiliary loss — prevents Lazy Likelihood Displacement death spiral
-            # (arXiv:2512.04220, PLAN.md line 504)
+            # (arXiv:2512.04220). Only meaningful when old_logprob != curr_logprob,
+            # which requires stored generation-time logprobs (not yet implemented).
             llds_coef = self.config.algorithm.llds_coef
-            if llds_coef > 0:
+            if llds_coef > 0 and self._has_stored_logprobs:
                 llds_loss, llds_mask = compute_llds_loss(
                     log_prob=mb_lp[:, :min_len],
                     old_log_prob=mb_old_lp[:, :min_len],
@@ -641,16 +647,26 @@ class QGRETrainer:
                         verifier = LoRAVerifier()
                         verifier.verify_sync(lora_path)
                         verifier.verify_active(self.model, self.tokenizer)
-                    except (ImportError, Exception):
-                        pass  # Non-fatal — verification is a safety check
+                    except ImportError:
+                        pass  # LoRA verifier not installed
+                    except Exception as e:
+                        import warnings
+                        warnings.warn(
+                            f"Step {self.global_step}: LoRA verification failed: {e}. "
+                            f"Training continues but weights may be desynchronized."
+                        )
 
                 # 7. Periodic vLLM recreation to prevent VRAM leak (PLAN.md line 719, unsloth #3864)
                 if self.global_step > 0 and self.global_step % 50 == 0:
                     if hasattr(backend, "recreate_engine"):
                         try:
                             backend.recreate_engine()
-                        except Exception:
-                            pass  # Non-fatal — continue training
+                        except Exception as e:
+                            import warnings
+                            warnings.warn(
+                                f"Step {self.global_step}: vLLM engine recreation failed: {e}. "
+                                f"VRAM leak may accumulate. Monitor GPU memory."
+                            )
 
             if self.global_step >= cfg.total_steps:
                 break

@@ -98,7 +98,7 @@ tests/
   test_trainer.py      — Step 1
   test_wiring.py       — Steps 2-3 (GPU required)
   test_logging.py      — Steps 4, 6
-  test_equivalence.py  — Step 7
+  test_consistency.py  — Step 7 (internal consistency, NOT verl equivalence)
   test_smoke.py        — GPU smoke test
   test_triton_logprobs.py — Triton kernel tests
 ```
