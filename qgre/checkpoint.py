@@ -12,17 +12,21 @@ def gamestate_to_dict(gs: GameState) -> dict:
 
     Converts: deque → {values, maxlen} for safe round-trip.
     """
-    sm = {}
-    for step_num, dq in gs.step_mastery.items():
-        sm[step_num] = {"values": list(dq), "maxlen": dq.maxlen}
+    # Serialize 2D tier_mastery: {tier: {step_num: {values, maxlen}}}
+    tm = {}
+    for tier, step_windows in gs.tier_mastery.items():
+        tm[tier] = {}
+        for step_num, dq in step_windows.items():
+            tm[tier][step_num] = {"values": list(dq), "maxlen": dq.maxlen}
 
     return {
-        "phase": gs.phase,
         "step_count": gs.step_count,
         "mastery_threshold": gs.mastery_threshold,
-        "step_mastery": sm,
+        "tier_mastery": tm,
+        "tier_phases": dict(gs.tier_phases),
+        "active_tiers": list(gs.active_tiers),
+        "tier_steps_at_phase_start": dict(gs.tier_steps_at_phase_start),
         "phase_history": list(gs.phase_history),
-        "steps_at_phase_start": gs.steps_at_phase_start,
         "stagnation_timeout": gs.stagnation_timeout,
         "plateau_window": gs.plateau_window,
         "plateau_threshold": gs.plateau_threshold,
@@ -32,24 +36,38 @@ def gamestate_to_dict(gs: GameState) -> dict:
 def gamestate_from_dict(d: dict) -> GameState:
     """Reconstruct GameState from a plain dict.
 
-    Restores: list → deque (with maxlen).
+    Restores: list → deque (with maxlen). Handles both old 1D and new 2D format.
     """
     gs = GameState()
-    gs.phase = d.get("phase", 1)
     gs.step_count = d.get("step_count", 0)
     gs.mastery_threshold = d.get("mastery_threshold", 0.8)
     gs.phase_history = list(d.get("phase_history", []))
-    gs.steps_at_phase_start = d.get("steps_at_phase_start", 0)
     gs.stagnation_timeout = d.get("stagnation_timeout", 200)
     gs.plateau_window = d.get("plateau_window", 50)
     gs.plateau_threshold = d.get("plateau_threshold", 0.02)
 
-    sm = d.get("step_mastery", {})
-    gs.step_mastery = {}
-    for step_num, window_data in sm.items():
-        maxlen = window_data.get("maxlen", QUALITY_WINDOW_SIZE)
-        values = window_data.get("values", [])
-        gs.step_mastery[int(step_num)] = deque(values, maxlen=maxlen)
+    # 2D tier fields
+    gs.tier_phases = d.get("tier_phases", {"default": d.get("phase", 1)})
+    gs.active_tiers = d.get("active_tiers", ["default"])
+    gs.tier_steps_at_phase_start = d.get("tier_steps_at_phase_start", {})
+
+    # Restore tier_mastery from serialized format
+    tm = d.get("tier_mastery", {})
+    gs.tier_mastery = {}
+    for tier, step_windows in tm.items():
+        gs.tier_mastery[tier] = {}
+        for step_num, window_data in step_windows.items():
+            maxlen = window_data.get("maxlen", QUALITY_WINDOW_SIZE)
+            values = window_data.get("values", [])
+            gs.tier_mastery[tier][int(step_num)] = deque(values, maxlen=maxlen)
+
+    # Backward compat: migrate old 1D step_mastery to "default" tier
+    if "step_mastery" in d and "tier_mastery" not in d:
+        gs.tier_mastery["default"] = {}
+        for step_num, window_data in d["step_mastery"].items():
+            maxlen = window_data.get("maxlen", QUALITY_WINDOW_SIZE)
+            values = window_data.get("values", [])
+            gs.tier_mastery["default"][int(step_num)] = deque(values, maxlen=maxlen)
 
     return gs
 

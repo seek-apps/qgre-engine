@@ -165,7 +165,12 @@ class UnslothBackend:
 
         Call every 50-100 steps per unsloth #3864 / ms-swift #8233.
         """
-        if hasattr(self.model, 'vllm_engine') and self.model.vllm_engine is not None:
-            del self.model.vllm_engine
+        # Unsloth stores vllm_engine on model or model.model (inner base model)
+        engine = getattr(self.model, 'vllm_engine', None) or getattr(getattr(self.model, 'model', None), 'vllm_engine', None)
+        if engine is not None:
+            if hasattr(self.model, 'vllm_engine'):
+                del self.model.vllm_engine
+            if hasattr(getattr(self.model, 'model', None), 'vllm_engine'):
+                del self.model.model.vllm_engine
             torch.cuda.empty_cache()
             # Unsloth will recreate the engine on next fast_generate call

@@ -30,8 +30,9 @@ def pytest_collection_modifyitems(config, items):
 @pytest.fixture
 def mock_game_state() -> GameState:
     """GameState with non-trivial state for serialization tests."""
-    gs = GameState(phase=3, step_count=150, mastery_threshold=0.8)
-    gs.phase_history = [50, 100]
+    gs = GameState(step_count=150, mastery_threshold=0.8)
+    gs.tier_phases = {"default": 3}
+    gs.phase_history = [(50, "default", 1, 2), (100, "default", 2, 3)]
 
     # Per-step mastery scores
     gs.record_step_score(1, 0.95)

@@ -15,6 +15,7 @@ data:
   max_prompt_length: 512
   train_batch_size: 4
   prompt_column: prompt
+  system_prompt_column: system_prompt  # Separate system message in chat template
   metadata_columns:
     - ground_truth
     - H_expr
@@ -26,17 +27,18 @@ data:
     - difficulty
     - system
   difficulty_column: difficulty
-  # 2D mastery matrix curriculum
-  tier_order: [tier1, edge, tier2, tier3, tier4, adversarial]
+  # 2D mastery matrix curriculum — more granular tiers with system prompt fade
+  # tier1/edge: full prompt | tier1b/tier2: abbreviated | tier2b/tier3: minimal | tier3b+: none
+  tier_order: [tier1, edge, tier1b, tier2, tier2b, tier3, tier3b, tier4, adversarial]
   tier_advance_quality_phase: 3    # Must master equations before harder physics unlocks
-  tier_advance_threshold: 0.85     # Mastery threshold for tier advancement
+  tier_advance_threshold: 0.75     # Mastery threshold for tier advancement
   initial_tiers: [tier1, edge]
 
 generation:
-  temperature: 0.6
-  top_p: 0.95
-  top_k: 20
-  max_tokens: 2048
+  temperature: 1.0
+  top_p: 1.0
+  top_k: -1
+  max_tokens: 4096
   stop_token_ids: [151643, 151645]
 
 algorithm:
@@ -48,7 +50,9 @@ algorithm:
   clip_ratio_high: 0.28
   llds_coef: 0.0
   loss_type: grpo
-  segmenter: uniform
+  segmenter: qwen3_xml
+  length_penalty_coef: 0.005
+  length_penalty_threshold: 0.6
 
   step_qualities:
     1: [q_format, q_has_math]
@@ -57,7 +61,7 @@ algorithm:
     4: [q_correct_H, q_consistency]
 
 training:
-  total_steps: 400
+  total_steps: 1200
   lr: 5.0e-6
   warmup_steps: 10
   lr_scheduler: cosine

@@ -324,7 +324,7 @@ def test_step_records_mastery_and_advances_phase():
 
         # After 25 steps with high step-1 scores, phase should have advanced
         assert trainer.game_state.phase >= 2, f"Phase should have advanced, got {trainer.game_state.phase}"
-        assert "mastery/step_1" in metrics
+        assert "mastery/default/step_1" in metrics
 
 
 def test_step_uses_engine_phase_not_reward_phase():
@@ -335,7 +335,7 @@ def test_step_uses_engine_phase_not_reward_phase():
         cfg.logging.checkpoint_dir = str(Path(tmpdir) / "ckpt")
 
         from qgre.types import GameState
-        gs = GameState(phase=1)  # Engine says phase 1
+        gs = GameState()  # Engine starts at phase 1 (default tier)
 
         model = MockModel()
         trainer = QGRETrainer(model=model, tokenizer=None,

@@ -14,7 +14,20 @@ from pathlib import Path
 import pandas as pd
 import sympy as sp
 
-SYSTEM_PROMPT = (Path(__file__).parent / "system_prompt.txt").read_text().strip()
+from examples.hamiltonian.system_prompts import FULL, ABBREVIATED, MINIMAL, NONE
+
+# System prompt fade: earlier tiers get full coaching, later tiers get less
+TIER_SYSTEM_PROMPTS = {
+    "tier1": FULL,
+    "tier1b": FULL,
+    "edge": FULL,
+    "tier2": ABBREVIATED,
+    "tier2b": ABBREVIATED,
+    "tier3": MINIMAL,
+    "tier3b": MINIMAL,
+    "tier4": NONE,
+    "adversarial": NONE,
+}
 
 
 # ─── Sympy verification ─────────────────────────────────────────────────────
@@ -33,17 +46,18 @@ def _verify(H, q_vars, p_vars, dqdt_exprs, dpdt_exprs):
 
 def _problem(prompt, H, T, V, q_vars, p_vars, dqdt_exprs, dpdt_exprs,
              difficulty, system, coordinates):
-    """Build a verified problem dict."""
+    """Build a verified problem dict with separate system prompt."""
     _verify(H, q_vars, p_vars, dqdt_exprs, dpdt_exprs)
 
     # Format dqdt/dpdt as semicolon-separated for multi-DOF
     dqdt_strs = [f"d{q}/dt = {dq}" for q, dq in zip(q_vars, dqdt_exprs)]
     dpdt_strs = [f"d{p}/dt = {dp}" for p, dp in zip(p_vars, dpdt_exprs)]
 
-    full_prompt = f"{SYSTEM_PROMPT}\n\n---\n\n{prompt}"
+    sys_prompt = TIER_SYSTEM_PROMPTS.get(difficulty, FULL)
 
     return {
-        "prompt": full_prompt,
+        "prompt": prompt,
+        "system_prompt": sys_prompt,
         "ground_truth": f"H = {H}; {'; '.join(dqdt_strs)}; {'; '.join(dpdt_strs)}",
         "H_expr": str(H),
         "T_expr": str(T),
@@ -130,7 +144,7 @@ def _tier1_incline():
                 q_vars=[s], p_vars=[p_s],
                 dqdt_exprs=[sp.diff(H, p_s)],
                 dpdt_exprs=[-sp.diff(H, s)],
-                difficulty="tier1", system="inclined_plane",
+                difficulty="tier1b", system="inclined_plane",
                 coordinates="s",
             ))
     return problems
@@ -182,7 +196,7 @@ def _tier1_gravity_spring():
                 q_vars=[x], p_vars=[p],
                 dqdt_exprs=[sp.diff(H, p)],
                 dpdt_exprs=[-sp.diff(H, x)],
-                difficulty="tier1", system="gravity_spring",
+                difficulty="tier1b", system="gravity_spring",
                 coordinates="x",
             ))
     return problems
@@ -213,7 +227,7 @@ def _tier2_pendulum():
                 q_vars=[theta], p_vars=[p_theta],
                 dqdt_exprs=[sp.diff(H, p_theta)],
                 dpdt_exprs=[-sp.diff(H, theta)],
-                difficulty="tier2", system="pendulum",
+                difficulty="tier2b", system="pendulum",
                 coordinates="theta",
             ))
     return problems
@@ -240,7 +254,7 @@ def _tier2_central_force():
                 q_vars=[r, theta], p_vars=[p_r, p_theta],
                 dqdt_exprs=[sp.diff(H, p_r), sp.diff(H, p_theta)],
                 dpdt_exprs=[-sp.diff(H, r), -sp.diff(H, theta)],
-                difficulty="tier2", system="central_force",
+                difficulty="tier2b", system="central_force",
                 coordinates="r, theta",
             ))
     return problems
@@ -266,7 +280,7 @@ def _tier2_kepler():
             q_vars=[r, theta], p_vars=[p_r, p_theta],
             dqdt_exprs=[sp.diff(H, p_r), sp.diff(H, p_theta)],
             dpdt_exprs=[-sp.diff(H, r), -sp.diff(H, theta)],
-            difficulty="tier2", system="kepler",
+            difficulty="tier2b", system="kepler",
             coordinates="r, theta",
         ))
     return problems
@@ -391,7 +405,7 @@ def _tier3_magnetic_field():
                 q_vars=[x, y], p_vars=[px, py],
                 dqdt_exprs=[sp.diff(H, px), sp.diff(H, py)],
                 dpdt_exprs=[-sp.diff(H, x), -sp.diff(H, y)],
-                difficulty="tier3", system="magnetic_field",
+                difficulty="tier3b", system="magnetic_field",
                 coordinates="x, y",
             ))
     return problems
@@ -424,7 +438,7 @@ def _tier3_rotating_hoop():
                 q_vars=[theta], p_vars=[p_theta],
                 dqdt_exprs=[sp.diff(H, p_theta)],
                 dpdt_exprs=[-sp.diff(H, theta)],
-                difficulty="tier3", system="rotating_hoop",
+                difficulty="tier3b", system="rotating_hoop",
                 coordinates="theta",
             ))
     return problems
@@ -600,12 +614,13 @@ def _adversarial():
     H = sp.Integer(0)
     for gamma in [1, 2]:
         problems.append({
-            "prompt": SYSTEM_PROMPT + "\n\n---\n\n" + (
+            "prompt": (
                 f"A block of mass m = 1 kg slides on a surface with friction coefficient "
                 f"γ = {gamma}. The friction force is -γ*v.\n\n"
                 f"Derive the Hamiltonian and Hamilton's equations. "
                 f"Is this system conservative? Can a standard Hamiltonian be written?"
             ),
+            "system_prompt": TIER_SYSTEM_PROMPTS["adversarial"],
             "ground_truth": "Non-conservative system — no standard Hamiltonian exists",
             "H_expr": "none",
             "T_expr": "p**2/2",
@@ -624,12 +639,13 @@ def _adversarial():
         V = -F0 * sp.cos(t) * x  # time-dependent — H exists but dH/dt ≠ 0
         H = T + V
         problems.append({
-            "prompt": SYSTEM_PROMPT + "\n\n---\n\n" + (
+            "prompt": (
                 f"A particle of mass m = 1 kg is driven by a time-dependent force "
                 f"F(t) = {F0}*cos(t).\n\n"
                 f"Can you write a Hamiltonian? Is it conserved? "
                 f"Derive Hamilton's equations if possible."
             ),
+            "system_prompt": TIER_SYSTEM_PROMPTS["adversarial"],
             "ground_truth": f"H = p**2/2 - {F0}*cos(t)*x; H is NOT conserved (explicit time dependence)",
             "H_expr": str(H),
             "T_expr": str(T),
@@ -648,11 +664,12 @@ def _adversarial():
             T = a * p**2
             V = b * x**2
             problems.append({
-                "prompt": SYSTEM_PROMPT + "\n\n---\n\n" + (
+                "prompt": (
                     f"Consider the Hamiltonian H(x, p) = {a}p² + {b}x².\n\n"
                     f"Verify this is a valid Hamiltonian by computing Hamilton's equations. "
                     f"What physical system does this describe?"
                 ),
+                "system_prompt": TIER_SYSTEM_PROMPTS["adversarial"],
                 "ground_truth": f"H = {a}*p**2 + {b}*x**2; dq/dt = {2*a}*p; dp/dt = -{2*b}*x",
                 "H_expr": str(H),
                 "T_expr": str(T),
@@ -775,15 +792,15 @@ def main():
     df.to_parquet(out_dir / "train.parquet", index=False)
 
     # Write per-phase files for curriculum staging
-    # Phase 1: tier1 + edge (simple 1D — model learns format + basic derivation)
-    # Phase 2: + tier2 (angular, nonlinear — model learns harder physics)
-    # Phase 3: + tier3 (multi-DOF, electromagnetic)
-    # Phase 4: + tier4 + adversarial (Legendre transform, trick questions)
+    # Phase 1: tier1 + edge (simple 1D — full system prompt)
+    # Phase 2: + tier1b + tier2 (combined potentials + 1D nonlinear — abbreviated prompt)
+    # Phase 3: + tier2b + tier3 (angular + multi-DOF — minimal prompt)
+    # Phase 4: + tier3b + tier4 + adversarial (electromagnetic + Legendre — no prompt)
     phase_tiers = {
         1: {"tier1", "edge"},
-        2: {"tier1", "edge", "tier2"},
-        3: {"tier1", "edge", "tier2", "tier3"},
-        4: {"tier1", "edge", "tier2", "tier3", "tier4", "adversarial"},
+        2: {"tier1", "tier1b", "edge", "tier2"},
+        3: {"tier1", "tier1b", "edge", "tier2", "tier2b", "tier3"},
+        4: {"tier1", "tier1b", "edge", "tier2", "tier2b", "tier3", "tier3b", "tier4", "adversarial"},
     }
     for phase, tiers in phase_tiers.items():
         phase_df = df[df["difficulty"].isin(tiers)]

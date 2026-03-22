@@ -79,6 +79,7 @@ def cmd_train(args):
         n_completions=n_completions,
         prompt_column=config.data.prompt_column,
         metadata_columns=config.data.metadata_columns,
+        system_prompt_column=config.data.system_prompt_column,
     )
 
     # Create trainer

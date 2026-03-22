@@ -44,6 +44,7 @@ class QGREDataLoader:
         seed: int = 42,
         prompt_column: str = "prompt",
         metadata_columns: list[str] | None = None,
+        system_prompt_column: str | None = None,
     ):
         self.tokenizer = tokenizer
         self.max_prompt_length = max_prompt_length
@@ -52,6 +53,7 @@ class QGREDataLoader:
         self.seed = seed
         self.prompt_column = prompt_column
         self.metadata_columns = metadata_columns or []
+        self.system_prompt_column = system_prompt_column
 
         # Tokenize and filter
         self.items = self._prepare(prompts)
@@ -87,10 +89,20 @@ class QGREDataLoader:
 
             # Apply chat template if tokenizer supports it
             if hasattr(self.tokenizer, "apply_chat_template"):
-                messages = [{"role": "user", "content": text}]
-                token_ids = self.tokenizer.apply_chat_template(
-                    messages, tokenize=True, add_generation_prompt=True,
-                )
+                messages = []
+                # Use separate system message if system_prompt_column is configured
+                if self.system_prompt_column and row.get(self.system_prompt_column):
+                    messages.append({"role": "system", "content": row[self.system_prompt_column]})
+                messages.append({"role": "user", "content": text})
+                try:
+                    token_ids = self.tokenizer.apply_chat_template(
+                        messages, tokenize=True, add_generation_prompt=True,
+                        enable_thinking=False,
+                    )
+                except TypeError:
+                    token_ids = self.tokenizer.apply_chat_template(
+                        messages, tokenize=True, add_generation_prompt=True,
+                    )
             else:
                 token_ids = self.tokenizer.encode(text)
 

@@ -199,13 +199,14 @@ def _score_expression(completion_expr_str: str | None, ground_truth_str: str,
     if not isinstance(teacher, sp.Basic) or isinstance(teacher, sp.logic.boolalg.BooleanAtom):
         return _string_similarity(completion_expr_str, ground_truth_str)
 
-    # Exact symbolic match
-    try:
-        diff = sp.simplify(student - teacher)
-        if diff == 0:
-            return 1.0
-    except Exception:
-        pass
+    # Exact symbolic match — try multiple simplification strategies
+    for simplifier in [sp.simplify, sp.trigsimp, sp.ratsimp, sp.nsimplify]:
+        try:
+            diff = simplifier(student - teacher)
+            if diff == 0:
+                return 1.0
+        except Exception:
+            continue
 
     # Try expanding both
     try:
@@ -215,8 +216,52 @@ def _score_expression(completion_expr_str: str | None, ground_truth_str: str,
     except Exception:
         pass
 
-    # Partial credit: check if key terms are present
+    # Try expanding with trig
     try:
+        diff = sp.trigsimp(sp.expand_trig(student - teacher))
+        if diff == 0:
+            return 1.0
+    except Exception:
+        pass
+
+    # Numerical equivalence check — evaluate at random points
+    try:
+        free = (student.free_symbols | teacher.free_symbols) - {sp.Symbol('pi')}
+        if free:
+            test_point = {s: sp.Rational(3, 7) for s in free}
+            s_val = float(student.subs(test_point))
+            t_val = float(teacher.subs(test_point))
+            if abs(s_val - t_val) < 1e-6 * max(abs(t_val), 1):
+                # Verify at a second point
+                test_point2 = {s: sp.Rational(5, 11) for s in free}
+                s_val2 = float(student.subs(test_point2))
+                t_val2 = float(teacher.subs(test_point2))
+                if abs(s_val2 - t_val2) < 1e-6 * max(abs(t_val2), 1):
+                    return 1.0
+    except Exception:
+        pass
+
+    # Partial credit: use numerical closeness, not just symbol overlap
+    # Wrong coefficients (-3x vs -6x) must score much lower than correct answers
+    try:
+        # Numerical ratio check: how close is the student's value to teacher's?
+        free = (student.free_symbols | teacher.free_symbols) - {sp.Symbol('pi')}
+        numerical_score = 0.0
+        if free:
+            test_point = {s: sp.Rational(3, 7) for s in free}
+            try:
+                s_val = float(student.subs(test_point))
+                t_val = float(teacher.subs(test_point))
+                if abs(t_val) > 1e-10:
+                    ratio = s_val / t_val
+                    # Perfect = 1.0, half-off = 0.5, wrong sign = 0.0
+                    numerical_score = max(0.0, 1.0 - abs(1.0 - ratio))
+                elif abs(s_val) < 1e-10:
+                    numerical_score = 1.0  # Both near zero
+            except Exception:
+                pass
+
+        # Symbol overlap (secondary signal)
         student_syms = student.free_symbols
         teacher_syms = teacher.free_symbols
         if teacher_syms:
@@ -224,16 +269,11 @@ def _score_expression(completion_expr_str: str | None, ground_truth_str: str,
         else:
             sym_overlap = 1.0
 
-        structure_score = 0.0
-        student_atoms = student.atoms(sp.Function, sp.Pow)
-        teacher_atoms = teacher.atoms(sp.Function, sp.Pow)
-        if teacher_atoms:
-            structure_score = len(student_atoms & teacher_atoms) / max(len(teacher_atoms), 1)
-
-        partial = 0.3 + 0.3 * sym_overlap + 0.2 * structure_score
-        return min(partial, 0.8)
+        # Weight numerical closeness heavily — it catches coefficient errors
+        partial = 0.2 + 0.5 * numerical_score + 0.2 * sym_overlap
+        return min(partial, 0.85)
     except Exception:
-        return 0.3
+        return 0.2
 
 
 def _string_similarity(a: str, b: str) -> float:

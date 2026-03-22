@@ -73,21 +73,22 @@ def test_gamestate_empty_roundtrip():
 
 def test_gamestate_stagnation_fields_roundtrip():
     """Stagnation detection fields survive round-trip and default correctly from old checkpoints."""
-    gs = GameState(stagnation_timeout=150, plateau_window=30, plateau_threshold=0.05, steps_at_phase_start=42)
+    gs = GameState(stagnation_timeout=150, plateau_window=30, plateau_threshold=0.05)
+    gs.tier_steps_at_phase_start = {"default": 42}
     d = gamestate_to_dict(gs)
     restored = gamestate_from_dict(d)
 
     assert restored.stagnation_timeout == 150
     assert restored.plateau_window == 30
     assert restored.plateau_threshold == 0.05
-    assert restored.steps_at_phase_start == 42
+    assert restored.tier_steps_at_phase_start == {"default": 42}
 
     # Old checkpoint without stagnation fields should use defaults
     old = gamestate_from_dict({"phase": 2, "step_count": 100})
     assert old.stagnation_timeout == 200
     assert old.plateau_window == 50
     assert old.plateau_threshold == 0.02
-    assert old.steps_at_phase_start == 0
+    assert old.tier_steps_at_phase_start == {}
 
 
 def test_gamestate_phase_advance():
@@ -115,7 +116,8 @@ def test_gamestate_phase_advance():
 
 def test_gamestate_no_advance_past_max():
     """Phase cannot advance past max_phase."""
-    gs = GameState(phase=4, mastery_threshold=0.5)
+    gs = GameState(mastery_threshold=0.5)
+    gs.tier_phases = {"default": 4}
     gs.record_step_score(4, 1.0)
     assert not gs.check_phase_advance(max_phase=4)
     assert gs.phase == 4
