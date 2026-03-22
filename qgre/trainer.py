@@ -65,6 +65,18 @@ class QGRETrainer:
             plateau_window=config.training.plateau_window,
             plateau_threshold=config.training.plateau_threshold,
         )
+        self._dataloader = None  # Set in train()
+
+        # 2D curriculum setup
+        data_cfg = config.data
+        self._tier_order = data_cfg.tier_order
+        self._difficulty_column = data_cfg.difficulty_column
+        self._tier_advance_phase = data_cfg.tier_advance_quality_phase
+        self._tier_advance_threshold = data_cfg.tier_advance_threshold
+        if self._tier_order and data_cfg.initial_tiers:
+            self.game_state.active_tiers = list(data_cfg.initial_tiers)
+            for t in data_cfg.initial_tiers:
+                self.game_state.tier_phases.setdefault(t, 1)
 
         # Step qualities and phase mapping — configurable per domain
         # step_qualities: from constructor arg, config YAML, or error
@@ -225,13 +237,14 @@ class QGRETrainer:
         """
         assert self.optimizer is not None, "Call setup_optimizer() first"
 
-        # Phase is engine-managed — use GameState, not RewardResult
-        current_phase = self.game_state.phase
-        # Fallback to highest available phase if current_phase not in mapping
-        fallback_phase = max(p for p in self.phase_qualities if p <= current_phase) if any(p <= current_phase for p in self.phase_qualities) else min(self.phase_qualities)
-        active_qualities = [
-            self.phase_qualities.get(current_phase, self.phase_qualities[fallback_phase])
-        ] * len(reward_results)
+        # Per-prompt active qualities based on each prompt's tier and that tier's quality phase
+        active_qualities = []
+        for i in range(len(reward_results)):
+            meta = batch.metadata[i] if i < len(batch.metadata) else {}
+            tier = self._get_prompt_tier(meta)
+            tier_phase = self.game_state.tier_phases.get(tier, 1)
+            fallback = max(p for p in self.phase_qualities if p <= tier_phase) if any(p <= tier_phase for p in self.phase_qualities) else min(self.phase_qualities)
+            active_qualities.append(self.phase_qualities.get(tier_phase, self.phase_qualities[fallback]))
 
         # Compute per-token advantages (segment → step rewards → SPO/GRPO → GDPO → broadcast)
         token_advantages, batch_regions = self.advantage_estimator.compute_advantages(
@@ -528,71 +541,100 @@ class QGRETrainer:
 
         return True
 
+    def _get_prompt_tier(self, metadata: dict) -> str:
+        """Get the difficulty tier for a prompt from its metadata."""
+        if self._difficulty_column:
+            return metadata.get(self._difficulty_column, "default")
+        return "default"
+
     def _record_mastery_and_advance(self, reward_results, active_qualities, batch, metrics):
-        """Record per-step mastery scores, check phase advancement, update difficulty gate."""
+        """Record per-tier mastery scores, check per-tier phase advancement, check tier unlock."""
         import numpy as np
-        for step_num, quality_keys in self.step_qualities.items():
-            active_keys = [k for k in quality_keys if k in active_qualities[0]]
-            if active_keys:
-                step_scores = [
-                    float(np.mean([rr.scores.get(k, 0.0) for k in active_keys]))
-                    for rr in reward_results
-                ]
-                mean_step_score = float(np.mean(step_scores))
-                self.game_state.record_step_score(step_num, mean_step_score)
-                metrics[f"mastery/step_{step_num}"] = mean_step_score
+        from collections import defaultdict
 
         max_phase = max(self.step_qualities.keys())
-        old_phase = self.game_state.phase
-        if self.game_state.check_phase_advance(max_phase):
-            new_phase = self.game_state.phase
-            metrics["phase_advanced"] = new_phase
-            self.advantage_estimator.on_tier_advance(
-                new_tier=new_phase,
-                prompt_tier_map={pid: new_phase for pid in batch.prompt_ids},
+
+        # Group reward results by tier
+        tier_groups = defaultdict(list)
+        for i, rr in enumerate(reward_results):
+            meta = batch.metadata[i] if i < len(batch.metadata) else {}
+            tier = self._get_prompt_tier(meta)
+            tier_groups[tier].append((rr, active_qualities[i]))
+
+        # Record mastery per tier, check per-tier quality phase advance
+        for tier, items in tier_groups.items():
+            tier_active_qs = items[0][1]  # All items in same tier share active qualities
+            for step_num, quality_keys in self.step_qualities.items():
+                active_keys = [k for k in quality_keys if k in tier_active_qs]
+                if active_keys:
+                    scores = [
+                        float(np.mean([rr.scores.get(k, 0.0) for k in active_keys]))
+                        for rr, _ in items
+                    ]
+                    mean_score = float(np.mean(scores))
+                    self.game_state.record_tier_step_score(tier, step_num, mean_score)
+                    metrics[f"mastery/{tier}/step_{step_num}"] = mean_score
+
+            if self.game_state.check_tier_phase_advance(tier, max_phase):
+                new_phase = self.game_state.tier_phases[tier]
+                metrics[f"tier_phase_advanced/{tier}"] = new_phase
+                # Reset SPO baselines for prompts in this tier at the new phase
+                tier_pids = [batch.prompt_ids[i] for i in range(len(reward_results))
+                             if self._get_prompt_tier(batch.metadata[i] if i < len(batch.metadata) else {}) == tier]
+                self.advantage_estimator.on_tier_advance(
+                    new_tier=new_phase,
+                    prompt_tier_map={pid: new_phase for pid in tier_pids},
+                )
+
+        # Check tier unlock
+        if self._tier_order:
+            new_tier = self.game_state.check_tier_unlock(
+                self._tier_order, self._tier_advance_phase, self._tier_advance_threshold,
             )
-            self._apply_difficulty_gate(self._dataloader)
+            if new_tier:
+                metrics["tier_unlocked"] = new_tier
+                import warnings
+                warnings.warn(f"Step {self.global_step}: tier '{new_tier}' unlocked")
+                self._apply_difficulty_gate()
 
         self.game_state.step_count = self.global_step
         metrics["phase"] = self.game_state.phase
 
-        stagnation = self.game_state.check_stagnation()
-        metrics["stagnation"] = {"normal": 0, "stagnating": 1, "stuck": 2}[stagnation.value]
+        # Per-tier stagnation
+        for tier in self.game_state.active_tiers:
+            stag = self.game_state.check_tier_stagnation(tier)
+            metrics[f"stagnation/{tier}"] = {"normal": 0, "stagnating": 1, "stuck": 2}[stag.value]
 
-    def _apply_difficulty_gate(self, dataloader):
-        """Apply difficulty-gated curriculum: only sample prompts at or below current phase.
+    def _apply_difficulty_gate(self):
+        """Apply difficulty gate using active_tiers from GameState.
 
-        Uses config.data.difficulty_schedule to map phase → allowed difficulty values.
-        Calls dataloader.set_difficulty_gate() to zero out prompts above the gate.
-        Logs the gate change to MLflow.
+        Sets dataloader to only sample prompts from active tiers, with equal
+        weight per tier (prevents large tiers drowning small ones).
         """
-        schedule = self.config.data.difficulty_schedule
-        col = self.config.data.difficulty_column
-        if not schedule or not col or not hasattr(dataloader, "set_difficulty_gate"):
+        if self._dataloader is None or not hasattr(self._dataloader, "set_difficulty_gate"):
             return
+        col = self._difficulty_column
+        if not col:
+            return  # No difficulty column → no gating (default tier, all prompts)
 
-        phase = self.game_state.phase
-        # Find the highest phase in schedule that's <= current phase
-        valid_phases = [p for p in schedule if p <= phase]
-        if not valid_phases:
-            return
-        active_phase = max(valid_phases)
-        allowed = set(schedule[active_phase])
-        dataloader.set_difficulty_gate(allowed, col)
+        allowed = set(self.game_state.active_tiers)
+        self._dataloader.set_difficulty_gate(allowed, col)
 
-        # Log to MLflow
-        try:
-            from qgre.mlflow_logger import log_step_metrics
-            log_step_metrics(
-                step=self.global_step,
-                reward_mean=0.0,
-                loss=0.0,
-                extra={"difficulty_gate_phase": active_phase, "difficulty_gate_tiers": len(allowed)},
-            )
-        except Exception:
-            pass
+        # Equal weight per tier: tier with fewer prompts gets higher per-prompt weight
+        from collections import Counter
+        tier_counts = Counter(
+            item["metadata"].get(col, "default") for item in self._dataloader.items
+        )
+        tier_weights = {}
+        for item in self._dataloader.items:
+            tier = item["metadata"].get(col, "default")
+            if tier in allowed:
+                tier_weights[item["prompt_id"]] = 1.0 / max(tier_counts[tier], 1)
+        if tier_weights:
+            self._dataloader.set_priorities(tier_weights)
+
         import warnings
-        warnings.warn(f"Phase {phase}: difficulty gate → {sorted(allowed)}")
+        warnings.warn(f"Difficulty gate → {sorted(allowed)} ({len(allowed)} tiers active)")
 
     def train(
         self,
@@ -637,7 +679,7 @@ class QGRETrainer:
         self.resume(self.config.logging.checkpoint_dir)
 
         # Difficulty-gated curriculum: set initial gate based on current phase
-        self._apply_difficulty_gate(dataloader)
+        self._apply_difficulty_gate()
 
         for epoch in range(100):  # Outer epoch loop — stops when total_steps reached
             for batch in dataloader:

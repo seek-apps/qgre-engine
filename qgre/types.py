@@ -30,69 +30,136 @@ class StagnationStatus(Enum):
 
 @dataclass
 class GameState:
-    """QGRE curriculum state — engine-managed phase advancement.
+    """QGRE 2D mastery matrix — tracks quality × difficulty independently.
 
-    The engine tracks quality scores per step, computes mastery, and advances
-    phases when thresholds are met. This is the QGRE curriculum: step 1 mastery
-    unlocks step 2 qualities.
+    Two axes:
+    - Quality phases (1→N): format → identification → equations → full derivation
+    - Difficulty tiers: tier1 → tier2 → tier3 → ... (domain-specific)
 
-    phase: current curriculum phase (1 = only step 1 qualities active)
-    step_mastery: per-step quality windows for mastery tracking
-    mastery_threshold: quality mean required to advance to next phase
+    Each cell mastery[tier][phase] has its own rolling window. Quality phases
+    advance per-tier. Tier N+1 unlocks when tier N reaches a configurable
+    quality phase threshold.
+
+    When no tiers are configured, all prompts map to a single "default" tier,
+    making this equivalent to the original 1D phase system.
     """
 
-    phase: int = 1
     step_count: int = 0
     mastery_threshold: float = 0.8
-    step_mastery: dict = field(default_factory=dict)
-    # {step_num: deque([mean_quality_scores...], maxlen=QUALITY_WINDOW_SIZE)}
-    phase_history: list = field(default_factory=list)
-    steps_at_phase_start: int = 0
     stagnation_timeout: int = 200
     plateau_window: int = 50
     plateau_threshold: float = 0.02
 
-    def record_step_score(self, step_num: int, score: float):
-        """Record a quality score for a step. Used by engine after each training step."""
-        if step_num not in self.step_mastery:
-            self.step_mastery[step_num] = deque(maxlen=QUALITY_WINDOW_SIZE)
-        self.step_mastery[step_num].append(score)
+    # 2D mastery matrix
+    tier_mastery: dict = field(default_factory=dict)
+    # tier_mastery[tier][step_num] = deque of scores
+    tier_phases: dict = field(default_factory=lambda: {"default": 1})
+    # Per-tier quality phase
+    active_tiers: list = field(default_factory=lambda: ["default"])
+    # Currently unlocked tiers
+    tier_steps_at_phase_start: dict = field(default_factory=dict)
+    # tier_steps_at_phase_start[tier] = step_count when tier's current phase started
+    phase_history: list = field(default_factory=list)
+    # [(step_count, tier, old_phase, new_phase), ...]
 
-    def get_step_mastery(self, step_num: int) -> float:
-        """Get the mean quality score for a step over the mastery window."""
-        window = self.step_mastery.get(step_num)
+    # ── 1D backward compat properties ──
+
+    @property
+    def phase(self) -> int:
+        """Global phase = min phase across active tiers. For 1D compat."""
+        if not self.tier_phases:
+            return 1
+        active = [self.tier_phases[t] for t in self.active_tiers if t in self.tier_phases]
+        return min(active) if active else 1
+
+    @property
+    def step_mastery(self) -> dict:
+        """Legacy: return default tier's mastery windows."""
+        return self.tier_mastery.get("default", {})
+
+    # ── 2D mastery tracking ──
+
+    def record_tier_step_score(self, tier: str, step_num: int, score: float):
+        """Record a quality score for a tier+step cell."""
+        if tier not in self.tier_mastery:
+            self.tier_mastery[tier] = {}
+        if step_num not in self.tier_mastery[tier]:
+            self.tier_mastery[tier][step_num] = deque(maxlen=QUALITY_WINDOW_SIZE)
+        self.tier_mastery[tier][step_num].append(score)
+
+    def get_tier_step_mastery(self, tier: str, step_num: int) -> float:
+        """Get the mean quality score for a tier+step cell."""
+        windows = self.tier_mastery.get(tier, {})
+        window = windows.get(step_num)
         if not window:
             return 0.0
         return sum(window) / len(window)
 
-    def check_phase_advance(self, max_phase: int) -> bool:
-        """Check if the current phase's step has mastered. Advance if so.
-
-        QGRE rule: phase N requires step N mastery >= mastery_threshold.
-        Returns True if phase advanced.
-        """
-        if self.phase >= max_phase:
+    def check_tier_phase_advance(self, tier: str, max_phase: int) -> bool:
+        """Check if a tier's current quality phase is mastered. Advance if so."""
+        current_phase = self.tier_phases.get(tier, 1)
+        if current_phase >= max_phase:
             return False
 
-        current_mastery = self.get_step_mastery(self.phase)
-        if current_mastery >= self.mastery_threshold:
-            self.phase += 1
-            self.phase_history.append(self.step_count)
-            self.steps_at_phase_start = self.step_count
+        mastery = self.get_tier_step_mastery(tier, current_phase)
+        if mastery >= self.mastery_threshold:
+            old_phase = current_phase
+            self.tier_phases[tier] = current_phase + 1
+            self.phase_history.append((self.step_count, tier, old_phase, current_phase + 1))
+            self.tier_steps_at_phase_start[tier] = self.step_count
             return True
         return False
 
-    def check_stagnation(self) -> StagnationStatus:
-        """Check if training is stagnating in the current phase.
+    def check_tier_unlock(
+        self, tier_order: list[str], unlock_phase: int, unlock_threshold: float,
+    ) -> str | None:
+        """Check if the next tier should be unlocked.
 
-        Returns STUCK if timeout exceeded, STAGNATING if plateau detected, NORMAL otherwise.
-        Detection only — intervention logic lives in the trainer.
+        Finds the first inactive tier in tier_order. Checks if ALL active tiers
+        before it have reached unlock_phase with mastery >= unlock_threshold.
+        Returns the newly unlocked tier name, or None.
         """
-        steps_in_phase = self.step_count - self.steps_at_phase_start
+        active_set = set(self.active_tiers)
+
+        # Find first inactive tier in tier_order
+        next_tier = None
+        next_idx = -1
+        for i, t in enumerate(tier_order):
+            if t not in active_set:
+                next_tier = t
+                next_idx = i
+                break
+
+        if next_tier is None:
+            return None  # All tiers already unlocked
+
+        # All active tiers before next_tier must have reached unlock_phase with threshold
+        for t in tier_order[:next_idx]:
+            if t not in active_set:
+                continue  # Skip tiers not in active set (shouldn't happen in ordered unlock)
+            phase = self.tier_phases.get(t, 1)
+            if phase < unlock_phase:
+                return None  # This tier hasn't reached the required quality phase
+            mastery = self.get_tier_step_mastery(t, unlock_phase)
+            if mastery < unlock_threshold:
+                return None  # This tier hasn't mastered the required phase
+
+        # All active tiers before next_tier are ready — unlock it
+        self.active_tiers.append(next_tier)
+        self.tier_phases[next_tier] = 1
+        self.tier_steps_at_phase_start[next_tier] = self.step_count
+        return next_tier
+
+    def check_tier_stagnation(self, tier: str) -> StagnationStatus:
+        """Check if a specific tier is stagnating in its current phase."""
+        start = self.tier_steps_at_phase_start.get(tier, 0)
+        steps_in_phase = self.step_count - start
         if steps_in_phase >= self.stagnation_timeout:
             return StagnationStatus.STUCK
 
-        window = self.step_mastery.get(self.phase)
+        current_phase = self.tier_phases.get(tier, 1)
+        windows = self.tier_mastery.get(tier, {})
+        window = windows.get(current_phase)
         if window and len(window) >= self.plateau_window:
             recent = list(window)[-self.plateau_window:]
             half = len(recent) // 2
@@ -102,3 +169,21 @@ class GameState:
                 return StagnationStatus.STAGNATING
 
         return StagnationStatus.NORMAL
+
+    # ── 1D compat methods (delegate to "default" tier) ──
+
+    def record_step_score(self, step_num: int, score: float):
+        """Legacy 1D: record to default tier."""
+        self.record_tier_step_score("default", step_num, score)
+
+    def get_step_mastery(self, step_num: int) -> float:
+        """Legacy 1D: read from default tier."""
+        return self.get_tier_step_mastery("default", step_num)
+
+    def check_phase_advance(self, max_phase: int) -> bool:
+        """Legacy 1D: advance default tier's phase."""
+        return self.check_tier_phase_advance("default", max_phase)
+
+    def check_stagnation(self) -> StagnationStatus:
+        """Legacy 1D: check default tier stagnation."""
+        return self.check_tier_stagnation("default")

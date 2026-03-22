@@ -29,6 +29,11 @@ class DataConfig:
     # The difficulty value comes from the metadata column named by difficulty_column.
     difficulty_column: str | None = None  # e.g. "difficulty"
     difficulty_schedule: dict | None = None  # e.g. {1: ["tier1","edge"], 2: ["tier1","edge","tier2"], ...}
+    # 2D mastery matrix curriculum (takes precedence over difficulty_schedule when set)
+    tier_order: list[str] | None = None           # e.g. ["tier1", "edge", "tier2", "tier3"]
+    tier_advance_quality_phase: int = 3           # Quality phase required on current tier to unlock next
+    tier_advance_threshold: float = 0.85          # Mastery threshold for tier advancement
+    initial_tiers: list[str] | None = None        # Starting tiers, e.g. ["tier1", "edge"]
 
 
 @dataclass

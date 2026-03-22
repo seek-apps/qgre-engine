@@ -26,11 +26,11 @@ data:
     - difficulty
     - system
   difficulty_column: difficulty
-  difficulty_schedule:
-    1: [tier1, edge]
-    2: [tier1, edge, tier2]
-    3: [tier1, edge, tier2, tier3]
-    4: [tier1, edge, tier2, tier3, tier4, adversarial]
+  # 2D mastery matrix curriculum
+  tier_order: [tier1, edge, tier2, tier3, tier4, adversarial]
+  tier_advance_quality_phase: 3    # Must master equations before harder physics unlocks
+  tier_advance_threshold: 0.85     # Mastery threshold for tier advancement
+  initial_tiers: [tier1, edge]
 
 generation:
   temperature: 0.6
