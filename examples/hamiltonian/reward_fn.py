@@ -86,6 +86,21 @@ def _normalize_for_sympy(expr_str: str) -> str:
     s = re.sub(r"\u0307", "", s)  # combining dot above
     # digit * letter: 3x → 3*x
     s = re.sub(r"(\d)([a-zA-Z_(])", r"\1*\2", s)
+    # uppercase * lowercase: Fx → F*x, Ky → K*y (constant × coordinate)
+    s = re.sub(r"([A-Z])([a-z])", r"\1*\2", s)
+    # Consecutive single lowercase letters: mgy → m*g*y, mgh → m*g*h
+    # Only split known physics variable sequences (avoid breaking 'sin', 'cos', 'theta', etc)
+    # Strategy: if a sequence of 2+ lowercase letters is NOT a known name, split it
+    _KNOWN_NAMES = {"sin", "cos", "tan", "exp", "log", "sqrt", "ln", "pi",
+                    "theta", "omega", "alpha", "beta", "gamma", "delta",
+                    "theta1", "theta2", "p_theta", "p_r", "p_s", "p_x", "p_y"}
+    def _split_vars(match):
+        word = match.group(0)
+        if word.lower() in _KNOWN_NAMES:
+            return word
+        # Split into single chars with * between: mgy → m*g*y
+        return "*".join(word)
+    s = re.sub(r"[a-z]{2,}", _split_vars, s)
     # letter/paren * letter: )x → )*x, ) x → )* x, x( → x*(
     s = re.sub(r"(\))\s*([a-zA-Z_(])", r"\1*\2", s)
     # letter/number before paren: x( → x*(
@@ -440,7 +455,54 @@ def _score_V_correct(text: str, meta: dict) -> float:
         else:
             return 0.0
 
-    return _score_expression(potential_str, expected_V, [])
+    # Direct comparison first
+    score = _score_expression(potential_str, expected_V, [])
+    if score >= 0.9:
+        return score
+
+    # Fallback: model may write symbolic form (mgy, Fx, kx²) while ground truth
+    # has constants evaluated (49*y/5, -3*x, 3*x**2). Try substituting known
+    # constants from the problem into the student expression via sympy.
+    student_sym = _try_sympify(potential_str)
+    teacher_sym = _try_sympify(expected_V)
+    if student_sym is not None and teacher_sym is not None:
+        # Build substitution dict from problem metadata
+        subs = {}
+        # Extract mass from prompt
+        prompt = meta.get("prompt", "")
+        m_match = re.search(r"mass\s*(?:m\s*)?=?\s*(\d+(?:\.\d+)?)", prompt)
+        if m_match:
+            subs[sp.Symbol("m", positive=True)] = sp.Rational(m_match.group(1))
+            subs[sp.Symbol("m")] = sp.Rational(m_match.group(1))
+        # Extract spring constant
+        k_match = re.search(r"(?:spring\s+)?constant\s*k?\s*=\s*(\d+(?:\.\d+)?)", prompt)
+        if k_match:
+            subs[sp.Symbol("k", positive=True)] = sp.Rational(k_match.group(1))
+            subs[sp.Symbol("k")] = sp.Rational(k_match.group(1))
+        # Extract force
+        f_match = re.search(r"force\s*(?:F\s*)?=?\s*(\d+(?:\.\d+)?)", prompt)
+        if f_match:
+            subs[sp.Symbol("F", positive=True)] = sp.Rational(f_match.group(1))
+            subs[sp.Symbol("F")] = sp.Rational(f_match.group(1))
+
+        if subs:
+            try:
+                student_eval = student_sym.subs(subs)
+                diff = sp.simplify(student_eval - teacher_sym)
+                if diff == 0:
+                    return 1.0
+                # Try numerical check after substitution
+                free = (student_eval.free_symbols | teacher_sym.free_symbols) - {sp.Symbol("pi")}
+                if free:
+                    test_point = {s: sp.Rational(3, 7) for s in free}
+                    s_val = float(student_eval.subs(test_point))
+                    t_val = float(teacher_sym.subs(test_point))
+                    if abs(t_val) > 1e-10 and abs(s_val - t_val) < 1e-4 * max(abs(t_val), 1):
+                        return 1.0
+            except Exception:
+                pass
+
+    return score
 
 
 def _score_grounding(text: str, prompt: str) -> float:

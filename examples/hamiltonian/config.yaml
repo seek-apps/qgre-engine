@@ -63,7 +63,7 @@ algorithm:
     6: [q_correct_dqdt, q_correct_dpdt, q_consistency]
 
 training:
-  total_steps: 3500
+  total_steps: 4000
   lr: 5.0e-6
   warmup_steps: 10
   lr_scheduler: cosine
