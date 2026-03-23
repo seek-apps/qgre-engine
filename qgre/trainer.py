@@ -395,7 +395,8 @@ class QGRETrainer:
                             std_output = self.model(mb_ids)
                             std_logits = std_output.logits if hasattr(std_output, "logits") else std_output
                             del std_output
-                            std_lp = logprobs_from_logits(std_logits[:, :-1, :], mb_ids[:, 1:])
+                            # Cast to float32 — fused path uses fp32, standard must match
+                            std_lp = logprobs_from_logits(std_logits[:, :-1, :].float(), mb_ids[:, 1:])
                             del std_logits
                             min_len_v = min(mb_lp.shape[1], std_lp.shape[1])
                             if not torch.allclose(mb_lp[:, :min_len_v].detach(), std_lp[:, :min_len_v], atol=1e-3):
