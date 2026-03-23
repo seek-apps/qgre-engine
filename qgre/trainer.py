@@ -622,7 +622,7 @@ class QGRETrainer:
         try:
             from qgre.lora_verify import LoRAVerifier
             LoRAVerifier.verify_active(self.model, self.tokenizer)
-        except (ImportError, Exception):
+        except (ImportError, AttributeError):
             pass  # Non-fatal if tokenizer not set or Unsloth not loaded
 
         return True

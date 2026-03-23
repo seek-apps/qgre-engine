@@ -686,7 +686,7 @@ def hamiltonian_reward(
     Phase 3: q_correct_dqdt, q_correct_dpdt — Hamilton's equations match ground truth
     Phase 4: q_correct_H, q_consistency — full Hamiltonian + internal consistency
     """
-    meta = metadata or {}
+    meta = dict(metadata) if metadata else {}  # Shallow copy — don't mutate shared dataloader dict
     meta["prompt"] = prompt  # Make prompt available to scoring functions (e.g., V_correct constant substitution)
     text = completion
     scores: dict[str, float] = {}

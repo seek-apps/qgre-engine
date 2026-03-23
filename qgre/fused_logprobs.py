@@ -143,7 +143,7 @@ def get_hidden_states_and_lm_head(
     try:
         body_output = body(input_ids, **kwargs)
     except TypeError as e:
-        if attention_mask is not None and "attention_mask" in str(e):
+        if attention_mask is not None and "unexpected keyword argument" in str(e) and "attention_mask" in str(e):
             import warnings
             warnings.warn(
                 f"Model body does not accept attention_mask — falling back without it. "
