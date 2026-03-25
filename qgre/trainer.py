@@ -805,7 +805,7 @@ class QGRETrainer:
         # Difficulty-gated curriculum: set initial gate based on current phase
         self._apply_difficulty_gate()
 
-        for epoch in range(100):  # Outer epoch loop — stops when total_steps reached
+        for epoch in range(10000):  # Outer epoch loop — stops when total_steps reached
             for batch in dataloader:
                 if self.global_step >= cfg.total_steps:
                     break
