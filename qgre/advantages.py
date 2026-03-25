@@ -174,6 +174,9 @@ class QGREStepAdvantageEstimator:
 
         # GDPO-style: normalize each step's advantages across the batch
         # When normalize_advantages=False (Dr.GRPO), skip std division to avoid bias
+        # SPO mode: skip mean subtraction entirely — SPO advantages are already per-prompt
+        # baselined (r - V). Batch mean-centering destroys per-prompt signal by injecting
+        # noise from unrelated prompts. GRPO needs it; SPO does not.
         for step_num in self._step_nums:
             # NaN guard: replace NaN advantages before normalization (ms-swift #8123)
             if step_advs[step_num].isnan().any():
@@ -184,14 +187,18 @@ class QGREStepAdvantageEstimator:
                     f"Check reward_fn for NaN returns. Replacing with 0.0."
                 )
                 step_advs[step_num] = torch.nan_to_num(step_advs[step_num], nan=0.0)
-            mean = step_advs[step_num].mean()
-            if self.normalize_advantages:
+            if self.mode == "spo":
+                # SPO: no batch normalization — per-prompt baseline is the only centering
+                pass
+            elif self.normalize_advantages:
+                mean = step_advs[step_num].mean()
                 std = step_advs[step_num].std(correction=0)
                 if std > 1e-8:
                     step_advs[step_num] = (step_advs[step_num] - mean) / (std + 1e-8)
                 else:
                     step_advs[step_num] = step_advs[step_num] - mean
             else:
+                mean = step_advs[step_num].mean()
                 step_advs[step_num] = step_advs[step_num] - mean
 
         # Phase 3: Broadcast per-step advantages to per-token by region

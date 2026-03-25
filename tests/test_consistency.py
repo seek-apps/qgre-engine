@@ -224,7 +224,8 @@ def test_dr_grpo_no_std_normalization():
     """Dr.GRPO: GDPO step skips std division when normalize_advantages=False."""
     tokens = _make_tokens()
 
-    # Use SPO mode to isolate the GDPO normalization step (no GRPO pre-normalization)
+    # Use GRPO mode to test the GDPO normalization step behavior
+    # (SPO mode skips batch normalization entirely — per-prompt baseline is the only centering)
     # 4 samples with different rewards → varied step advantages
     results = [
         RewardResult(reward=0.9, scores={q: 0.9 for q in ALL_Q}, phase=4),
@@ -235,18 +236,16 @@ def test_dr_grpo_no_std_normalization():
 
     # Standard: normalize by std in GDPO step
     est_norm = QGREStepAdvantageEstimator(
-        lr=0.1, mode="spo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG,
+        lr=0.1, mode="grpo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG,
         normalize_advantages=True,
     )
-    est_norm.compute_advantages([1, 2, 3, 4], [tokens] * 4, results, [ALL_Q] * 4)
     advs_norm, _ = est_norm.compute_advantages([1, 2, 3, 4], [tokens] * 4, results, [ALL_Q] * 4)
 
     # Dr.GRPO: mean-only in GDPO step
     est_raw = QGREStepAdvantageEstimator(
-        lr=0.1, mode="spo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG,
+        lr=0.1, mode="grpo", step_qualities=STEP_QUALITIES, segmenter=XML_SEG,
         normalize_advantages=False,
     )
-    est_raw.compute_advantages([1, 2, 3, 4], [tokens] * 4, results, [ALL_Q] * 4)
     advs_raw, _ = est_raw.compute_advantages([1, 2, 3, 4], [tokens] * 4, results, [ALL_Q] * 4)
 
     norm_flat = torch.cat(advs_norm)
