@@ -678,28 +678,36 @@ def _score_H_in_momentum(text: str) -> float:
 
 
 def _score_V_correct(text: str, meta: dict) -> float:
-    """q_V_correct: POTENTIAL section matches ground truth V."""
+    """q_V_correct: potential energy matches ground truth V.
+
+    Section-agnostic: finds ALL 'V = expr' anywhere in the text.
+    """
     expected_V = meta.get("V_expr", "")
     if not expected_V or expected_V == "none":
         return 0.0
 
-    potential_str = _extract_labeled(text, "POTENTIAL")
-    if potential_str is None:
-        # Fallback
-        m = re.search(r"V\s*=\s*([^\n;]+)", text)
-        if m:
-            potential_str = m.group(1).strip()
-        else:
-            return 0.0
+    # Section-agnostic: find all V expressions
+    all_exprs = _find_all_expressions(text)
+    v_candidates = all_exprs.get("V", [])
 
-    # Direct comparison first
-    score = _score_expression(potential_str, expected_V, [])
+    # Also try label-based extraction as fallback
+    labeled_v = _extract_labeled(text, "POTENTIAL")
+    if labeled_v and labeled_v not in v_candidates:
+        v_candidates.append(labeled_v)
+
+    if not v_candidates:
+        return 0.0
+
+    # Score best candidate
+    score = _best_match(v_candidates, expected_V)
     if score >= 0.9:
         return score
 
     # Fallback: model may write symbolic form (mgy, Fx, kx²) while ground truth
     # has constants evaluated (49*y/5, -3*x, 3*x**2). Try substituting known
     # constants from the problem into the student expression via sympy.
+    # Use the best-scoring candidate from section-agnostic extraction.
+    potential_str = v_candidates[0]  # Best candidate for detailed analysis
     student_sym = _try_sympify(potential_str)
     teacher_sym = _try_sympify(expected_V)
     if student_sym is not None and teacher_sym is not None:
@@ -755,13 +763,28 @@ def _score_grounding(text: str, prompt: str) -> float:
 
 
 def _score_dqdt(text: str, meta: dict) -> float:
-    """q_correct_dqdt: Hamilton's first equation matches ground truth."""
+    """q_correct_dqdt: Hamilton's first equation matches ground truth.
+
+    Section-agnostic: finds ALL 'dq/dt = expr' patterns anywhere in the text.
+    """
     expected = meta.get("dqdt", "")
     if not expected or expected == "none":
         return 0.0
 
     expected_parts = [e.strip() for e in expected.split(";")]
-    extracted = _extract_equations_block(text)
+
+    # Section-agnostic: find all derivative expressions
+    all_exprs = _find_all_expressions(text)
+    # Collect all dX/dt expressions (dq/dt, dx/dt, dy/dt, ds/dt, dtheta/dt)
+    extracted = []
+    for key, vals in all_exprs.items():
+        if key.startswith("d") and "/dt" in key:
+            extracted.extend(vals)
+    # Also try old block extraction as fallback
+    block_extracted = _extract_equations_block(text)
+    for e in block_extracted:
+        if e not in extracted:
+            extracted.append(e)
 
     if not extracted:
         if re.search(r"dq/dt|∂H/∂p|dx/dt|dtheta/dt|dr/dt|ds/dt", text):
@@ -780,13 +803,26 @@ def _score_dqdt(text: str, meta: dict) -> float:
 
 
 def _score_dpdt(text: str, meta: dict) -> float:
-    """q_correct_dpdt: Hamilton's second equation matches ground truth."""
+    """q_correct_dpdt: Hamilton's second equation matches ground truth.
+
+    Section-agnostic: finds ALL equation patterns anywhere in the text.
+    """
     expected = meta.get("dpdt", "")
     if not expected or expected == "none":
         return 0.0
 
     expected_parts = [e.strip() for e in expected.split(";")]
-    extracted = _extract_equations_block(text)
+
+    # Section-agnostic + block extraction
+    all_exprs = _find_all_expressions(text)
+    extracted = []
+    for key, vals in all_exprs.items():
+        if key.startswith("d") and "/dt" in key:
+            extracted.extend(vals)
+    block_extracted = _extract_equations_block(text)
+    for e in block_extracted:
+        if e not in extracted:
+            extracted.append(e)
 
     if not extracted:
         if re.search(r"dp/dt|-∂H/∂q|-dH/dq|dp_r/dt|dp_theta/dt", text):
@@ -805,23 +841,34 @@ def _score_dpdt(text: str, meta: dict) -> float:
 
 
 def _score_correct_H(text: str, meta: dict) -> float:
-    """q_correct_H: HAMILTONIAN section matches ground truth.
+    """q_correct_H: Hamiltonian matches ground truth.
 
-    Differentiated scoring so the model gets distinct signals:
-    - 1.0: correct H in momentum form
-    - 0.5-0.7: correct structure but velocity form (ẋ instead of p)
-    - 0.3-0.5: partially correct (some terms right)
-    - 0.2: attempted but unparseable
-    - 0.1: wrote a number instead of symbolic expression
-    - 0.0: nothing found
+    Section-agnostic: finds ALL 'H = expr' anywhere in the text,
+    scores the best match against ground truth.
     """
     expected_H = meta.get("H_expr", "")
     if not expected_H or expected_H == "none":
         return 0.0
 
+    # Section-agnostic: find all H expressions
+    all_exprs = _find_all_expressions(text)
+    h_candidates = all_exprs.get("H", [])
+
+    # Also try label-based extraction as fallback
     extracted_H = _extract_H(text)
-    if extracted_H is None:
+    if extracted_H and extracted_H not in h_candidates:
+        h_candidates.append(extracted_H)
+
+    if not h_candidates:
         return 0.0
+
+    # Score best candidate
+    best = _best_match(h_candidates, expected_H)
+    if best >= 0.7:
+        return best
+
+    # Use the first candidate for detailed analysis below
+    extracted_H = h_candidates[0]
 
     # Check if model evaluated to a number instead of keeping symbolic
     normed = _normalize_for_sympy(extracted_H)
