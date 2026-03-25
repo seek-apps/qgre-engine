@@ -60,9 +60,17 @@ def _normalize_for_sympy(expr_str: str) -> str:
     # LaTeX \sqrt{x} → sqrt(x)
     s = re.sub(r"\\sqrt\{([^}]+)\}", r"sqrt(\1)", s)
     # LaTeX \sin, \cos etc → sin, cos
+    # Insert * only if preceded by a letter/digit (not by * or operator)
+    s = re.sub(r"(?<=[a-zA-Z0-9)])\\(sin|cos|tan|exp|log|ln)\b", r"*\1", s)
     s = re.sub(r"\\(sin|cos|tan|exp|log|ln)\b", r"\1", s)
-    # Degree symbol: sin(30°) → sin(pi/6), sin(45°) → sin(pi/4), sin(60°) → sin(pi/3)
+    # Degree symbols: handle ALL forms BEFORE ^ → ** conversion
+    # LaTeX: 60^\circ, 60^{\circ}, 60°
+    s = re.sub(r"(\d+)\^\\circ", lambda m: {"30": "pi/6", "45": "pi/4", "60": "pi/3", "90": "pi/2"}.get(m.group(1), m.group(1)), s)
+    s = re.sub(r"(\d+)\^\{\\circ\}", lambda m: {"30": "pi/6", "45": "pi/4", "60": "pi/3", "90": "pi/2"}.get(m.group(1), m.group(1)), s)
     s = re.sub(r"(\d+)°", lambda m: {"30": "pi/6", "45": "pi/4", "60": "pi/3", "90": "pi/2"}.get(m.group(1), m.group(1)), s)
+    # Bare sin(60), sin(30) etc without degree symbol — assume degrees for common physics angles
+    s = re.sub(r"sin\((\d+)\)", lambda m: {"30": "sin(pi/6)", "45": "sin(pi/4)", "60": "sin(pi/3)", "90": "sin(pi/2)"}.get(m.group(1), f"sin({m.group(1)})"), s)
+    s = re.sub(r"cos\((\d+)\)", lambda m: {"30": "cos(pi/6)", "45": "cos(pi/4)", "60": "cos(pi/3)", "90": "cos(pi/2)"}.get(m.group(1), f"cos({m.group(1)})"), s)
     # Strip LaTeX \text{}, \left, \right etc
     s = re.sub(r"\\text\{([^}]*)\}", r"\1", s)
     s = re.sub(r"\\(left|right|,|;|quad|qquad|displaystyle)", "", s)
