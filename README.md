@@ -18,13 +18,19 @@ Train on a novel domain — hypergraph incidence structures, symbolic physics, f
 
 This is the cold start problem. It is not a hyperparameter issue. It is a *credit assignment* failure: the model receives one number for an output that has multiple independently-assessable components, and it cannot determine which component the number refers to.
 
-QGRE solves this with three mechanisms applied simultaneously:
+QGRE solves this with six mechanisms applied simultaneously:
 
-1. **Decompose the reward.** Your reward function returns per-quality scores, not a single scalar. `q_format: 0.9`, `q_grounding: 0.4`, `q_accuracy: 0.0` — each quality scored independently, each giving partial credit (never binary 0/1).
+1. **Decompose the reward.** Your reward function returns per-quality scores, not a single scalar. `q_format: 0.9`, `q_grounding: 0.4`, `q_accuracy: 0.0` — each quality scored independently, each giving partial credit. The partial credit is not a compromise. It is the gradient. The distance from 0.4 to 1.0 tells the model which direction to move.
 
-2. **Map scores to tokens.** A segmenter assigns every token in the completion to a step region. Format tokens receive format advantages. Grounding tokens receive grounding advantages. Think tokens receive zero advantage — reasoning is free.
+2. **Target the right tokens.** The reward function returns `scored_spans` — the character positions of every expression it scored. The engine maps these to token indices via the tokenizer's own `offset_mapping` and applies advantages to exactly those tokens. When the model writes `V = kx²/2` in the derivation *and* in the labeled answer, both spans receive the V_correct signal. The model learns where it decided wrong, not where it copied the decision.
 
 3. **Gate the curriculum.** Phase 1 activates only format qualities. The model learns "what shape should my output be?" without distraction from grounding or accuracy signals. When format mastery exceeds the threshold, phase 2 activates grounding. Each skill becomes the foundation for the next.
+
+4. **Preserve the gradient through the baseline.** SPO's persistent EMA baseline can converge to match constant partial credit — advantage goes to zero, gradient dies. The aspiration gap prevents this: `A = (r − baseline) + β × (r − target)`. The second term measures distance from the mastery threshold, not from expected performance. A score of 0.4 against a target of 0.8 produces −0.2 advantage *even when the baseline matches.* The shaped reward gradient survives.
+
+5. **Surface suppressed knowledge.** LoRA fine-tuning can suppress base model knowledge — the adapter learns a shortcut that ignores what the pretrained weights already know. LoRA dropout applies Bernoulli masks to adapter input projections during generation, partially reverting to base model behavior. Different masks produce different internal reasoning paths. The diversity comes from representations, not token sampling. Anneals to zero as the model internalizes what the dropout surfaced.
+
+6. **Freeze the baseline when it's wrong.** When reward variance for a prompt drops near zero, the EMA baseline has converged to a constant wrong answer. The variance-aware mechanism slows the baseline update rate proportionally. The baseline freezes. When exploration finally produces a correct answer, the advantage is massive — and persistent, because the frozen baseline doesn't chase it.
 
 The result: a model that bootstraps from zero knowledge of the domain. No SFT warm-up needed. No hand-crafted easy examples. The curriculum IS the warm-up.
 
@@ -105,20 +111,20 @@ The engine loads the model, tokenizes the data, creates the trainer, and runs th
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     QGRETrainer.step()                          │
-│                                                                 │
-│  ┌──────────┐   ┌──────────┐   ┌──────────────┐   ┌─────────┐ │
-│  │ Generate  │──▸│  Score   │──▸│  Advantages  │──▸│  Loss   │ │
-│  │ (vLLM)   │   │(reward_fn)│  │  (SPO+GDPO   │   │(NeMo RL)│ │
-│  │          │   │          │   │  +VPRM+phase) │   │         │ │
-│  └──────────┘   └──────────┘   └──────────────┘   └────┬────┘ │
-│       ▲                                                 │      │
-│       │              ┌──────────────┐                   ▼      │
-│       └──────────────│ LoRA Sync    │◂── backward + optimizer  │
-│                      │ (save/load)  │         step             │
-│                      └──────────────┘                          │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                      QGRETrainer.step()                              │
+│                                                                     │
+│  ┌────────────┐  ┌──────────┐  ┌────────────────┐  ┌─────────────┐ │
+│  │  Generate   │─▸│  Score   │─▸│   Advantages   │─▸│    Loss     │ │
+│  │ (vLLM +    │  │(reward_fn│  │ (SPO+aspiration │  │  (NeMo RL)  │ │
+│  │ LoRA drop) │  │ +spans)  │  │ +spans+VPRM    │  │             │ │
+│  └────────────┘  └──────────┘  │ +var-aware+amp) │  └──────┬──────┘ │
+│       ▲                        └────────────────┘         │        │
+│       │              ┌──────────────┐                     ▼        │
+│       └──────────────│ LoRA Sync    │◂── backward + optimizer step │
+│                      │ (save/load)  │    + critic optimizer step   │
+│                      └──────────────┘                              │
+└─────────────────────────────────────────────────────────────────────┘
   One process. One GPU. Direct function calls.
 ```
 
@@ -223,15 +229,19 @@ QGRE breaks this into per-token, per-step, per-quality advantages:
 
 Format tokens receive +0.85 (correct, reinforce). Accuracy tokens receive -0.40 (wrong, suppress). The gradient separates them. The model learns what worked and what didn't — from a single completion, with no group comparison.
 
-### The four techniques
+### The six techniques
 
 **SPO — Single-stream Policy Optimization.** A persistent EMA baseline tracks what each prompt usually scores, per step. `V[prompt][step] = V + lr × (r − V)`. The advantage is the deviation from history: "was this attempt better or worse than what you usually produce for this prompt on this step?" No group of 8 completions needed. Works with n=1. One completion per prompt, every completion teaches. The persistent memory is the replacement for the group comparison.
 
 **GDPO — Group Decomposed normalization.** Each step's advantages are independently mean-centered and variance-normalized across the batch. When format saturates at 0.95, its advantages cluster near zero (already mastered — small deviations). Grounding at 0.30 has wide variance (still learning — large deviations). Without GDPO, the format gradients dominate by magnitude. With GDPO, each step occupies equal gradient bandwidth regardless of mastery level.
 
-**VPRM — Verifiable Process Reward Mapping.** A segmenter function maps every token in the completion to a region label. The engine assigns each token the advantage of its step. Tokens labeled THINK receive zero advantage — the model can reason freely without gradient pressure on its thinking process. Tokens labeled FORMAT receive zero advantage — structural markup carries no training signal. Only content tokens in active steps receive gradient.
+**VPRM — Verifiable Process Reward Mapping.** Two modes. The segmenter maps tokens to section regions for backward compatibility. The span-based path maps tokens to the *exact character positions* where the reward function found each expression. When the model writes `H = p²/6 + 3x²` three times — in the derivation, the explanation, and the label — all three spans receive the `correct_H` advantage. The model learns at the point of decision, not at the point of transcription.
 
 **Phase Gating — The curriculum.** Phase 1 activates only step 1 qualities. When the rolling 20-batch mean mastery exceeds the threshold (default 0.8), the engine advances to phase 2, which cumulatively activates step 1 + step 2 qualities. Each phase builds on mastery from the previous phase. The model learns format before grounding, grounding before chain coherence, chain coherence before accuracy.
+
+**Target-Aware Aspiration Gap.** The advantage formula is `A = (r − V) + β × (r − target)`. The first term is standard SPO: how did this attempt compare to history? The second term is the aspiration gap: how far is this attempt from where it needs to be? When the baseline converges to match a constant partial credit score — the failure mode that kills gradient signal in every shaped-reward RL system — the aspiration gap survives. The shaped reward gradient passes through the baseline instead of being absorbed by it. Theoretically sound: equivalent to reward scaling `(1+β)` with shifted baseline `V + β × target`, both action-independent. One line of code. Domain-agnostic.
+
+**LoRA Dropout — Structured Exploration.** Temperature perturbs the output distribution. LoRA dropout perturbs the internal representation. During generation, Bernoulli masks on LoRA A matrices partially revert the model to base model behavior. The pretrained weights contain knowledge the adapter learned to suppress — for a physics model, the base model writes `V = kx²/2 + mgx` (includes gravity) while the adapter writes `V = kx²/2` (spring only, drops gravity). Dropout lets the suppressed knowledge surface. Different masks produce different reasoning paths. The diversity is structural, not stochastic. Anneals linearly to zero as the model internalizes what the dropout surfaced — the scaffold dissolves when the learner no longer needs it.
 
 ```
 Phase 1: [q_format]                          → mastery > 0.8 → advance
@@ -278,13 +288,17 @@ def my_reward_fn(prompt: str, completion: str, metadata: dict | None = None) -> 
         "q_grounding": check_grounding(completion),  # NEVER binary 0/1
         "q_accuracy": check_accuracy(completion),
     }
+    # Optional: tell the engine WHERE each quality was scored (character offsets).
+    # When present, advantages target these exact tokens instead of section labels.
+    scored_spans = find_expression_positions(completion)  # {"q_accuracy": [(start, end), ...]}
     return RewardResult(
         reward=sum(scores.values()) / len(scores),
         scores=scores,
+        scored_spans=scored_spans,  # Optional — falls back to segmenter if absent
     )
 ```
 
-Every score must give partial credit. A model that produces almost-valid JSON should score 0.7, not 0.0. A model that identifies 3 of 5 entities should score 0.6, not 0.0. Without partial credit, the gradient signal dies — the model cannot distinguish "close" from "wrong" and has no direction to improve.
+Every score must give partial credit. A model that produces almost-valid JSON should score 0.7, not 0.0. A model that identifies 3 of 5 entities should score 0.6, not 0.0. The partial credit is not a concession — it is the gradient's direction. The distance between 0.4 and 1.0, measured against the aspiration target, tells the model how far to move and which way. Without partial credit, the model cannot distinguish "close" from "wrong." Without the aspiration gap, the baseline absorbs the gradient. Both are required.
 
 ### 2. A step_qualities mapping
 
