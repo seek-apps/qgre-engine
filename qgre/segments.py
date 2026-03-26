@@ -187,16 +187,40 @@ def make_hif_json_segmenter(tokenizer: Any) -> Segmenter:
 
 # --- Hamiltonian structured-label segmenter (decode-and-regex) ---
 
+# --- Shared Hamiltonian label configuration (single source of truth) ---
+# Used by both the segmenter AND reward_fn.py for label extraction.
+
+# Canonical label names → list of aliases (case-insensitive matching)
+HAMILTONIAN_LABEL_ALIASES: dict[str, list[str]] = {
+    "COORDINATES": ["coordinates", "coordinate", "generalized coordinate"],
+    "MOMENTUM": ["momentum", "conjugate momentum"],
+    "KINETIC": ["kinetic", "kinetic energy"],
+    "POTENTIAL": ["potential", "potential energy"],
+    "HAMILTONIAN": ["hamiltonian"],
+    "EQUATIONS": ["equations", "equations of motion", "hamilton's equations"],
+}
+
 # Maps label patterns to step regions. Order matters — first match wins at each position.
 # Each label's tokens get ONLY that label's quality signal.
-HAMILTONIAN_LABEL_PATTERNS: list[tuple[str, str]] = [
-    (r"(?:^|\n)\s*(?:\*{0,2}|#{1,4}\s*)COORDINATES\s*(?:\*{0,2})\s*:", "STEP_1"),
-    (r"(?:^|\n)\s*(?:\*{0,2}|#{1,4}\s*)MOMENTUM\s*(?:\*{0,2})\s*:", "STEP_2"),
-    (r"(?:^|\n)\s*(?:\*{0,2}|#{1,4}\s*)KINETIC\s*(?:\*{0,2})\s*:", "STEP_3"),
-    (r"(?:^|\n)\s*(?:\*{0,2}|#{1,4}\s*)POTENTIAL\s*(?:\*{0,2})\s*:", "STEP_4"),
-    (r"(?:^|\n)\s*(?:\*{0,2}|#{1,4}\s*)HAMILTONIAN\s*(?:\*{0,2})\s*:", "STEP_5"),
-    (r"(?:^|\n)\s*(?:\*{0,2}|#{1,4}\s*)EQUATIONS\s*(?:\*{0,2})\s*:", "STEP_6"),
-]
+# Patterns match canonical names AND aliases, with markdown bold/headers.
+def _build_hamiltonian_patterns() -> list[tuple[str, str]]:
+    """Build segmenter patterns from the shared alias dict."""
+    step_map = {"COORDINATES": "STEP_1", "MOMENTUM": "STEP_2", "KINETIC": "STEP_3",
+                "POTENTIAL": "STEP_4", "HAMILTONIAN": "STEP_5", "EQUATIONS": "STEP_6"}
+    patterns = []
+    for label, region in step_map.items():
+        aliases = HAMILTONIAN_LABEL_ALIASES.get(label, [label.lower()])
+        all_names = [label] + aliases
+        # Build alternation: (?:COORDINATES|coordinates|coordinate|generalized coordinate)
+        alt = "|".join(re.escape(n) for n in all_names)
+        patterns.append((
+            rf"(?:^|\n)\s*(?:\*{{0,3}}|#{{1,4}}\s*)(?:{alt})\s*(?:\*{{0,3}})\s*:",
+            region,
+        ))
+    return patterns
+
+
+HAMILTONIAN_LABEL_PATTERNS: list[tuple[str, str]] = _build_hamiltonian_patterns()
 
 
 def _hamiltonian_segmenter_impl(token_ids: list[int], tokenizer: Any) -> list[str]:
@@ -265,6 +289,15 @@ def _hamiltonian_segmenter_impl(token_ids: list[int], tokenizer: Any) -> list[st
                 regions[tok_idx] = region
 
     return regions
+
+
+def segmenter_region_count(regions: list[str]) -> int:
+    """Count distinct non-THINK, non-OTHER step regions in segmenter output.
+
+    Used by VPRM to decide per-sample fallback: if only 1 region found,
+    fall back to SPO scalar baseline for that sample.
+    """
+    return len({r for r in regions if r.startswith("STEP_")})
 
 
 def make_hamiltonian_segmenter(tokenizer: Any) -> Segmenter:

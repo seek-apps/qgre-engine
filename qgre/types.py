@@ -17,6 +17,11 @@ class RewardResult:
     reward: float
     scores: dict = field(default_factory=dict)  # {"quality_name": float, ...}
     phase: int = 1  # Engine-managed — set by GameState, not reward_fn
+    scored_spans: dict = field(default_factory=dict)
+    # scored_spans: {"quality_name": [(char_start, char_end), ...], ...}
+    # Character offsets into the completion text. When populated, the engine
+    # uses these for per-token advantage assignment instead of the segmenter.
+    # Reward functions that don't populate this field get the legacy segmenter path.
 
 
 QUALITY_WINDOW_SIZE = 20

@@ -128,6 +128,13 @@ class QGRETrainer:
             frontier_amplification=alg.frontier_amplification,
         )
 
+        # VPRM critic — per-region per-dimension learned baseline
+        self.vprm_critic = None
+        self.vprm_optimizer = None
+        self._vprm_initialized = False
+        self._vprm_config = config.vprm
+        self._vprm_sq = sq
+
         # Loss function (NeMo RL extracted)
         self.loss_fn = ClippedPGLossFn({
             "reference_policy_kl_penalty": alg.kl_cov_ratio if alg.loss_mode == "kl_cov" else 0.0,
@@ -166,6 +173,23 @@ class QGRETrainer:
         self.optimizer: torch.optim.Optimizer | None = None
         self.scheduler: Any = None
         self._accumulated_loss = 0.0
+
+    def _init_vprm_critic(self, hidden_dim: int, device: str | torch.device):
+        """Lazily initialize VPRM critic once hidden_dim is known from first forward pass."""
+        if self._vprm_initialized:
+            return
+        from qgre.critic import VPRMCritic
+        self.vprm_critic = VPRMCritic(
+            hidden_dim=hidden_dim,
+            step_qualities=self._vprm_sq,
+            intermediate_dim=self._vprm_config.intermediate_dim,
+            clip_advantage=self._vprm_config.clip_advantage,
+        ).to(device)
+        self.vprm_optimizer = torch.optim.Adam(
+            self.vprm_critic.parameters(),
+            lr=self._vprm_config.lr,
+        )
+        self._vprm_initialized = True
 
     def setup_optimizer(self):
         """Create optimizer and LR scheduler from config.
@@ -274,15 +298,49 @@ class QGRETrainer:
                 if mastery < self.config.training.mastery_threshold:
                     frontier_steps.add(current_phase)
 
-        # Compute per-token advantages (segment → step rewards → SPO/GRPO → GDPO → broadcast)
-        token_advantages, batch_regions = self.advantage_estimator.compute_advantages(
-            batch_prompt_ids=batch.prompt_ids,
-            batch_token_ids=completions,
-            batch_reward_results=reward_results,
-            batch_active_qualities=active_qualities,
-            group_size=self.config.algorithm.grpo.n if self.config.algorithm.mode == "grpo" else None,
-            frontier_steps=frontier_steps,
-        )
+        # Compute per-token advantages — span-based (if scored_spans populated) or region-based (legacy)
+        use_spans = any(rr.scored_spans for rr in reward_results)
+        if use_spans:
+            from qgre.spans import build_char_to_token_map, scored_spans_to_token_masks
+            # Build per-sample token masks from scored_spans
+            batch_token_masks: list[dict[str, torch.Tensor]] = []
+            for i, rr in enumerate(reward_results):
+                if rr.scored_spans:
+                    # Decode completion for offset_mapping (authoritative char→token)
+                    comp_text = self.tokenizer.decode(completions[i], skip_special_tokens=False) if self.tokenizer else None
+                    char_map = build_char_to_token_map(completions[i], self.tokenizer, completion_text=comp_text)
+                    if char_map is not None:
+                        masks = scored_spans_to_token_masks(rr.scored_spans, char_map, len(completions[i]))
+                    else:
+                        masks = {}  # Fallback: empty masks → zero advantages (segmenter fallback below)
+                else:
+                    masks = {}
+                batch_token_masks.append(masks)
+
+            # Check if span mapping succeeded for any sample
+            if any(m for m in batch_token_masks):
+                token_advantages = self.advantage_estimator.compute_advantages_with_spans(
+                    batch_prompt_ids=batch.prompt_ids,
+                    batch_token_ids=completions,
+                    batch_reward_results=reward_results,
+                    batch_active_qualities=active_qualities,
+                    batch_token_masks=batch_token_masks,
+                    group_size=self.config.algorithm.grpo.n if self.config.algorithm.mode == "grpo" else None,
+                    frontier_steps=frontier_steps,
+                )
+                batch_regions = [["SPAN"] * len(c) for c in completions]  # Placeholder for KL weights
+            else:
+                use_spans = False  # All mappings failed, fall back to segmenter
+
+        if not use_spans:
+            token_advantages, batch_regions = self.advantage_estimator.compute_advantages(
+                batch_prompt_ids=batch.prompt_ids,
+                batch_token_ids=completions,
+                batch_reward_results=reward_results,
+                batch_active_qualities=active_qualities,
+                group_size=self.config.algorithm.grpo.n if self.config.algorithm.mode == "grpo" else None,
+                frontier_steps=frontier_steps,
+            )
 
         # Build full sequences on model device
         device = next(self.model.parameters()).device
@@ -321,9 +379,11 @@ class QGRETrainer:
         else:
             kl_region_weights = None
 
-        del batch_regions  # No longer needed — regions already mapped to KL weights or skipped
+        if not self.config.vprm.enabled:
+            del batch_regions  # No longer needed — regions already mapped to KL weights or skipped
 
         # SPO low-advantage filter: skip sequences with near-zero signal (PLAN.md lines 658-671)
+        _spo_filter_idx = None  # Maps filtered indices → original batch indices
         if self.config.algorithm.mode == "spo":
             useful = (padded_advs.abs() > 0.001).any(dim=-1)
             if useful.sum() == 0:
@@ -355,6 +415,10 @@ class QGRETrainer:
                 comp_attention_mask = comp_attention_mask[idx]
                 if kl_region_weights is not None:
                     kl_region_weights = kl_region_weights[idx]
+                # Track original indices for VPRM region/reward lookup
+                _spo_filter_idx = idx.tolist()
+            else:
+                _spo_filter_idx = None
 
         # Response mask
         prompt_lengths = [0] * comp_tensor.shape[0]
@@ -382,6 +446,7 @@ class QGRETrainer:
             mb_attn_mask = comp_attention_mask[mb_start:mb_end]
             mb_advs = padded_advs[mb_start:mb_end]
             mb_mask = response_mask[mb_start:mb_end]
+            mb_hidden_states = None  # Set by fused/non-fused path when VPRM enabled
 
             # Ensure Unsloth training mode before EACH forward pass (not just at init).
             # Unsloth's inplace attention kernels require this transition before backward.
@@ -435,6 +500,8 @@ class QGRETrainer:
                                 )
                             del std_lp
                         self._fused_validated = True
+                    # Keep hidden_states for VPRM critic if enabled; else free memory
+                    mb_hidden_states = hidden_states.detach() if self.config.vprm.enabled else None
                     del hidden_states
                 else:
                     # Hidden states mode didn't take effect — crash with diagnostics
@@ -457,11 +524,76 @@ class QGRETrainer:
                         f"Delete unsloth_compiled_cache/ and restart."
                     )
                 mb_logits = lm_head_nf(hs[:, :-1, :]).float()
+                mb_hidden_states = hs.detach() if self.config.vprm.enabled else None
                 del hs
                 mb_lp = logprobs_from_logits(mb_logits, mb_ids[:, 1:])
                 del mb_logits
 
             mb_old_lp = mb_lp.detach()
+
+            # VPRM critic: replace SPO advantages with critic-based advantages
+            mb_critic_loss = torch.tensor(0.0, device=device)
+            mb_critic_count = 0
+            if self.config.vprm.enabled and mb_hidden_states is not None:
+                from qgre.advantages import compute_advantages_vprm
+                # Lazy init critic on first forward pass (now we know hidden_dim)
+                if not self._vprm_initialized:
+                    self._init_vprm_critic(
+                        hidden_dim=mb_hidden_states.shape[-1],
+                        device=device,
+                    )
+
+                # Compute VPRM advantages per-sample in this micro-batch
+                for mb_i in range(mb_end - mb_start):
+                    filtered_i = mb_start + mb_i
+                    # Map filtered index → original batch index
+                    orig_i = _spo_filter_idx[filtered_i] if _spo_filter_idx is not None else filtered_i
+                    # Get regions for this sample (original batch index)
+                    if orig_i >= len(batch_regions):
+                        import warnings
+                        warnings.warn(
+                            f"VPRM: orig_i={orig_i} >= len(batch_regions)={len(batch_regions)} "
+                            f"— skipping sample (SPO filter mapping error?)"
+                        )
+                        continue
+                    sample_regions = batch_regions[orig_i]
+                    # Get reward result and active qualities
+                    if orig_i >= len(reward_results):
+                        import warnings
+                        warnings.warn(
+                            f"VPRM: orig_i={orig_i} >= len(reward_results)={len(reward_results)} "
+                            f"— skipping sample"
+                        )
+                        continue
+                    sample_rr = reward_results[orig_i]
+                    sample_aq = active_qualities[orig_i] if orig_i < len(active_qualities) else []
+                    # Get hidden states for this sample
+                    sample_hs = mb_hidden_states[mb_i]  # [seq_len, hidden_dim]
+                    # Trim to completion length
+                    comp_len = len(completions[orig_i]) if orig_i < len(completions) else sample_hs.shape[0]
+                    sample_hs_trimmed = sample_hs[:comp_len]
+
+                    vprm_advs, vprm_loss, used_critic = compute_advantages_vprm(
+                        critic=self.vprm_critic,
+                        hidden_states=sample_hs_trimmed,
+                        regions=sample_regions[:comp_len],
+                        reward_result=sample_rr,
+                        step_qualities=self.step_qualities,
+                        active_qualities=sample_aq,
+                        step_region_map=self.config.algorithm.step_region_map,
+                        frontier_steps=frontier_steps,
+                        frontier_amplification=self.config.algorithm.frontier_amplification,
+                        min_regions=self.config.vprm.spo_fallback_min_regions,
+                    )
+
+                    if used_critic:
+                        # Replace pre-computed advantages with VPRM advantages
+                        adv_len = min(vprm_advs.shape[0], mb_advs.shape[1])
+                        mb_advs[mb_i, :adv_len] = vprm_advs[:adv_len]
+                        mb_critic_loss = mb_critic_loss + vprm_loss
+                        mb_critic_count += 1
+
+                del mb_hidden_states
 
             # Align advantages + KL weights with logprob positions:
             # mb_lp[t] = log P(token t+1 | tokens 0..t), so it needs advantage[t+1]
@@ -515,6 +647,13 @@ class QGRETrainer:
                 mb_metrics["llds_loss"] = llds_loss.item()
                 mb_metrics["llds_mask_ratio"] = llds_mask.sum().item() / max(mb_mask[:, :min_len].sum().item(), 1)
 
+            # VPRM critic loss: normalize by sample count and add to policy loss
+            if mb_critic_count > 0:
+                mb_critic_loss = mb_critic_loss / mb_critic_count
+            if mb_critic_loss.requires_grad:
+                mb_loss = mb_loss + mb_critic_loss
+                mb_metrics["critic_loss"] = mb_critic_loss.item()
+
             (mb_loss / n_micro).backward()
             total_loss += mb_loss.item() / n_micro
 
@@ -548,6 +687,14 @@ class QGRETrainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config.training.max_grad_norm)
             self.optimizer.step()
             self.optimizer.zero_grad()
+            # VPRM critic optimizer steps at same cadence as policy optimizer
+            # Only step when critic actually received gradients (avoids diluting Adam moments)
+            if self.vprm_critic is not None and self.vprm_optimizer is not None:
+                has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 for p in self.vprm_critic.parameters())
+                if has_grad:
+                    torch.nn.utils.clip_grad_norm_(self.vprm_critic.parameters(), max_norm=self.config.training.max_grad_norm)
+                    self.vprm_optimizer.step()
+                self.vprm_optimizer.zero_grad()
             if self.scheduler is not None:
                 self.scheduler.step()
             # Report accumulated loss across gradient accumulation steps

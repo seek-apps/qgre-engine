@@ -617,3 +617,118 @@ EQUATIONS:
         result = hamiltonian_reward(SPRING_PROMPT, text, SPRING_META)
         assert result.scores["q_T_uses_p"] >= 0.7, f"LaTeX frac T should parse, got {result.scores['q_T_uses_p']}"
         assert result.scores["q_correct_H"] >= 0.7, f"H should still work, got {result.scores['q_correct_H']}"
+
+
+class TestLatex2SympyParsing:
+    """Tests for latex2sympy-based parsing — patterns that broke regex extraction."""
+
+    def test_parse_math_latex_frac(self):
+        """latex2sympy handles \\frac{}{} natively."""
+        from examples.hamiltonian.reward_fn import _parse_math
+        import sympy as sp
+        result = _parse_math(r"\frac{p^2}{6}")
+        assert result is not None
+        p = sp.Symbol("p")
+        assert sp.simplify(result - p**2/6) == 0
+
+    def test_parse_math_nested_frac(self):
+        """Nested fractions: \\frac{p^2}{2m} where m is a symbol."""
+        from examples.hamiltonian.reward_fn import _parse_math
+        import sympy as sp
+        result = _parse_math(r"\frac{p^2}{2m}")
+        assert result is not None
+        p, m = sp.Symbol("p"), sp.Symbol("m")
+        assert sp.simplify(result - p**2/(2*m)) == 0
+
+    def test_parse_math_derivative_frac(self):
+        """\\frac{dx}{dt} → Derivative(x, t)."""
+        from examples.hamiltonian.reward_fn import _parse_math
+        import sympy as sp
+        result = _parse_math(r"\frac{dx}{dt}")
+        assert result is not None
+        assert result.atoms(sp.Derivative), f"Expected Derivative, got {result}"
+
+    def test_parse_math_plain_algebra(self):
+        """Plain algebra without LaTeX parses via sympify fallback."""
+        from examples.hamiltonian.reward_fn import _parse_math
+        import sympy as sp
+        result = _parse_math("p**2/6 + 3*x**2")
+        assert result is not None
+        p, x = sp.Symbol("p"), sp.Symbol("x")
+        assert sp.simplify(result - (p**2/6 + 3*x**2)) == 0
+
+    def test_parse_math_degree_conversion(self):
+        """Degree notation \\sin(60^\\circ) → sin(π/3)."""
+        from examples.hamiltonian.reward_fn import _parse_math
+        import sympy as sp
+        result = _parse_math(r"\sin(60^\circ)")
+        assert result is not None
+        assert sp.simplify(result - sp.sin(sp.pi/3)) == 0
+
+    def test_velocity_detection_frac_derivative(self):
+        """\\frac{dx}{dt} detected as velocity form."""
+        from examples.hamiltonian.reward_fn import _has_velocity_form
+        assert _has_velocity_form(r"\frac{dx}{dt}") is True
+
+    def test_velocity_detection_dot_notation(self):
+        """Unicode ẋ detected as velocity form."""
+        from examples.hamiltonian.reward_fn import _has_velocity_form
+        assert _has_velocity_form("ẋ") is True
+
+    def test_velocity_detection_momentum_not_velocity(self):
+        """p²/6 is NOT velocity form."""
+        from examples.hamiltonian.reward_fn import _has_velocity_form
+        assert _has_velocity_form("p**2/6") is False
+
+    def test_full_latex_hamiltonian(self):
+        """Full LaTeX Hamiltonian with \\frac parses and scores correctly."""
+        text = (
+            "COORDINATES: q = x\n"
+            "MOMENTUM: p = 3*dx/dt\n"
+            "KINETIC: $ T = \\frac{p^2}{6} $\n"
+            "POTENTIAL: $ V = 3x^2 $\n"
+            "HAMILTONIAN: $ H = \\frac{p^2}{6} + 3x^2 $\n"
+            "EQUATIONS:\n"
+            "  $ \\frac{dq}{dt} = \\frac{p}{3} $\n"
+            "  $ \\frac{dp}{dt} = -6x $"
+        )
+        result = hamiltonian_reward(SPRING_PROMPT, text, SPRING_META)
+        assert result.scores["q_correct_H"] >= 0.7, f"LaTeX H should parse, got {result.scores['q_correct_H']}"
+        assert result.scores["q_T_uses_p"] >= 0.7, f"LaTeX T should parse, got {result.scores['q_T_uses_p']}"
+
+    def test_parse_math_rejects_chained_equality(self):
+        """Chained equality 'T = p²/2m = p²/6' must not crash — returns None."""
+        from examples.hamiltonian.reward_fn import _parse_math
+        # latex2sympy returns And(Eq(...), Eq(...)) for these — not sp.Expr
+        assert _parse_math(r"T = \frac{p^2}{2m} = \frac{p^2}{6}") is None
+        assert _parse_math(r"a = b = c") is None
+        # But clean expressions should still work
+        assert _parse_math(r"\frac{p^2}{6}") is not None
+
+    def test_chained_equality_in_scoring_never_crashes(self):
+        """Model writes 'H = T + V = p²/6 + 3x²' — must not crash reward function."""
+        text = (
+            "COORDINATES: q = x\n"
+            "MOMENTUM: p = 3*dx/dt\n"
+            "KINETIC: T = p²/(2*3) = p²/6\n"
+            "POTENTIAL: V = 3x²\n"
+            "HAMILTONIAN: H = T + V = p²/6 + 3x²\n"
+            "EQUATIONS:\n  dq/dt = p/3\n  dp/dt = -6x"
+        )
+        # Must not crash — returns valid scores
+        result = hamiltonian_reward(SPRING_PROMPT, text, SPRING_META)
+        assert result.reward > 0
+
+    def test_latex_dot_velocity_form_detected(self):
+        """Model writes \\dot{{x}} velocity form — detected and scored lower."""
+        text = (
+            "COORDINATES: q = x\n"
+            "MOMENTUM: p = 3*dx/dt\n"
+            "KINETIC: $ T = \\frac{1}{2} \\cdot 3 \\cdot \\dot{x}^2 $\n"
+            "POTENTIAL: V = 3x²\n"
+            "HAMILTONIAN: H = p²/6 + 3x²\n"
+            "EQUATIONS:\n  dq/dt = p/3\n  dp/dt = -6x"
+        )
+        result = hamiltonian_reward(SPRING_PROMPT, text, SPRING_META)
+        # T is in velocity form → should NOT get credit for momentum form
+        assert result.scores["q_T_in_momentum"] < 1.0

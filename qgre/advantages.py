@@ -6,8 +6,71 @@ from typing import Callable
 import numpy as np
 import torch
 
-from qgre.segments import Segmenter, uniform_segmenter
+from qgre.segments import Segmenter, segmenter_region_count, uniform_segmenter
 from qgre.types import RewardResult
+
+
+def apply_frontier_amplification(
+    step_advs: dict,
+    step_nums: list[int],
+    frontier_steps: set[int] | None,
+    amplification: float,
+) -> None:
+    """Multiply advantages for frontier steps (blocking phase advancement).
+
+    Modifies step_advs in place.
+    """
+    if frontier_steps and amplification > 0:
+        for sn in step_nums:
+            if sn in frontier_steps:
+                step_advs[sn] = step_advs[sn] * (1.0 + amplification)
+
+
+def broadcast_step_advantages_to_tokens(
+    step_advs: dict[int, float | torch.Tensor],
+    regions: list[str],
+    region_extra_steps: dict[int, list[int]],
+    sample_idx: int | None = None,
+) -> torch.Tensor:
+    """Broadcast per-step advantages to per-token by region label.
+
+    Shared by SPO/GRPO path and VPRM path. Each token gets the sum of its
+    region's primary step advantage + any virtual steps mapped to that region.
+
+    Args:
+        step_advs: step_num → advantage (float for VPRM, Tensor[batch] for SPO/GRPO)
+        regions: per-token region labels from segmenter
+        region_extra_steps: region_step → [virtual steps mapped to it]
+        sample_idx: when step_advs values are batch tensors, index into them
+    """
+    # Pre-build label → advantage value map from unique regions (O(n_labels) string ops)
+    # then do O(seq_len) dict lookups instead of per-token string parsing
+    label_to_adv: dict[str, float | torch.Tensor] = {}
+    for region in set(regions):
+        if region.startswith("STEP_"):
+            sn = int(region.split("_")[1])
+            if sn in step_advs:
+                val = step_advs[sn]
+                primary = val[sample_idx] if sample_idx is not None else val
+                contribs = [primary]
+                for vs in region_extra_steps.get(sn, []):
+                    if vs in step_advs:
+                        v = step_advs[vs]
+                        contribs.append(v[sample_idx] if sample_idx is not None else v)
+                if isinstance(contribs[0], torch.Tensor):
+                    label_to_adv[region] = torch.stack(contribs).sum()
+                else:
+                    label_to_adv[region] = sum(contribs)
+        elif region == "THINK" and 0 in step_advs:
+            val = step_advs[0]
+            label_to_adv[region] = val[sample_idx] if sample_idx is not None else val
+
+    seq_len = len(regions)
+    token_advs = torch.zeros(seq_len)
+    for t, region in enumerate(regions):
+        if region in label_to_adv:
+            token_advs[t] = label_to_adv[region]
+    return token_advs
 
 
 def build_batch_reward_tensors(
@@ -160,9 +223,8 @@ class QGREStepAdvantageEstimator:
             for step_num, quality_keys in self.step_qualities.items():
                 active = [k for k in quality_keys if k in batch_active_qualities[i]]
                 if active:
-                    step_rews[step_num] = float(np.nanmean([
-                        batch_reward_results[i].scores.get(k, 0.0) for k in active
-                    ]))
+                    vals = [batch_reward_results[i].scores.get(k, 0.0) for k in active]
+                    step_rews[step_num] = sum(vals) / len(vals)
                 else:
                     step_rews[step_num] = 0.0
             all_step_rewards.append(step_rews)
@@ -217,34 +279,15 @@ class QGREStepAdvantageEstimator:
                 mean = step_advs[step_num].mean()
                 step_advs[step_num] = step_advs[step_num] - mean
 
-        # Phase-aware frontier amplification: multiply advantages for steps that block
-        # phase advancement. Mastered steps get weight 1.0, frontier steps get
-        # (1 + frontier_amplification). This focuses gradient pressure on the bottleneck.
-        if frontier_steps and self.frontier_amplification > 0:
-            for step_num in self._step_nums:
-                if step_num in frontier_steps:
-                    step_advs[step_num] = step_advs[step_num] * (1.0 + self.frontier_amplification)
+        # Phase-aware frontier amplification: focus gradient on bottleneck steps
+        apply_frontier_amplification(step_advs, self._step_nums, frontier_steps, self.frontier_amplification)
 
         # Phase 3: Broadcast per-step advantages to per-token by region
-        # Virtual steps (via step_region_map) add their advantage to the mapped region's tokens
         batch_advantages: list[torch.Tensor] = []
         for i in range(batch_size):
-            token_advs = torch.zeros(len(batch_token_ids[i]))
-            for t, region in enumerate(all_regions[i]):
-                if region.startswith("STEP_"):
-                    sn = int(region.split("_")[1])
-                    if sn in step_advs:
-                        # Collect primary + virtual step advantages and SUM them.
-                        # Each quality targeting this region pushes at full strength.
-                        # With raw SPO advantages (bounded by reward scale [0,1]),
-                        # summation preserves the full gradient from every contributing quality.
-                        contribs = [step_advs[sn][i]]
-                        for vs in self._region_extra_steps.get(sn, []):
-                            if vs in step_advs:
-                                contribs.append(step_advs[vs][i])
-                        token_advs[t] = torch.stack(contribs).sum()
-                elif region == "THINK" and 0 in step_advs:
-                    token_advs[t] = step_advs[0][i]
+            token_advs = broadcast_step_advantages_to_tokens(
+                step_advs, all_regions[i], self._region_extra_steps, sample_idx=i,
+            )
             batch_advantages.append(token_advs)
 
         return batch_advantages, all_regions
@@ -356,6 +399,95 @@ class QGREStepAdvantageEstimator:
             "mode": self.mode,
         }
 
+    def compute_advantages_with_spans(
+        self,
+        batch_prompt_ids: list[int],
+        batch_token_ids: list[list[int]],
+        batch_reward_results: list["RewardResult"],
+        batch_active_qualities: list[list[str]],
+        batch_token_masks: list[dict[str, torch.Tensor]],
+        group_size: int | None = None,
+        frontier_steps: set[int] | None = None,
+    ) -> list[torch.Tensor]:
+        """Compute per-token advantages using span-based token masks.
+
+        Same per-step SPO/GRPO logic as compute_advantages(), but broadcasts
+        advantages to tokens using scored_spans masks instead of section regions.
+
+        Args:
+            batch_token_masks: per-sample dict of quality_name → [seq_len] boolean mask
+                (from qgre.spans.scored_spans_to_token_masks)
+        """
+        batch_size = len(batch_token_ids)
+
+        # Phase 1: Compute per-step rewards (same as region-based path)
+        all_step_rewards: list[dict[int, float]] = []
+        for i in range(batch_size):
+            step_rews: dict[int, float] = {}
+            for step_num, quality_keys in self.step_qualities.items():
+                active = [k for k in quality_keys if k in batch_active_qualities[i]]
+                if active:
+                    vals = [batch_reward_results[i].scores.get(k, 0.0) for k in active]
+                    step_rews[step_num] = sum(vals) / len(vals)
+                else:
+                    step_rews[step_num] = 0.0
+            all_step_rewards.append(step_rews)
+
+        # Phase 2: Per-step advantages via SPO or GRPO (same as region-based path)
+        step_advs: dict[int, torch.Tensor] = {
+            s: torch.zeros(batch_size) for s in self._step_nums
+        }
+        if self.mode == "spo":
+            self._compute_spo_advantages(batch_prompt_ids, all_step_rewards, step_advs, batch_size)
+        else:
+            self._compute_grpo_advantages(
+                batch_prompt_ids, all_step_rewards, step_advs, batch_size,
+                group_size=group_size or batch_size,
+            )
+
+        # Normalization (same as region-based path)
+        for step_num in self._step_nums:
+            if step_advs[step_num].isnan().any():
+                import warnings
+                nan_count = step_advs[step_num].isnan().sum().item()
+                warnings.warn(f"Step {step_num}: {nan_count} advantages are NaN. Replacing with 0.0.")
+                step_advs[step_num] = torch.nan_to_num(step_advs[step_num], nan=0.0)
+            if self.mode == "spo":
+                pass  # Raw SPO advantages
+            elif self.normalize_advantages:
+                mean = step_advs[step_num].mean()
+                std = step_advs[step_num].std(correction=0)
+                if std > 1e-8:
+                    step_advs[step_num] = (step_advs[step_num] - mean) / (std + 1e-8)
+                else:
+                    step_advs[step_num] = step_advs[step_num] - mean
+            else:
+                mean = step_advs[step_num].mean()
+                step_advs[step_num] = step_advs[step_num] - mean
+
+        # Frontier amplification (same as region-based path)
+        apply_frontier_amplification(step_advs, self._step_nums, frontier_steps, self.frontier_amplification)
+
+        # Phase 3: Broadcast using span masks instead of region labels
+        batch_advantages: list[torch.Tensor] = []
+        for i in range(batch_size):
+            seq_len = len(batch_token_ids[i])
+            token_advs = torch.zeros(seq_len)
+            masks = batch_token_masks[i]
+
+            for step_num, quality_keys in self.step_qualities.items():
+                step_adv = step_advs[step_num][i].item()
+                if abs(step_adv) < 1e-10:
+                    continue
+                # Apply this step's advantage to all tokens covered by ANY of its qualities' spans
+                for q_name in quality_keys:
+                    if q_name in masks:
+                        token_advs += step_adv * masks[q_name]
+
+            batch_advantages.append(token_advs)
+
+        return batch_advantages
+
     def load_state_dict(self, state: dict):
         self.lr = state.get("lr", self.lr)
         self.mode = state.get("mode", self.mode)
@@ -366,3 +498,77 @@ class QGREStepAdvantageEstimator:
         self._step_seen = defaultdict(set)
         for pid, steps in state.get("step_seen", {}).items():
             self._step_seen[int(pid)] = set(int(s) for s in steps)
+
+
+def compute_advantages_vprm(
+    critic,  # VPRMCritic
+    hidden_states: torch.Tensor,
+    regions: list[str],
+    reward_result: "RewardResult",
+    step_qualities: dict[int, list[str]],
+    active_qualities: list[str],
+    step_region_map: dict[int, int] | None = None,
+    frontier_steps: set[int] | None = None,
+    frontier_amplification: float = 2.0,
+    min_regions: int = 2,
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    """Compute per-token advantages using VPRM critic for a single sample.
+
+    Returns:
+        (token_advantages, critic_loss, used_critic):
+        - token_advantages: [seq_len] per-token advantages
+        - critic_loss: scalar MSE loss for critic training
+        - used_critic: True if critic was used, False if SPO fallback
+    """
+    seq_len = hidden_states.shape[0]
+    device = hidden_states.device
+
+    # Check if enough regions for critic — else SPO fallback
+    n_regions = segmenter_region_count(regions)
+    if n_regions < min_regions:
+        return (
+            torch.zeros(seq_len, device=device),
+            torch.tensor(0.0, device=device),
+            False,
+        )
+
+    # Get actual rewards per quality
+    actual_rewards = {k: reward_result.scores.get(k, 0.0) for k in active_qualities}
+
+    # Compute advantages via critic (hidden states must be DETACHED)
+    advs_dict, critic_losses = critic.compute_advantages(
+        hidden_states.detach(), regions, actual_rewards,
+    )
+
+    # Build reverse map: region_step → [virtual steps that map to it]
+    region_extra_steps: dict[int, list[int]] = defaultdict(list)
+    if step_region_map:
+        for vs, rs in step_region_map.items():
+            region_extra_steps[rs].append(vs)
+
+    # Broadcast per-quality advantages to per-token by region
+    step_nums = sorted(step_qualities.keys())
+    # Build per-step advantages from quality advantages
+    step_advs: dict[int, float] = {}
+    for step_num in step_nums:
+        qualities = [q for q in step_qualities[step_num] if q in active_qualities]
+        if qualities:
+            vals = [advs_dict.get(q, 0.0) for q in qualities]
+            step_advs[step_num] = sum(vals) / len(vals)
+        else:
+            step_advs[step_num] = 0.0
+
+    apply_frontier_amplification(step_advs, step_nums, frontier_steps, frontier_amplification)
+
+    # Broadcast to tokens
+    token_advantages = broadcast_step_advantages_to_tokens(
+        step_advs, regions, region_extra_steps,
+    ).to(device)
+
+    # Total critic loss
+    if critic_losses:
+        total_critic_loss = torch.stack(list(critic_losses.values())).mean()
+    else:
+        total_critic_loss = torch.tensor(0.0, device=device)
+
+    return token_advantages, total_critic_loss, True

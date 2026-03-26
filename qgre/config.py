@@ -79,6 +79,15 @@ class LabelSegmenterConfig:
 
 
 @dataclass
+class VPRMConfig:
+    enabled: bool = False
+    intermediate_dim: int = 128  # MLP hidden layer size
+    lr: float = 1e-4  # Critic learning rate (separate from policy lr)
+    clip_advantage: float = 5.0  # Per-quality advantage clipping bound
+    spo_fallback_min_regions: int = 2  # Min distinct regions to use critic (else SPO fallback)
+
+
+@dataclass
 class AlgorithmConfig:
     mode: str = "spo"  # "spo" or "grpo"
     spo: SPOConfig = field(default_factory=SPOConfig)
@@ -154,6 +163,7 @@ class QGREConfig:
     algorithm: AlgorithmConfig = field(default_factory=AlgorithmConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    vprm: VPRMConfig = field(default_factory=VPRMConfig)
 
     @staticmethod
     def from_yaml(path: str | Path) -> QGREConfig:
@@ -217,4 +227,6 @@ class QGREConfig:
             cfg.training = TrainingConfig(**_pick(TrainingConfig, d["training"], "training"))
         if "logging" in d:
             cfg.logging = LoggingConfig(**_pick(LoggingConfig, d["logging"], "logging"))
+        if "vprm" in d:
+            cfg.vprm = VPRMConfig(**_pick(VPRMConfig, d["vprm"], "vprm"))
         return cfg

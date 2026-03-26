@@ -25,9 +25,19 @@ from pathlib import Path
 
 import sympy as sp
 
+try:
+    from latex2sympy2_extended import latex2sympy as _latex2sympy
+except ImportError:
+    _latex2sympy = None  # Fallback: regex-only path
+
+from qgre.segments import HAMILTONIAN_LABEL_ALIASES
 from qgre.types import RewardResult
 
 logger = logging.getLogger("qgre.hamiltonian_reward")
+
+# Common physics degree → radian mappings (shared by parser and normalizer)
+_COMMON_DEGREES = {"30": "pi/6", "45": "pi/4", "60": "pi/3", "90": "pi/2"}
+_COMMON_DEGREES_LATEX = {"30": r"\frac{\pi}{6}", "45": r"\frac{\pi}{4}", "60": r"\frac{\pi}{3}", "90": r"\frac{\pi}{2}"}
 
 _DIAG_PATH = Path("output/hamiltonian/diagnostics.jsonl")
 
@@ -45,62 +55,56 @@ def _normalize_text(s: str) -> str:
 
 
 def _normalize_for_sympy(expr_str: str) -> str:
-    """Clean up expression string for sympy parsing."""
+    """Minimal normalization for plain-algebra sympify fallback.
+
+    Only handles what sympy.sympify can't parse natively: Unicode, degree symbols,
+    implicit multiplication, and basic cleanup. LaTeX is handled by latex2sympy.
+    """
     s = expr_str.strip()
     # Strip trailing incomplete LaTeX/markdown: **, $, \, etc.
     s = re.sub(r"[\*$\\]+$", "", s).strip()
-    # Strip markdown bold/italic at boundaries only (not multiplication *)
+    # Strip markdown bold/italic at boundaries
     s = re.sub(r"^\*{2,3}|(?<!\w)\*{2,3}$|\*{2,3}$", "", s).strip()
     # Strip LaTeX delimiters: $$ ... $$, $ ... $
     s = re.sub(r"\$+", "", s).strip()
     # Strip trailing LaTeX line breaks \\
     s = re.sub(r"\\\\$", "", s).strip()
-    # LaTeX \cdot → * (before stripping LaTeX commands)
+    # Degree symbols → radians (latex2sympy doesn't convert degrees)
+    s = re.sub(r"(\d+)\^\\circ", lambda m: _COMMON_DEGREES.get(m.group(1), m.group(1)), s)
+    s = re.sub(r"(\d+)\^\{\\circ\}", lambda m: _COMMON_DEGREES.get(m.group(1), m.group(1)), s)
+    s = re.sub(r"(\d+)°", lambda m: _COMMON_DEGREES.get(m.group(1), m.group(1)), s)
+    # Bare sin(60) etc — assume degrees for common physics angles
+    s = re.sub(r"sin\((\d+)\)", lambda m: _COMMON_DEGREES.get(m.group(1), "").join(["sin(", ")"]) if m.group(1) in _COMMON_DEGREES else f"sin({m.group(1)})", s)
+    s = re.sub(r"cos\((\d+)\)", lambda m: _COMMON_DEGREES.get(m.group(1), "").join(["cos(", ")"]) if m.group(1) in _COMMON_DEGREES else f"cos({m.group(1)})", s)
+    # LaTeX velocity markers → _VDOT_ (velocity form marker)
+    s = re.sub(r"\\dot\{([a-zA-Z])\}", r"_VDOT_", s)
+    # LaTeX \cdot → *
     s = s.replace("\\cdot", "*")
     # LaTeX \sqrt{x} → sqrt(x)
     s = re.sub(r"\\sqrt\{([^}]+)\}", r"sqrt(\1)", s)
-    # LaTeX \sin, \cos etc → sin, cos
-    # Insert * only if preceded by a letter/digit (not by * or operator)
+    # LaTeX trig → plain names
     s = re.sub(r"(?<=[a-zA-Z0-9)])\\(sin|cos|tan|exp|log|ln)\b", r"*\1", s)
     s = re.sub(r"\\(sin|cos|tan|exp|log|ln)\b", r"\1", s)
-    # Degree symbols: handle ALL forms BEFORE ^ → ** conversion
-    # LaTeX: 60^\circ, 60^{\circ}, 60°
-    s = re.sub(r"(\d+)\^\\circ", lambda m: {"30": "pi/6", "45": "pi/4", "60": "pi/3", "90": "pi/2"}.get(m.group(1), m.group(1)), s)
-    s = re.sub(r"(\d+)\^\{\\circ\}", lambda m: {"30": "pi/6", "45": "pi/4", "60": "pi/3", "90": "pi/2"}.get(m.group(1), m.group(1)), s)
-    s = re.sub(r"(\d+)°", lambda m: {"30": "pi/6", "45": "pi/4", "60": "pi/3", "90": "pi/2"}.get(m.group(1), m.group(1)), s)
-    # Bare sin(60), sin(30) etc without degree symbol — assume degrees for common physics angles
-    s = re.sub(r"sin\((\d+)\)", lambda m: {"30": "sin(pi/6)", "45": "sin(pi/4)", "60": "sin(pi/3)", "90": "sin(pi/2)"}.get(m.group(1), f"sin({m.group(1)})"), s)
-    s = re.sub(r"cos\((\d+)\)", lambda m: {"30": "cos(pi/6)", "45": "cos(pi/4)", "60": "cos(pi/3)", "90": "cos(pi/2)"}.get(m.group(1), f"cos({m.group(1)})"), s)
-    # Strip LaTeX \text{}, \left, \right etc
+    # Strip LaTeX text commands
     s = re.sub(r"\\text\{([^}]*)\}", r"\1", s)
     s = re.sub(r"\\(left|right|,|;|quad|qquad|displaystyle)", "", s)
-    # LaTeX \dot{x} → _VDOT_ (velocity form marker) — BEFORE stripping LaTeX commands
-    s = re.sub(r"\\dot\{([a-zA-Z])\}", r"_VDOT_", s)
     # LaTeX fractions: \frac{a}{b} → (a)/(b)
     s = re.sub(r"\\frac\{([^}]+)\}\{([^}]+)\}", r"(\1)/(\2)", s)
     # Strip remaining LaTeX commands
     s = re.sub(r"\\[a-zA-Z]+", "", s)
-    # Strip leftover braces from LaTeX
+    # Strip leftover braces
     s = s.replace("{", "").replace("}", "")
-    # Unicode superscripts
+    # Unicode
     s = s.replace("^", "**")
     s = s.replace("²", "**2").replace("³", "**3").replace("⁴", "**4")
-    # Unicode velocity symbols (precomposed) → _VDOT_
-    # NOTE: ẋ ẏ ṙ are precomposed single chars. θ̇ and q̇ are base+combining dot.
-    # Handle precomposed first, then combining dot separately.
     for vc in ("ẋ", "ẏ", "ṙ"):
         s = s.replace(vc, "_VDOT_")
     s = s.replace("θ", "theta").replace("ω", "omega")
-    s = s.replace("p_θ", "p_theta").replace("p_r", "p_r").replace("p_s", "p_s")
-    # Strip combining characters (dots above letters)
+    s = s.replace("p_θ", "p_theta")
     s = re.sub(r"\u0307", "", s)  # combining dot above
-    # digit * letter: 3x → 3*x
+    # Implicit multiplication
     s = re.sub(r"(\d)([a-zA-Z_(])", r"\1*\2", s)
-    # uppercase * lowercase: Fx → F*x, Ky → K*y (constant × coordinate)
     s = re.sub(r"([A-Z])([a-z])", r"\1*\2", s)
-    # Consecutive single lowercase letters: mgy → m*g*y, mgh → m*g*h
-    # Only split known physics variable sequences (avoid breaking 'sin', 'cos', 'theta', etc)
-    # Strategy: if a sequence of 2+ lowercase letters is NOT a known name, split it
     _KNOWN_NAMES = {"sin", "cos", "tan", "exp", "log", "sqrt", "ln", "pi",
                     "theta", "omega", "alpha", "beta", "gamma", "delta",
                     "theta1", "theta2", "p_theta", "p_r", "p_s", "p_x", "p_y"}
@@ -108,23 +112,67 @@ def _normalize_for_sympy(expr_str: str) -> str:
         word = match.group(0)
         if word.lower() in _KNOWN_NAMES:
             return word
-        # Split into single chars with * between: mgy → m*g*y
         return "*".join(word)
     s = re.sub(r"[a-z]{2,}", _split_vars, s)
-    # letter/paren * letter: )x → )*x, ) x → )* x, x( → x*(
     s = re.sub(r"(\))\s*([a-zA-Z_(])", r"\1*\2", s)
-    # letter/number before paren: x( → x*(
     s = re.sub(r"([a-zA-Z0-9_])\s*(\()", r"\1*\2", s)
-    # Restore function calls broken by above: sin*( → sin(
     for fn in ("sin", "cos", "tan", "exp", "log", "sqrt", "ln"):
         s = s.replace(f"{fn}*(", f"{fn}(")
-    # fraction-space-variable: 1/2 x → 1/2*x
     s = re.sub(r"(\d)\s+([a-zA-Z_(])", r"\1*\2", s)
-    # Strip leading "H =", "T =", "V =", etc. (leftover from label extraction)
+    # Strip leading "H =", "T =", etc.
     s = re.sub(r"^[A-Za-z_]+\s*=\s*", "", s)
-    # Clean up whitespace
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+def _parse_math(expr_str: str) -> sp.Basic | None:
+    """Parse a math expression (LaTeX or plain) to sympy. Primary parser.
+
+    Tries latex2sympy first (handles \\frac, \\sin, \\dot, derivatives, etc.),
+    then falls back to sympify with normalization for plain algebra.
+    """
+    if not expr_str or expr_str.strip() == "":
+        return None
+
+    raw = expr_str.strip()
+    # Strip wrapping $ delimiters for latex2sympy
+    cleaned = re.sub(r"^\$+|\$+$", "", raw).strip()
+
+    # Pre-process degree notation before any parser (neither handles it correctly)
+    cleaned = re.sub(r"(\d+)\^\s*\\circ", lambda m: _COMMON_DEGREES_LATEX.get(m.group(1), m.group(1)), cleaned)
+    cleaned = re.sub(r"(\d+)\^\s*\{\\circ\}", lambda m: _COMMON_DEGREES_LATEX.get(m.group(1), m.group(1)), cleaned)
+
+    # Try latex2sympy first — handles all LaTeX natively
+    if _latex2sympy is not None and "\\" in cleaned:
+        # Ensure bare trig names have LaTeX prefix (latex2sympy treats "sin" as s*i*n)
+        # Only do this when we're already in the latex2sympy path (has backslashes)
+        latex_cleaned = cleaned
+        for fn in ("sin", "cos", "tan", "exp", "log", "ln", "sqrt"):
+            latex_cleaned = re.sub(rf"(?<!\\)\b{fn}\s*\(", rf"\\{fn}(", latex_cleaned)
+        try:
+            result = _latex2sympy(latex_cleaned)
+            # Only accept sp.Expr — the one type safe for .subs()/.simplify()/etc.
+            # Rejects: Equality (sp.Rel), And/Or (sp.Boolean), BooleanAtom, custom types.
+            # Known issue: latex2sympy returns And() for chained equalities like
+            # "T = p²/2m = p²/6" which crashes .subs() (HuggingFace Math-Verify #24).
+            if isinstance(result, sp.Expr):
+                return result
+        except Exception as exc:
+            logger.debug("latex2sympy failed on %r: %s", cleaned, exc)
+
+    # Fallback: normalize and sympify (plain algebra like p**2/6, 3*x**2)
+    # NOTE: degree handling in _normalize_for_sympy is the fallback for when
+    # _parse_math's latex2sympy path fails — do not remove it.
+    normed = ""
+    try:
+        normed = _normalize_for_sympy(expr_str)
+        result = sp.sympify(normed, locals=_SYMPY_LOCALS)
+        if isinstance(result, sp.Expr):
+            return result
+        return None
+    except Exception as exc:
+        logger.debug("sympify fallback failed on %r (normalized: %r): %s", expr_str, normed, exc)
+        return None
 
 
 # ─── Sympy helpers ────────────────────────────────────────────────────────────
@@ -138,72 +186,120 @@ _SYMPY_LOCALS = {
     "theta": sp.Symbol("theta"), "theta1": sp.Symbol("theta1"), "theta2": sp.Symbol("theta2"),
     "x1": sp.Symbol("x1"), "x2": sp.Symbol("x2"),
     "m": sp.Symbol("m", positive=True),
+    "k": sp.Symbol("k", positive=True),
+    "F": sp.Symbol("F"),
+    "l": sp.Symbol("l", positive=True),  # length
     "g": sp.Rational(98, 10),
     "pi": sp.pi,
 }
 
 
+def _extract_constants_from_prompt(prompt: str) -> dict:
+    """Extract physical constants (m, k, F, l) from the prompt text.
+
+    Returns a sympy substitution dict mapping symbols → values.
+    Used by scorers to evaluate symbolic student expressions against
+    ground truth that has constants evaluated.
+    """
+    subs = {}
+    # Mass
+    m_match = re.search(r"mass\s*(?:m\s*)?=?\s*(\d+(?:\.\d+)?)", prompt)
+    if m_match:
+        val = sp.nsimplify(m_match.group(1))
+        subs[sp.Symbol("m", positive=True)] = val
+        subs[sp.Symbol("m")] = val
+    # Spring constant
+    k_match = re.search(r"(?:spring\s+)?constant\s*k?\s*=\s*(\d+(?:\.\d+)?)", prompt)
+    if k_match:
+        val = sp.nsimplify(k_match.group(1))
+        subs[sp.Symbol("k", positive=True)] = val
+        subs[sp.Symbol("k")] = val
+    # Force
+    f_match = re.search(r"force\s*(?:F\s*)?=?\s*(\d+(?:\.\d+)?)", prompt)
+    if f_match:
+        val = sp.nsimplify(f_match.group(1))
+        subs[sp.Symbol("F")] = val
+    # Length/radius (match both lowercase l and uppercase L)
+    l_match = re.search(r"(?:length|radius)\s*(?:[lLR]\s*)?=?\s*(\d+(?:\.\d+)?)", prompt)
+    if l_match:
+        val = sp.nsimplify(l_match.group(1))
+        subs[sp.Symbol("l", positive=True)] = val
+        subs[sp.Symbol("l")] = val
+    return subs
+
+
 def _try_sympify(expr_str: str) -> sp.Basic | None:
-    """Try to parse expression string into sympy, with normalization."""
-    if not expr_str or expr_str.strip() == "":
-        return None
-    try:
-        normed = _normalize_for_sympy(expr_str)
-        result = sp.sympify(normed, locals=_SYMPY_LOCALS)
-        if isinstance(result, sp.logic.boolalg.BooleanAtom):
-            return None
-        # sympify can return list/tuple for comma-separated exprs — reject those
-        if not isinstance(result, sp.Basic):
-            return None
-        return result
-    except Exception:
-        return None
+    """Try to parse expression string into sympy. Uses _parse_math (latex2sympy + fallback)."""
+    return _parse_math(expr_str)
 
 
 def _remap_variables(student: sp.Basic, teacher: sp.Basic) -> sp.Basic:
-    """Remap student variables to match teacher's coordinate names.
+    """Remap student variables to match teacher's coordinate AND momentum names.
 
-    The model may use x where ground truth uses y, or s where it uses x.
-    Both are valid — the coordinate name is arbitrary. This function finds
-    a consistent mapping from student symbols to teacher symbols.
+    The model may use x where ground truth uses y, or p where ground truth
+    uses p_theta. Both are valid — the names are arbitrary. This function
+    finds a consistent mapping from student symbols to teacher symbols.
 
-    Only remaps single-letter coordinate variables (x, y, s, r, q, theta).
-    Does NOT remap p (momentum) or constants (m, g, k).
+    Remaps coordinates (x, y, s, r, q, theta, ...) AND momenta (p, p_theta, ...).
+    Does NOT remap constants (m, g, k).
     """
-    _COORDS = {"x", "y", "s", "r", "q", "theta", "theta1", "theta2",
-                "x1", "x2", "p_x", "p_y", "p_r", "p_s", "p_theta"}
-    _MOMENTA = {"p", "p_x", "p_y", "p_r", "p_s", "p_theta", "p1", "p2"}
-
-    student_syms = {s for s in student.free_symbols if s.name in _COORDS}
-    teacher_syms = {s for s in teacher.free_symbols if s.name in _COORDS}
-
-    # If symbols already match, no remapping needed
-    if student_syms & teacher_syms == teacher_syms:
+    # Only sp.Expr supports .subs() safely. Reject Equality, And, Boolean, etc.
+    if not isinstance(student, sp.Expr) or not isinstance(teacher, sp.Expr):
         return student
 
-    # Simple case: one coordinate variable each — direct map
-    student_coords = student_syms - {s for s in student.free_symbols if s.name in _MOMENTA}
-    teacher_coords = teacher_syms - {s for s in teacher.free_symbols if s.name in _MOMENTA}
+    _COORDS = {"x", "y", "s", "r", "q", "theta", "theta1", "theta2", "x1", "x2"}
+    _MOMENTA = {"p", "p_x", "p_y", "p_r", "p_s", "p_theta", "p1", "p2"}
+    _REMAP = _COORDS | _MOMENTA
+    _CONSTANTS = {"m", "g", "k", "pi", "omega", "alpha", "beta", "gamma", "delta"}
 
-    if len(student_coords) == 1 and len(teacher_coords) == 1:
-        s_var = next(iter(student_coords))
-        t_var = next(iter(teacher_coords))
-        if s_var != t_var:
-            return student.subs(s_var, t_var)
+    student_remap = {s for s in student.free_symbols if s.name in _REMAP}
+    teacher_remap = {s for s in teacher.free_symbols if s.name in _REMAP}
 
-    # Multi-variable: try positional mapping (sorted by name)
-    if len(student_coords) == len(teacher_coords) and len(student_coords) > 0:
+    # If all teacher symbols already present in student, no remapping needed
+    if teacher_remap <= student_remap:
+        return student
+
+    # Split into coords and momenta for independent remapping
+    student_coords = {s for s in student_remap if s.name in _COORDS}
+    teacher_coords = {s for s in teacher_remap if s.name in _COORDS}
+    student_momenta = {s for s in student_remap if s.name in _MOMENTA}
+    teacher_momenta = {s for s in teacher_remap if s.name in _MOMENTA}
+
+    subs = {}
+
+    # Remap coordinates
+    if len(student_coords) == len(teacher_coords) and student_coords != teacher_coords:
         s_sorted = sorted(student_coords, key=lambda s: s.name)
         t_sorted = sorted(teacher_coords, key=lambda s: s.name)
-        subs = {s: t for s, t in zip(s_sorted, t_sorted) if s != t}
-        if subs:
-            return student.subs(subs)
+        for sv, tv in zip(s_sorted, t_sorted):
+            if sv != tv:
+                subs[sv] = tv
 
-    return student  # Can't remap — return as-is
+    # Remap momenta (model uses p, ground truth uses p_theta, p_s, etc.)
+    if len(student_momenta) == len(teacher_momenta) and student_momenta != teacher_momenta:
+        s_sorted = sorted(student_momenta, key=lambda s: s.name)
+        t_sorted = sorted(teacher_momenta, key=lambda s: s.name)
+        for sv, tv in zip(s_sorted, t_sorted):
+            if sv != tv:
+                subs[sv] = tv
+
+    if subs:
+        return student.subs(subs)
+
+    return student
 
 
-def _score_expression(student_str: str | None, teacher_str: str, variables: list[str]) -> float:
+def _score_expression(
+    student_str: str | None,
+    teacher_str: str,
+    variables: list[str],
+    constant_subs: dict | None = None,
+) -> float:
     """Score a mathematical expression against ground truth.
+
+    Args:
+        constant_subs: optional sympy substitution dict (from _extract_constants_from_prompt)
+            to evaluate symbolic constants (m, k, F) in student expression before comparing.
 
     Returns 0.0-1.0:
     - 1.0: exact symbolic or numerical match (including after variable remapping)
@@ -217,6 +313,13 @@ def _score_expression(student_str: str | None, teacher_str: str, variables: list
 
     student = _try_sympify(student_str)
     teacher = _try_sympify(teacher_str)
+
+    # Substitute known constants (m, k, F from prompt) into student expression
+    if constant_subs and student is not None and isinstance(student, sp.Expr):
+        try:
+            student = student.subs(constant_subs)
+        except Exception as exc:
+            logger.debug("constant substitution failed on %s: %s", student, exc)
 
     if teacher is None:
         return _string_similarity(student_str, teacher_str)
@@ -353,14 +456,8 @@ def _string_similarity(a: str, b: str) -> float:
 
 # ─── Structured section extractors ────────────────────────────────────────────
 
-_LABEL_ALIASES = {
-    "COORDINATES": ["coordinates", "coordinate", "generalized coordinate"],
-    "MOMENTUM": ["momentum", "conjugate momentum"],
-    "KINETIC": ["kinetic", "kinetic energy"],
-    "POTENTIAL": ["potential", "potential energy"],
-    "HAMILTONIAN": ["hamiltonian"],
-    "EQUATIONS": ["equations", "equations of motion", "hamilton's equations"],
-}
+# Label aliases imported from qgre.segments (single source of truth)
+_LABEL_ALIASES = HAMILTONIAN_LABEL_ALIASES
 
 
 def _extract_labeled(text: str, label: str) -> str | None:
@@ -445,7 +542,9 @@ def _find_all_expressions(text: str) -> dict[str, list[str]]:
         results.setdefault(var, []).append(expr)
 
     # LaTeX fraction derivatives: \frac{dq}{dt} = expr
-    for m in re.finditer(r'\\frac\{d([a-z_]+)\}\{dt\}\s*=\s*([^\n,;]{2,})', text):
+    # Pre-convert \theta → theta so \frac{d\theta}{dt} is matchable
+    text_greek = re.sub(r"\\(theta|omega|alpha|beta|gamma|delta|pi)\b", r"\1", text)
+    for m in re.finditer(r'\\frac\{d([a-z_]+)\}\{dt\}\s*=\s*([^\n,;]{2,})', text_greek):
         var = f"d{m.group(1)}/dt"
         expr = m.group(2).strip()
         expr = re.sub(r"[\*$\\]+$", "", expr).strip()
@@ -454,7 +553,12 @@ def _find_all_expressions(text: str) -> dict[str, list[str]]:
     return results
 
 
-def _best_match(candidates: list[str], teacher_str: str, variables: list[str] | None = None) -> float:
+def _best_match(
+    candidates: list[str],
+    teacher_str: str,
+    variables: list[str] | None = None,
+    constant_subs: dict | None = None,
+) -> float:
     """Score the best-matching candidate expression against ground truth.
 
     Tries each candidate, returns the highest score. This is the core of
@@ -465,7 +569,7 @@ def _best_match(candidates: list[str], teacher_str: str, variables: list[str] | 
         return 0.0
     best = 0.0
     for expr in candidates:
-        score = _score_expression(expr, teacher_str, variables or [])
+        score = _score_expression(expr, teacher_str, variables or [], constant_subs=constant_subs)
         if score > best:
             best = score
         if best >= 1.0:
@@ -488,10 +592,15 @@ def _extract_equations_block(text: str) -> list[str]:
     block_m = re.search(r"EQUATIONS[:\s]*\n((?:[\s\-*$]+[^\n]+\n?)+)", text, re.IGNORECASE)
     if block_m:
         block_text = block_m.group(1)
-        # Normalize LaTeX fractions first
+        # Convert LaTeX trig/Greek to plain names FIRST (before frac processing)
+        # so \frac{d\theta}{dt} becomes \frac{dtheta}{dt} which the derivative regex can match
+        block_text = re.sub(r"\\(sin|cos|tan|exp|log|ln|sqrt)\b", r"\1", block_text)
+        block_text = re.sub(r"\\(theta|omega|alpha|beta|gamma|delta|pi)\b", r"\1", block_text)
+        # Now normalize LaTeX fractions (Greek letters already converted)
         block_text = re.sub(r"\\frac\{d([a-z_]+)\}\{dt\}", r"d\1/dt", block_text)
         block_text = re.sub(r"\\frac\{([^}]+)\}\{([^}]+)\}", r"(\1)/(\2)", block_text)
-        block_text = re.sub(r"\\[a-zA-Z]+", "", block_text)
+        block_text = re.sub(r"\\(cdot|left|right|text\{[^}]*\}|,|;|quad|qquad|displaystyle)", "", block_text)
+        block_text = re.sub(r"\\[a-zA-Z]+", "", block_text)  # Strip remaining unknown LaTeX
         block_text = re.sub(r"[$*]", "", block_text)
         for line in block_text.strip().split("\n"):
             line = line.strip().lstrip("-").strip()
@@ -503,7 +612,10 @@ def _extract_equations_block(text: str) -> list[str]:
 
     # Fallback: scattered equation patterns (also handle LaTeX)
     # Normalize LaTeX in full text for fallback
-    norm_text = re.sub(r"\\frac\{d([a-z_]+)\}\{dt\}", r"d\1/dt", text)
+    # Convert Greek/trig FIRST so \frac{d\theta}{dt} → \frac{dtheta}{dt}
+    norm_text = re.sub(r"\\(sin|cos|tan|exp|log|ln|sqrt)\b", r"\1", text)
+    norm_text = re.sub(r"\\(theta|omega|alpha|beta|gamma|delta|pi)\b", r"\1", norm_text)
+    norm_text = re.sub(r"\\frac\{d([a-z_]+)\}\{dt\}", r"d\1/dt", norm_text)
     norm_text = re.sub(r"\\frac\{([^}]+)\}\{([^}]+)\}", r"(\1)/(\2)", norm_text)
     norm_text = re.sub(r"\\[a-zA-Z]+", "", norm_text)
     norm_text = re.sub(r"[$*]", "", norm_text)
@@ -611,7 +723,7 @@ def _score_T_uses_p(text: str, meta: dict) -> float:
     p_candidates = [e for e in t_candidates if re.search(r"p[_²^2\s/(*]|p\*\*2|p\^2|\bp\b", e)]
 
     if p_candidates:
-        score = _best_match(p_candidates, expected_T)
+        score = _best_match(p_candidates, expected_T, constant_subs=meta.get("_constant_subs"))
         return max(0.7, score)  # At least 0.7 for having p form
 
     # No T = p... found. Check if ANY expression in the text matches ground truth T
@@ -623,58 +735,63 @@ def _score_T_uses_p(text: str, meta: dict) -> float:
     return 0.0  # No T expression found at all
 
 
-def _score_T_in_momentum(text: str) -> float:
-    """Check if kinetic energy T is expressed in momentum form (p²) vs velocity form.
+def _has_velocity_form(expr_str: str) -> bool:
+    """Check if expression contains velocity markers (derivatives, dot notation).
 
-    Section-agnostic: finds ALL 'T = expr' anywhere in the text.
-    Returns 1.0 if ANY T expression contains p without velocity markers.
+    Fast regex check first (catches >95% of cases), then sympy parse only
+    when regex says no — avoids expensive latex2sympy/sympify in the common case.
+    """
+    # Fast path: regex catches most velocity forms
+    if re.search(r"[ẋẏṙ]|\\dot|_VDOT_|\u0307|d[a-zθ]/dt|\\frac\{d[a-zθ]", expr_str):
+        return True
+    # Slow path: parse only when regex misses (e.g. latex2sympy Derivative detection)
+    if "\\" in expr_str:
+        parsed = _parse_math(expr_str)
+        if parsed is not None:
+            if parsed.atoms(sp.Derivative):
+                return True
+            if any(s.name.startswith("dot{") for s in parsed.free_symbols):
+                return True
+    return False
+
+
+def _has_momentum_var(expr_str: str) -> bool:
+    """Check if expression contains momentum variable p."""
+    return bool(re.search(r"p[_²/(*+\-]|p\*\*|p\^|p_[a-z]|\bp\d|\bp\b", expr_str))
+
+
+def _score_in_momentum_form(text: str, var_name: str) -> float:
+    """Check if variable is expressed in momentum form (p) vs velocity form.
+
+    Section-agnostic: finds ALL 'VAR = expr' anywhere in the text.
+    Returns 1.0 if ANY expression contains p without velocity markers.
     """
     try:
         all_exprs = _find_all_expressions(text)
-        t_candidates = all_exprs.get("T", [])
-        if not t_candidates:
+        candidates = all_exprs.get(var_name, [])
+        if not candidates:
             return 0.0
 
-        for expr in t_candidates:
-            has_p = bool(re.search(r"p[_²/(*]|p\*\*|p\^|p_[a-z]|\bp\d|\bp\b", expr))
-            has_velocity = bool(re.search(
-                r"[ẋẏṙ]|\\dot|_VDOT_|\u0307|d[a-zθ]/dt|\\frac\{d[a-zθ]", expr
-            ))
+        for expr in candidates:
+            has_p = _has_momentum_var(expr)
+            has_velocity = _has_velocity_form(expr)
             if has_p and not has_velocity:
                 return 1.0
             if has_p and has_velocity:
                 return 0.5
 
-        return 0.0  # No T expression with p found
-    except Exception:
         return 0.0
+    except Exception as exc:
+        logger.debug("_score_%s_in_momentum failed: %s", var_name, exc)
+        return 0.0
+
+
+def _score_T_in_momentum(text: str) -> float:
+    return _score_in_momentum_form(text, "T")
 
 
 def _score_H_in_momentum(text: str) -> float:
-    """Check if Hamiltonian H is expressed using momentum variable p.
-
-    Section-agnostic: finds ALL 'H = expr' anywhere in the text.
-    Returns 1.0 if ANY H expression contains p without velocity markers.
-    """
-    try:
-        all_exprs = _find_all_expressions(text)
-        h_candidates = all_exprs.get("H", [])
-        if not h_candidates:
-            return 0.0
-
-        for expr in h_candidates:
-            has_p = bool(re.search(r"p[_²/(*+\-]|p\*\*|p\^|p_[a-z]|\bp\d|\bp\b", expr))
-            has_velocity = bool(re.search(
-                r"[ẋẏṙ]|\\dot|_VDOT_|\u0307|d[a-zθ]/dt|\\frac\{d[a-zθ]", expr
-            ))
-            if has_p and not has_velocity:
-                return 1.0
-            if has_p and has_velocity:
-                return 0.5
-
-        return 0.0
-    except Exception:
-        return 0.0
+    return _score_in_momentum_form(text, "H")
 
 
 def _score_V_correct(text: str, meta: dict) -> float:
@@ -698,54 +815,43 @@ def _score_V_correct(text: str, meta: dict) -> float:
     if not v_candidates:
         return 0.0
 
-    # Score best candidate
-    score = _best_match(v_candidates, expected_V)
+    # Score best candidate and track which one scored highest
+    score = 0.0
+    best_v_candidate = v_candidates[0]
+    for cand in v_candidates:
+        s = _score_expression(cand, expected_V, [], constant_subs=meta.get("_constant_subs"))
+        if s > score:
+            score = s
+            best_v_candidate = cand
+        if score >= 1.0:
+            break
     if score >= 0.9:
         return score
 
     # Fallback: model may write symbolic form (mgy, Fx, kx²) while ground truth
     # has constants evaluated (49*y/5, -3*x, 3*x**2). Try substituting known
     # constants from the problem into the student expression via sympy.
-    # Use the best-scoring candidate from section-agnostic extraction.
-    potential_str = v_candidates[0]  # Best candidate for detailed analysis
+    # Uses centralized _constant_subs (from _extract_constants_from_prompt) to avoid
+    # symbol assumption mismatches from duplicate extraction.
+    potential_str = best_v_candidate
     student_sym = _try_sympify(potential_str)
     teacher_sym = _try_sympify(expected_V)
-    if student_sym is not None and teacher_sym is not None:
-        # Build substitution dict from problem metadata
-        subs = {}
-        # Extract mass from prompt
-        prompt = meta.get("prompt", "")
-        m_match = re.search(r"mass\s*(?:m\s*)?=?\s*(\d+(?:\.\d+)?)", prompt)
-        if m_match:
-            subs[sp.Symbol("m", positive=True)] = sp.nsimplify(m_match.group(1))
-            subs[sp.Symbol("m")] = sp.nsimplify(m_match.group(1))
-        # Extract spring constant
-        k_match = re.search(r"(?:spring\s+)?constant\s*k?\s*=\s*(\d+(?:\.\d+)?)", prompt)
-        if k_match:
-            subs[sp.Symbol("k", positive=True)] = sp.nsimplify(k_match.group(1))
-            subs[sp.Symbol("k")] = sp.nsimplify(k_match.group(1))
-        # Extract force
-        f_match = re.search(r"force\s*(?:F\s*)?=?\s*(\d+(?:\.\d+)?)", prompt)
-        if f_match:
-            subs[sp.Symbol("F", positive=True)] = sp.nsimplify(f_match.group(1))
-            subs[sp.Symbol("F")] = sp.nsimplify(f_match.group(1))
-
-        if subs:
-            try:
-                student_eval = student_sym.subs(subs)
-                diff = sp.simplify(student_eval - teacher_sym)
-                if diff == 0:
+    subs = meta.get("_constant_subs", {})
+    if student_sym is not None and teacher_sym is not None and subs:
+        try:
+            student_eval = student_sym.subs(subs)
+            diff = sp.simplify(student_eval - teacher_sym)
+            if diff == 0:
+                return 1.0
+            free = (student_eval.free_symbols | teacher_sym.free_symbols) - {sp.Symbol("pi")}
+            if free:
+                test_point = {s: sp.Rational(3, 7) for s in free}
+                s_val = float(student_eval.subs(test_point))
+                t_val = float(teacher_sym.subs(test_point))
+                if abs(t_val) > 1e-10 and abs(s_val - t_val) < 1e-4 * max(abs(t_val), 1):
                     return 1.0
-                # Try numerical check after substitution
-                free = (student_eval.free_symbols | teacher_sym.free_symbols) - {sp.Symbol("pi")}
-                if free:
-                    test_point = {s: sp.Rational(3, 7) for s in free}
-                    s_val = float(student_eval.subs(test_point))
-                    t_val = float(teacher_sym.subs(test_point))
-                    if abs(t_val) > 1e-10 and abs(s_val - t_val) < 1e-4 * max(abs(t_val), 1):
-                        return 1.0
-            except Exception:
-                pass
+        except Exception as exc:
+            logger.debug("V_correct sympy substitution failed: %s", exc)
 
     return score
 
@@ -762,32 +868,30 @@ def _score_grounding(text: str, prompt: str) -> float:
     return found / len(specific_nums)
 
 
-def _score_dqdt(text: str, meta: dict) -> float:
-    """q_correct_dqdt: Hamilton's first equation matches ground truth.
+def _score_equation(text: str, meta: dict, meta_key: str, fallback_pattern: str) -> float:
+    """Score a Hamilton equation (dq/dt or dp/dt) against ground truth.
 
-    Section-agnostic: finds ALL 'dq/dt = expr' patterns anywhere in the text.
+    Section-agnostic: finds ALL derivative expressions anywhere in the text.
     """
-    expected = meta.get("dqdt", "")
+    expected = meta.get(meta_key, "")
     if not expected or expected == "none":
         return 0.0
 
     expected_parts = [e.strip() for e in expected.split(";")]
 
-    # Section-agnostic: find all derivative expressions
+    # Section-agnostic: find all derivative expressions + block extraction
     all_exprs = _find_all_expressions(text)
-    # Collect all dX/dt expressions (dq/dt, dx/dt, dy/dt, ds/dt, dtheta/dt)
     extracted = []
     for key, vals in all_exprs.items():
         if key.startswith("d") and "/dt" in key:
             extracted.extend(vals)
-    # Also try old block extraction as fallback
     block_extracted = _extract_equations_block(text)
     for e in block_extracted:
         if e not in extracted:
             extracted.append(e)
 
     if not extracted:
-        if re.search(r"dq/dt|∂H/∂p|dx/dt|dtheta/dt|dr/dt|ds/dt", text):
+        if re.search(fallback_pattern, text):
             return 0.2
         return 0.0
 
@@ -795,49 +899,19 @@ def _score_dqdt(text: str, meta: dict) -> float:
     for exp_part in expected_parts:
         best = 0.0
         for ext in extracted:
-            score = _score_expression(ext, exp_part, [])
+            score = _score_expression(ext, exp_part, [], constant_subs=meta.get("_constant_subs"))
             best = max(best, score)
         scores.append(best)
 
     return sum(scores) / len(scores) if scores else 0.0
+
+
+def _score_dqdt(text: str, meta: dict) -> float:
+    return _score_equation(text, meta, "dqdt", r"dq/dt|∂H/∂p|dx/dt|dtheta/dt|dr/dt|ds/dt")
 
 
 def _score_dpdt(text: str, meta: dict) -> float:
-    """q_correct_dpdt: Hamilton's second equation matches ground truth.
-
-    Section-agnostic: finds ALL equation patterns anywhere in the text.
-    """
-    expected = meta.get("dpdt", "")
-    if not expected or expected == "none":
-        return 0.0
-
-    expected_parts = [e.strip() for e in expected.split(";")]
-
-    # Section-agnostic + block extraction
-    all_exprs = _find_all_expressions(text)
-    extracted = []
-    for key, vals in all_exprs.items():
-        if key.startswith("d") and "/dt" in key:
-            extracted.extend(vals)
-    block_extracted = _extract_equations_block(text)
-    for e in block_extracted:
-        if e not in extracted:
-            extracted.append(e)
-
-    if not extracted:
-        if re.search(r"dp/dt|-∂H/∂q|-dH/dq|dp_r/dt|dp_theta/dt", text):
-            return 0.2
-        return 0.0
-
-    scores = []
-    for exp_part in expected_parts:
-        best = 0.0
-        for ext in extracted:
-            score = _score_expression(ext, exp_part, [])
-            best = max(best, score)
-        scores.append(best)
-
-    return sum(scores) / len(scores) if scores else 0.0
+    return _score_equation(text, meta, "dpdt", r"dp/dt|-∂H/∂q|-dH/dq|dp_r/dt|dp_theta/dt")
 
 
 def _score_correct_H(text: str, meta: dict) -> float:
@@ -859,16 +933,34 @@ def _score_correct_H(text: str, meta: dict) -> float:
     if extracted_H and extracted_H not in h_candidates:
         h_candidates.append(extracted_H)
 
+    # Split chained equalities: "T + V = p²/2 + 0 = p²/2" → also try "p²/2" (last RHS)
+    expanded = []
+    for cand in h_candidates:
+        expanded.append(cand)
+        if "=" in cand:
+            last_rhs = cand.rsplit("=", 1)[-1].strip()
+            if last_rhs and last_rhs not in expanded:
+                expanded.append(last_rhs)
+    h_candidates = expanded
+
     if not h_candidates:
         return 0.0
 
-    # Score best candidate
-    best = _best_match(h_candidates, expected_H)
+    # Score best candidate and track which one it was
+    best = 0.0
+    best_candidate = h_candidates[0]
+    for cand in h_candidates:
+        score = _score_expression(cand, expected_H, [], constant_subs=meta.get("_constant_subs"))
+        if score > best:
+            best = score
+            best_candidate = cand
+        if best >= 1.0:
+            break
     if best >= 0.7:
         return best
 
-    # Use the first candidate for detailed analysis below
-    extracted_H = h_candidates[0]
+    # Use the BEST candidate (not first) for detailed analysis below
+    extracted_H = best_candidate
 
     # Check if model evaluated to a number instead of keeping symbolic
     normed = _normalize_for_sympy(extracted_H)
@@ -877,13 +969,14 @@ def _score_correct_H(text: str, meta: dict) -> float:
         return 0.1  # Distinct signal: "you plugged in numbers, keep it symbolic"
 
     # Try direct match first
-    direct_score = _score_expression(extracted_H, expected_H, [])
+    direct_score = _score_expression(extracted_H, expected_H, [], constant_subs=meta.get("_constant_subs"))
     if direct_score >= 0.7:
         return direct_score
 
-    # Check if it's velocity form of the correct H — substitute _VDOT_ → p/m
-    # If H has _VDOT_ terms, try replacing with p to see if structure matches
-    if "_VDOT_" in normed:
+    # Check if it's velocity form of the correct H — contains derivatives or _VDOT_
+    # latex2sympy produces Derivative objects, _normalize_for_sympy produces _VDOT_ markers
+    has_velocity = "_VDOT_" in normed or (parsed is not None and parsed.atoms(sp.Derivative))
+    if has_velocity:
         # The model wrote the right structure but in velocity form
         # Give partial credit: 0.5 for correct structure, wrong variables
         # Try to check if V term (non-velocity part) is correct
@@ -917,17 +1010,22 @@ def _score_consistency(text: str, meta: dict) -> float:
         return 0.2
 
     coords = meta.get("coordinates", "x")
-    coord_list = [c.strip() for c in coords.split(",")]
+    coord_list = [c.strip() for c in coords.split(",") if c.strip()]
 
     extracted_eqs = _extract_equations_block(text)
     if not extracted_eqs:
         return 0.3
 
+    # Find the actual momentum symbols used in H (don't guess from coordinate names)
+    h_sym_names = {s.name for s in H_sym.free_symbols}
+
     consistency_scores = []
     for coord in coord_list:
-        p_name = f"p_{coord}" if coord not in ("x", "y", "s", "q") else "p"
-        if coord in ("x1", "x2"):
-            p_name = coord.replace("x", "p")
+        # Try candidate momentum names in priority order
+        candidates = [f"p_{coord}", "p", coord.replace("x", "p") if coord.startswith("x") else None,
+                      f"p{coord[-1]}" if coord[-1].isdigit() else None]
+        candidates = [c for c in candidates if c is not None]
+        p_name = next((c for c in candidates if c in h_sym_names), candidates[0])
 
         p_sym = _SYMPY_LOCALS.get(p_name) or sp.Symbol(p_name)
         q_sym = _SYMPY_LOCALS.get(coord) or sp.Symbol(coord)
@@ -986,7 +1084,7 @@ def _score_correct_coefficient(text: str, meta: dict) -> float:
             extracted_H = _extract_H(text)
             if extracted_H is not None:
                 any_extracted = True
-                h_score = _score_expression(extracted_H, meta["H_expr"], [])
+                h_score = _score_expression(extracted_H, meta["H_expr"], [], constant_subs=meta.get("_constant_subs"))
                 component_scores.append(h_score)
 
         # ── Score equations ──────────────────────────────────────────────────
@@ -998,12 +1096,13 @@ def _score_correct_coefficient(text: str, meta: dict) -> float:
             if extracted_eqs:
                 any_extracted = True
 
+                csubs = meta.get("_constant_subs")
                 if has_dqdt:
                     expected_parts = [e.strip() for e in meta["dqdt"].split(";") if e.strip()]
                     part_scores = []
                     for exp_part in expected_parts:
                         best = max(
-                            (_score_expression(ext, exp_part, []) for ext in extracted_eqs),
+                            (_score_expression(ext, exp_part, [], constant_subs=csubs) for ext in extracted_eqs),
                             default=0.0,
                         )
                         part_scores.append(best)
@@ -1015,7 +1114,7 @@ def _score_correct_coefficient(text: str, meta: dict) -> float:
                     part_scores = []
                     for exp_part in expected_parts:
                         best = max(
-                            (_score_expression(ext, exp_part, []) for ext in extracted_eqs),
+                            (_score_expression(ext, exp_part, [], constant_subs=csubs) for ext in extracted_eqs),
                             default=0.0,
                         )
                         part_scores.append(best)
@@ -1050,7 +1149,8 @@ def _score_correct_coefficient(text: str, meta: dict) -> float:
         if avg >= 0.35:
             return 0.4
         return max(0.2, avg)
-    except Exception:
+    except Exception as exc:
+        logger.debug("_score_correct_coefficient failed: %s", exc)
         return 0.0
 
 
@@ -1088,7 +1188,7 @@ def _score_derivative_correct(text: str, meta: dict) -> float:
 
         for exp_part in expected_parts:
             for ext in extracted:
-                score = _score_expression(ext, exp_part, [])
+                score = _score_expression(ext, exp_part, [], constant_subs=meta.get("_constant_subs"))
                 if score > best_score:
                     best_score = score
                     best_student_str = ext
@@ -1126,7 +1226,8 @@ def _score_derivative_correct(text: str, meta: dict) -> float:
         # dp/dt found in extracted equations but matched nothing
         return 0.2
 
-    except Exception:
+    except Exception as exc:
+        logger.debug("_score_derivative_correct failed: %s", exc)
         return 0.0
 
 
@@ -1184,6 +1285,75 @@ def _score_defines_momentum(text: str) -> float:
     return 0.0
 
 
+# ─── Span finder (runs on RAW text, positions valid for char→token mapping) ───
+
+def _find_expression_spans(text: str) -> dict[str, list[tuple[int, int]]]:
+    """Find character spans of scored expression patterns in RAW completion text.
+
+    Runs on the ORIGINAL text with NO cleaning so character offsets are valid
+    for the char→token mapping in qgre/spans.py. This is intentionally separate
+    from the scoring extractors which clean text before matching.
+
+    Returns quality_name → [(char_start, char_end), ...].
+    """
+    spans: dict[str, list[tuple[int, int]]] = {}
+
+    # H = expr (Hamiltonian)
+    spans["q_correct_H"] = [
+        (m.start(), m.end())
+        for m in re.finditer(r'H\s*=\s*[^\n]{3,}', text)
+    ]
+
+    # V = expr (potential energy)
+    spans["q_V_correct"] = [
+        (m.start(), m.end())
+        for m in re.finditer(r'V\s*=\s*[^\n]{3,}', text)
+    ]
+
+    # T = expr (kinetic energy)
+    t_spans = [
+        (m.start(), m.end())
+        for m in re.finditer(r'T\s*=\s*[^\n]{3,}', text)
+    ]
+    spans["q_T_uses_p"] = t_spans
+    spans["q_T_in_momentum"] = t_spans  # Same spans, different quality
+
+    # H also scored by momentum form quality
+    spans["q_H_in_momentum"] = spans["q_correct_H"]
+
+    # Equation expressions: dq/dt = ..., dp/dt = ..., \frac{dX}{dt} = ...
+    eq_spans = [
+        (m.start(), m.end())
+        for m in re.finditer(r'd[a-z_]+/dt\s*=\s*[^\n]{2,}', text)
+    ]
+    eq_spans += [
+        (m.start(), m.end())
+        for m in re.finditer(r'\\frac\{d[a-z_\\]+\}\{dt\}\s*=\s*[^\n]{2,}', text)
+    ]
+    spans["q_correct_dqdt"] = eq_spans
+    spans["q_correct_dpdt"] = eq_spans
+    spans["q_consistency"] = eq_spans + spans["q_correct_H"]  # Equations + H
+    spans["q_correct_coefficient"] = eq_spans + spans["q_correct_H"]
+    spans["q_derivative_correct"] = eq_spans
+
+    # Momentum definition: p = expr
+    spans["q_momentum_defined"] = [
+        (m.start(), m.end())
+        for m in re.finditer(r'p\s*=\s*[^\n]{3,}', text)
+    ]
+    spans["q_defines_momentum"] = spans["q_momentum_defined"]
+
+    # Format qualities: entire completion (all tokens get format signal)
+    full = [(0, len(text))] if text else []
+    spans["q_format"] = full
+    spans["q_has_math"] = full
+
+    # Grounding: entire completion (checks numerical values throughout)
+    spans["q_grounding"] = full
+
+    return spans
+
+
 # ─── Main reward function ─────────────────────────────────────────────────────
 
 def hamiltonian_reward(
@@ -1199,9 +1369,14 @@ def hamiltonian_reward(
     Phase 4: q_correct_H, q_consistency — full Hamiltonian + internal consistency
     """
     meta = dict(metadata) if metadata else {}  # Shallow copy — don't mutate shared dataloader dict
-    meta["prompt"] = prompt  # Make prompt available to scoring functions (e.g., V_correct constant substitution)
+    meta["prompt"] = prompt  # Make prompt available to scoring functions
+    # Extract physical constants from prompt once — shared by all scorers
+    meta["_constant_subs"] = _extract_constants_from_prompt(prompt)
     text = completion
     scores: dict[str, float] = {}
+
+    # Find expression spans on RAW text (before any scoring/cleaning)
+    expression_spans = _find_expression_spans(text)
 
     # ── Phase 1: Format ──
     scores["q_format"] = _score_format(text)
@@ -1244,4 +1419,4 @@ def hamiltonian_reward(
     except Exception:
         pass
 
-    return RewardResult(reward=total, scores=scores)
+    return RewardResult(reward=total, scores=scores, scored_spans=expression_spans)
