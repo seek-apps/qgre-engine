@@ -589,9 +589,13 @@ class QGRETrainer:
                     )
 
                     if used_critic:
-                        # Replace pre-computed advantages with VPRM advantages
-                        adv_len = min(vprm_advs.shape[0], mb_advs.shape[1])
-                        mb_advs[mb_i, :adv_len] = vprm_advs[:adv_len]
+                        # When spans are active, DON'T overwrite span advantages —
+                        # spans provide better token targeting. Only collect critic loss
+                        # (critic still learns the baseline for future use).
+                        # When spans are NOT active, replace SPO advantages with VPRM.
+                        if not use_spans:
+                            adv_len = min(vprm_advs.shape[0], mb_advs.shape[1])
+                            mb_advs[mb_i, :adv_len] = vprm_advs[:adv_len]
                         mb_critic_loss = mb_critic_loss + vprm_loss
                         mb_critic_count += 1
 
