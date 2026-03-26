@@ -35,8 +35,8 @@ data:
   initial_tiers: [tier1, edge]
 
 generation:
-  temperature: 0.8
-  top_p: 1.0
+  temperature: 1.0
+  top_p: 0.85
   top_k: -1
   max_tokens: 4096
   stop_token_ids: [151643, 151645]
