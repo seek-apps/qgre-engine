@@ -155,6 +155,10 @@ class QGREStepAdvantageEstimator:
         self._step_nums = sorted(self.step_qualities.keys())
         self.V: dict[int, dict[int, float]] = defaultdict(lambda: defaultdict(float))
         self._step_seen: dict[int, set[int]] = defaultdict(set)
+        # Target-aware aspiration gap
+        self._aspiration_beta = 0.0  # Set from config via trainer
+        self._aspiration_target = 0.0
+
         # Variance-aware baseline: track per-(prompt, step) reward variance
         self._var_aware = var_aware
         self._var_threshold = var_threshold
@@ -328,6 +332,12 @@ class QGREStepAdvantageEstimator:
                     self._step_seen[pid].add(step_num)
 
                 step_advs[step_num][i] = r - v
+
+                # Target-aware aspiration gap: preserve directional signal from shaped rewards.
+                # Without this, the baseline eats the partial credit gradient (0.4 - 0.4 = 0).
+                # With this, sub-target completions get proportional negative push toward target.
+                if self._aspiration_beta > 0 and self._aspiration_target > 0:
+                    step_advs[step_num][i] += self._aspiration_beta * (r - self._aspiration_target)
 
                 # Variance-aware baseline: slow lr when reward is constant
                 effective_lr = self.lr

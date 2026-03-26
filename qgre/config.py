@@ -60,6 +60,10 @@ class SPOConfig:
     lr_factor: float = 1.5
     min_lr: float = 0.01
     max_lr: float = 0.5
+    # Target-aware aspiration gap: A += beta * (reward - target). Preserves shaped reward gradients
+    # even when baseline matches the constant partial credit. beta=0 disables.
+    aspiration_beta: float = 0.5
+    aspiration_target: float = 0.8  # Usually mastery_threshold
     # Variance-aware baseline: slow baseline lr when reward variance drops (prevents dead gradient)
     var_aware: bool = True
     var_threshold: float = 0.01  # Variance below this triggers slowdown

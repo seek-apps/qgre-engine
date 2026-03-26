@@ -119,6 +119,8 @@ class QGRETrainer:
                 segmenter = getattr(importlib.import_module(mod_path), fn_name)
 
         spo_cfg = alg.spo
+        # Target-aware aspiration gap uses mastery threshold as default target
+        aspiration_target = spo_cfg.aspiration_target if spo_cfg.aspiration_target > 0 else config.training.mastery_threshold
         self.advantage_estimator = QGREStepAdvantageEstimator(
             lr=spo_lr, mode=mode,
             step_qualities=sq,
@@ -132,6 +134,8 @@ class QGRETrainer:
             var_lr=spo_cfg.var_lr,
             min_var_ratio=spo_cfg.min_var_ratio,
         )
+        self.advantage_estimator._aspiration_beta = spo_cfg.aspiration_beta
+        self.advantage_estimator._aspiration_target = aspiration_target
 
         # VPRM critic — per-region per-dimension learned baseline
         self.vprm_critic = None
