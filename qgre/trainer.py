@@ -996,20 +996,22 @@ class QGRETrainer:
                     )
                     if current_rate > 0:
                         restore_lora = apply_lora_dropout(self.model, current_rate)
-                        # Sync noisy weights to vLLM
-                        if hasattr(backend, "save_weights"):
-                            backend.save_weights(str(Path(self.config.logging.checkpoint_dir) / "lora_latest"))
+                        # Sync noisy weights to vLLM (save AND load — save alone doesn't push to engine)
+                        lora_path = str(Path(self.config.logging.checkpoint_dir) / "lora_latest")
+                        if hasattr(backend, "save_weights") and hasattr(backend, "load_weights"):
+                            backend.save_weights(lora_path)
+                            backend.load_weights(lora_path)
 
-                output = backend.generate(
-                    batch.input_ids.to(next(self.model.parameters()).device),
-                    batch.attention_mask.to(next(self.model.parameters()).device),
-                )
-
-                # Restore clean weights after generation
-                if restore_lora is not None:
-                    restore_lora()
-                    if hasattr(backend, "save_weights"):
-                        backend.save_weights(str(Path(self.config.logging.checkpoint_dir) / "lora_latest"))
+                try:
+                    output = backend.generate(
+                        batch.input_ids.to(next(self.model.parameters()).device),
+                        batch.attention_mask.to(next(self.model.parameters()).device),
+                    )
+                finally:
+                    # Always restore clean weights — even if generate crashes
+                    # Don't sync to vLLM here — step-end sync (after training) handles it
+                    if restore_lora is not None:
+                        restore_lora()
 
                 # 2. Score via reward_fn
                 reward_results = []

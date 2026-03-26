@@ -44,17 +44,30 @@ def apply_lora_dropout(model: nn.Module, dropout_rate: float) -> Callable[[], No
             mask = torch.bernoulli(
                 torch.ones_like(param.data) * (1.0 - dropout_rate)
             )
-            # Scale by 1/(1-p) to maintain expected magnitude (inverted dropout)
-            param.data.mul_(mask / (1.0 - dropout_rate))
+            # NO inverted dropout scaling — we WANT to suppress LoRA magnitude.
+            # Expected activation = (1-p) * original. This partially reverts to
+            # base model behavior, surfacing knowledge LoRA learned to suppress.
+            param.data.mul_(mask)
+
+    if not saved and dropout_rate > 0:
+        import warnings
+        warnings.warn(
+            f"LoRA dropout rate {dropout_rate} requested but no lora_A parameters found. "
+            f"Check that the model has PEFT/LoRA adapters loaded."
+        )
 
     def restore():
+        # Use named_parameters() for robust parameter lookup (safe under Unsloth patching)
+        param_dict = dict(model.named_parameters())
         for name, original in saved.items():
-            # Walk the model to find the parameter by name
-            parts = name.split(".")
-            obj = model
-            for part in parts[:-1]:
-                obj = getattr(obj, part)
-            getattr(obj, parts[-1]).data.copy_(original)
+            if name in param_dict:
+                assert param_dict[name].shape == original.shape, f"Shape mismatch restoring {name}"
+                param_dict[name].data.copy_(original)
+            else:
+                raise RuntimeError(
+                    f"LoRA dropout restore failed: parameter '{name}' no longer exists. "
+                    f"Model structure changed between apply and restore."
+                )
 
     return restore
 
