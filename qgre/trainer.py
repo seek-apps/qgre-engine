@@ -118,6 +118,7 @@ class QGRETrainer:
                 mod_path, fn_name = alg.segmenter.rsplit(":", 1)
                 segmenter = getattr(importlib.import_module(mod_path), fn_name)
 
+        spo_cfg = alg.spo
         self.advantage_estimator = QGREStepAdvantageEstimator(
             lr=spo_lr, mode=mode,
             step_qualities=sq,
@@ -126,13 +127,11 @@ class QGRETrainer:
             filter_groups=alg.grpo.filter_groups,
             step_region_map=alg.step_region_map,
             frontier_amplification=alg.frontier_amplification,
+            var_aware=spo_cfg.var_aware,
+            var_threshold=spo_cfg.var_threshold,
+            var_lr=spo_cfg.var_lr,
+            min_var_ratio=spo_cfg.min_var_ratio,
         )
-        # Wire variance-aware SPO config
-        spo_cfg = alg.spo
-        self.advantage_estimator._var_aware = spo_cfg.var_aware
-        self.advantage_estimator._var_threshold = spo_cfg.var_threshold
-        self.advantage_estimator._var_lr = spo_cfg.var_lr
-        self.advantage_estimator._min_var_ratio = spo_cfg.min_var_ratio
 
         # VPRM critic — per-region per-dimension learned baseline
         self.vprm_critic = None

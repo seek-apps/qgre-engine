@@ -15,7 +15,8 @@ preserved to maintain output space structure and formatting.
 
 from __future__ import annotations
 
-from typing import Any, Callable
+import warnings
+from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -35,12 +36,12 @@ def apply_lora_dropout(model: nn.Module, dropout_rate: float) -> Callable[[], No
     if dropout_rate <= 0.0:
         return lambda: None  # No-op
 
-    saved: dict[str, torch.Tensor] = {}
+    saved: list[tuple[torch.nn.Parameter, torch.Tensor]] = []
 
     for name, param in model.named_parameters():
         # Match LoRA A matrices (input projection) — not B (output projection)
         if "lora_A" in name and param.requires_grad:
-            saved[name] = param.data.clone()
+            saved.append((param, param.data.clone()))
             mask = torch.bernoulli(
                 torch.ones_like(param.data) * (1.0 - dropout_rate)
             )
@@ -50,24 +51,14 @@ def apply_lora_dropout(model: nn.Module, dropout_rate: float) -> Callable[[], No
             param.data.mul_(mask)
 
     if not saved and dropout_rate > 0:
-        import warnings
         warnings.warn(
             f"LoRA dropout rate {dropout_rate} requested but no lora_A parameters found. "
             f"Check that the model has PEFT/LoRA adapters loaded."
         )
 
     def restore():
-        # Use named_parameters() for robust parameter lookup (safe under Unsloth patching)
-        param_dict = dict(model.named_parameters())
-        for name, original in saved.items():
-            if name in param_dict:
-                assert param_dict[name].shape == original.shape, f"Shape mismatch restoring {name}"
-                param_dict[name].data.copy_(original)
-            else:
-                raise RuntimeError(
-                    f"LoRA dropout restore failed: parameter '{name}' no longer exists. "
-                    f"Model structure changed between apply and restore."
-                )
+        for param, original in saved:
+            param.data.copy_(original)
 
     return restore
 

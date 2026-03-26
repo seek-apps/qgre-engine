@@ -133,6 +133,10 @@ class QGREStepAdvantageEstimator:
         filter_groups: bool = True,
         step_region_map: dict[int, int] | None = None,
         frontier_amplification: float = 2.0,
+        var_aware: bool = True,
+        var_threshold: float = 0.01,
+        var_lr: float = 0.05,
+        min_var_ratio: float = 0.01,
     ):
         self.lr = lr
         self.mode = mode
@@ -152,11 +156,10 @@ class QGREStepAdvantageEstimator:
         self.V: dict[int, dict[int, float]] = defaultdict(lambda: defaultdict(float))
         self._step_seen: dict[int, set[int]] = defaultdict(set)
         # Variance-aware baseline: track per-(prompt, step) reward variance
-        # Assign thresholds BEFORE defaultdict lambda that references them
-        self._var_aware = True  # Overridden from config in trainer
-        self._var_threshold = 0.01
-        self._var_lr = 0.05
-        self._min_var_ratio = 0.01
+        self._var_aware = var_aware
+        self._var_threshold = var_threshold
+        self._var_lr = var_lr
+        self._min_var_ratio = min_var_ratio
         self._reward_var: dict[int, dict[int, float]] = defaultdict(lambda: defaultdict(lambda: self._var_threshold))
         self._reward_mean: dict[int, dict[int, float]] = defaultdict(lambda: defaultdict(float))
         # step_region_map: virtual steps (no segmenter region) → region step whose tokens carry their advantage
