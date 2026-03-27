@@ -38,7 +38,7 @@ generation:
   temperature: 1.0
   top_p: 1.0
   lora_dropout_rate: 0.15
-  lora_dropout_anneal_steps: 1500
+  lora_dropout_anneal_steps: 2000
   top_k: -1
   max_tokens: 4096
   stop_token_ids: [151643, 151645]

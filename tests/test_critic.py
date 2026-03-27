@@ -76,8 +76,9 @@ class TestCriticConstruction:
         n_params = sum(p.numel() for p in critic.parameters())
         n_qualities = len(critic.quality_names)
         # Each MLP: hidden_dim*128 + 128 + 128*128 + 128 + 128*1 + 1
+        # x2 for online + target heads
         expected_per_mlp = HIDDEN_DIM * 128 + 128 + 128 * 128 + 128 + 128 + 1
-        assert abs(n_params - n_qualities * expected_per_mlp) < 10
+        assert abs(n_params - n_qualities * expected_per_mlp * 2) < 10
 
 
 # --- Forward pass tests ---

@@ -709,6 +709,12 @@ class QGRETrainer:
                 if has_grad:
                     torch.nn.utils.clip_grad_norm_(self.vprm_critic.parameters(), max_norm=self.config.training.max_grad_norm)
                     self.vprm_optimizer.step()
+                    # Polyak-average target network (or hard-sync during warmup)
+                    if self._vprm_config.use_target_network:
+                        if self.global_step < self._vprm_config.target_warmup_steps and self.global_step % 100 == 0:
+                            self.vprm_critic.sync_target_to_online()
+                        elif self.global_step >= self._vprm_config.target_warmup_steps:
+                            self.vprm_critic.update_target_network(tau=self._vprm_config.polyak_tau)
                 self.vprm_optimizer.zero_grad()
             if self.scheduler is not None:
                 self.scheduler.step()

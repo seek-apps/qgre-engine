@@ -72,10 +72,18 @@ class VPRMCritic(nn.Module):
 
         self.quality_names = all_qualities
 
-        # One MLP per quality
+        # One MLP per quality (online heads — learn fast via MSE)
         self.heads = nn.ModuleDict({
             q: QualityMLP(hidden_dim, intermediate_dim) for q in all_qualities
         })
+
+        # Target heads — slow-moving copy for stable advantage predictions (Polyak averaged)
+        import copy
+        self.target_heads = nn.ModuleDict({
+            q: copy.deepcopy(self.heads[q]) for q in all_qualities
+        })
+        for param in self.target_heads.parameters():
+            param.requires_grad = False
 
         # Map quality → step_num (for region assignment)
         self._quality_to_step: dict[str, int] = {}
@@ -83,16 +91,32 @@ class VPRMCritic(nn.Module):
             for q in qualities:
                 self._quality_to_step[q] = step_num
 
+    @torch.no_grad()
+    def update_target_network(self, tau: float = 0.01):
+        """Polyak averaging: θ_target ← (1-τ)θ_target + τ*θ_online."""
+        for q_name in self.quality_names:
+            for op, tp in zip(self.heads[q_name].parameters(), self.target_heads[q_name].parameters()):
+                tp.data.mul_(1.0 - tau).add_(op.data, alpha=tau)
+
+    @torch.no_grad()
+    def sync_target_to_online(self):
+        """Hard copy online → target. Used during warmup."""
+        for q_name in self.quality_names:
+            for op, tp in zip(self.heads[q_name].parameters(), self.target_heads[q_name].parameters()):
+                tp.data.copy_(op.data)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         regions: list[str],
+        use_target: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Predict baselines for each quality from region-pooled hidden states.
 
         Args:
             hidden_states: [seq_len, hidden_dim] — DETACHED from training graph
             regions: [seq_len] — region label per token (from segmenter)
+            use_target: if True, use slow-moving target heads for stable predictions
 
         Returns:
             dict mapping quality_name → predicted baseline (scalar tensor)
@@ -115,13 +139,14 @@ class VPRMCritic(nn.Module):
                 region_pools[f"STEP_{step_id}"] = pooled
 
         # Predict baseline for each quality using its region's pooled states
+        heads = self.target_heads if use_target else self.heads
         predictions: dict[str, torch.Tensor] = {}
         for q_name in self.quality_names:
             step_num = self._quality_to_step[q_name]
             region_key = f"STEP_{step_num}"
             if region_key in region_pools:
                 pooled = region_pools[region_key].unsqueeze(0)  # [1, hidden_dim]
-                predictions[q_name] = self.heads[q_name](pooled).squeeze(0).squeeze(0)
+                predictions[q_name] = heads[q_name](pooled).squeeze(0).squeeze(0)
             else:
                 # Region not found — return zero baseline (SPO fallback handles this)
                 predictions[q_name] = torch.tensor(0.0, device=hidden_states.device)
@@ -146,14 +171,17 @@ class VPRMCritic(nn.Module):
             - advantages: quality_name → clipped advantage (float)
             - critic_losses: quality_name → MSE loss tensor (for backward)
         """
-        predictions = self.forward(hidden_states, regions)
+        # Target predictions for stable advantages, online predictions for MSE loss
+        target_preds = self.forward(hidden_states, regions, use_target=True)
+        online_preds = self.forward(hidden_states, regions, use_target=False)
 
         advantages: dict[str, float] = {}
         critic_losses: dict[str, torch.Tensor] = {}
 
         for q_name in self.quality_names:
             actual = actual_rewards.get(q_name, 0.0)
-            predicted = predictions.get(q_name)
+            predicted = target_preds.get(q_name)  # Stable baseline from target
+            online_pred = online_preds.get(q_name)  # For MSE loss
 
             if predicted is None:
                 advantages[q_name] = 0.0
@@ -163,12 +191,10 @@ class VPRMCritic(nn.Module):
             adv = max(-self.clip_advantage, min(self.clip_advantage, adv))
             advantages[q_name] = adv
 
-            # Only compute critic loss when prediction came from MLP (has grad_fn).
-            # Zero-baseline predictions for missing regions have no grad_fn
-            # and would inflate the loss metric without producing gradients.
-            if predicted.requires_grad:
-                target = torch.tensor(actual, device=predicted.device, dtype=predicted.dtype)
-                critic_losses[q_name] = (predicted - target) ** 2
+            # MSE loss from ONLINE predictions (not target) — online learns fast
+            if online_pred is not None and online_pred.requires_grad:
+                reward_target = torch.tensor(actual, device=online_pred.device, dtype=online_pred.dtype)
+                critic_losses[q_name] = (online_pred - reward_target) ** 2
 
         return advantages, critic_losses
 
@@ -223,11 +249,15 @@ class VPRMCritic(nn.Module):
 
     @classmethod
     def from_checkpoint(cls, checkpoint: dict, device: str = "cpu") -> VPRMCritic:
-        """Restore critic from checkpoint."""
+        """Restore critic from checkpoint. Handles old checkpoints without target_heads."""
         critic = cls(
             hidden_dim=checkpoint["hidden_dim"],
             step_qualities=checkpoint["step_qualities"],
         )
-        critic.load_state_dict(checkpoint["model_state"])
+        # Load with strict=False to handle old checkpoints without target_heads
+        critic.load_state_dict(checkpoint["model_state"], strict=False)
+        # If target_heads weren't in checkpoint, sync from online heads
+        if not any(k.startswith("target_heads.") for k in checkpoint["model_state"]):
+            critic.sync_target_to_online()
         critic.to(device)
         return critic

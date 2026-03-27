@@ -97,6 +97,9 @@ class VPRMConfig:
     lr: float = 1e-4  # Critic learning rate (separate from policy lr)
     clip_advantage: float = 5.0  # Per-quality advantage clipping bound
     spo_fallback_min_regions: int = 2  # Min distinct regions to use critic (else SPO fallback)
+    polyak_tau: float = 0.01  # Polyak averaging rate for target network
+    use_target_network: bool = True  # Stable baselines via slow-moving target
+    target_warmup_steps: int = 500  # Hard-sync target every 100 steps during warmup
 
 
 @dataclass
