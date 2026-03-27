@@ -974,16 +974,21 @@ class QGRETrainer:
                     prompt_tier_map={pid: new_phase for pid in tier_pids},
                 )
 
-        # Check tier unlock
+        # Check tier unlock — tutorial gates tier advancement
         if self._tier_order:
             new_tier = self.game_state.check_tier_unlock(
                 self._tier_order, self._tier_advance_phase, self._tier_advance_threshold,
             )
             if new_tier:
-                metrics["tier_unlocked"] = new_tier
-                import warnings
-                warnings.warn(f"Step {self.global_step}: tier '{new_tier}' unlocked")
-                self._apply_difficulty_gate()
+                if self.game_state.can_tier_unlock(new_tier):
+                    metrics["tier_unlocked"] = new_tier
+                    import warnings
+                    warnings.warn(f"Step {self.global_step}: tier '{new_tier}' unlocked")
+                    self._apply_difficulty_gate()
+                else:
+                    # Tutorial says no — roll back the unlock
+                    self.game_state.active_tiers.remove(new_tier)
+                    del self.game_state.tier_phases[new_tier]
 
         # Tutorial skill tree: record per-skill mastery score
         if self.game_state.tutorial_enabled:
@@ -1100,6 +1105,7 @@ class QGRETrainer:
             self.game_state.init_tutorial(
                 self.config.tutorial, all_prompt_ids,
                 dataloader_items=dataloader.items,
+                difficulty_column=self._difficulty_column,
             )
 
         self.setup_optimizer()

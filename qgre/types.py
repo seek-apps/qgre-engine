@@ -164,6 +164,7 @@ class GameState:
     untracked_always_active: bool = True
     default_aspiration_target: float = 0.8
     _prompt_to_skill: dict = field(default_factory=dict, repr=False)
+    _tier_to_skills: dict = field(default_factory=dict, repr=False)  # tier_name → [skill_keys]
     _active_base_pool: list = field(default_factory=list, repr=False)
     _mastered_pool: list = field(default_factory=list, repr=False)
     _active_prompts_dirty: bool = field(default=True, repr=False)
@@ -184,7 +185,8 @@ class GameState:
     # ── Tutorial skill tree ──
 
     def init_tutorial(self, tutorial_config, all_prompt_ids: list[str] | None = None,
-                      dataloader_items: list[dict] | None = None):
+                      dataloader_items: list[dict] | None = None,
+                      difficulty_column: str | None = None):
         """Initialize skill tree from TutorialConfig. Call after construction.
 
         Args:
@@ -192,6 +194,7 @@ class GameState:
             all_prompt_ids: List of all prompt IDs (as strings) in the dataset.
             dataloader_items: Raw dataloader items for metadata-based prompt matching.
                 Each item has 'prompt_id' (int) and 'metadata' (dict).
+            difficulty_column: Metadata column for tier mapping (e.g. "difficulty").
         """
         from qgre.config import TutorialConfig
         if not isinstance(tutorial_config, TutorialConfig) or not tutorial_config.enabled:
@@ -259,6 +262,20 @@ class GameState:
         for key, node in self.skill_tree.items():
             for prompt_id in node.prompts:
                 self._prompt_to_skill[prompt_id] = key
+
+        # Build tier → skills mapping (which skills have prompts in which tiers)
+        self._tier_to_skills = {}
+        if dataloader_items and difficulty_column:
+            for item in dataloader_items:
+                pid_str = str(item["prompt_id"])
+                tier = item.get("metadata", {}).get(difficulty_column, "default")
+                skill_key = self._prompt_to_skill.get(pid_str)
+                if skill_key is not None:
+                    self._tier_to_skills.setdefault(tier, set()).add(skill_key)
+            # Convert sets to lists for serialization
+            self._tier_to_skills = {k: list(v) for k, v in self._tier_to_skills.items()}
+            logger.info(f"[TUTORIAL] Tier→skill mapping: {self._tier_to_skills}")
+
         self._active_prompts_dirty = True
 
         # Validate
@@ -516,6 +533,26 @@ class GameState:
                 is_active=is_active,
             ))
         return contexts
+
+    def can_tier_unlock(self, tier_name: str) -> bool:
+        """Check if tutorial prerequisites allow this tier to unlock.
+
+        A tier can unlock only if all tutorial skills that have prompts in it
+        are at least ACTIVE (not LOCKED). This prevents gravity_spring prompts
+        from entering training before freefall and spring_only are mastered.
+
+        Uses _tier_to_skills mapping built during init_tutorial.
+        """
+        if not self.tutorial_enabled:
+            return True
+        skills_in_tier = self._tier_to_skills.get(tier_name, [])
+        if not skills_in_tier:
+            return True  # No tutorial-tracked prompts in this tier
+        for skill_key in skills_in_tier:
+            node = self.skill_tree[skill_key]
+            if node.status == SkillStatus.LOCKED:
+                return False
+        return True
 
     def get_aspiration_target(self, prompt_id: str) -> float:
         """Return the mastery_threshold for the skill this prompt belongs to."""
