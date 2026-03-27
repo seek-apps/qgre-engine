@@ -483,10 +483,14 @@ class GameState:
             else:
                 asp_target = self.default_aspiration_target
 
-            # Active: must pass tier gate AND skill gate
-            tier_active = active_tiers is None or tier in active_tiers
-            skill_active = active_prompt_set is None or pid_str in active_prompt_set
-            is_active = tier_active and skill_active
+            # Active: tutorial-tracked prompts in active skills bypass tier gate.
+            # Untracked prompts respect tier gate. Locked skill prompts are always inactive.
+            if skill_key is not None and active_prompt_set is not None:
+                # Tutorial-tracked: skill gate is the authority
+                is_active = pid_str in active_prompt_set
+            else:
+                # Untracked: tier gate decides
+                is_active = active_tiers is None or tier in active_tiers
 
             contexts.append(PromptContext(
                 prompt_id=pid,

@@ -788,43 +788,44 @@ class TestIntegration:
         assert advs[0].abs().sum().item() > 0
 
     def test_tutorial_with_phase_gating(self):
-        """Both phase gate AND skill unlock must pass for a prompt to be sampled."""
+        """Tutorial-tracked prompts bypass tier gate. Untracked prompts respect tier gate."""
         gs = make_game_state()
         gs.default_aspiration_target = 0.8
 
-        # Use prompt IDs that ARE in the skill tree (active skill) or all_prompts (untracked)
-        # "ff_1" is in freefall (active root skill) — should be in active prompt set
-        # "gs_1" is in gravity_spring (locked skill) — should NOT be in active prompt set
-        # "untracked_1" is not in any skill but in all_prompts — active (untracked_always_active)
-
-        # Test 1: prompt in active skill + active tier → active
-        # We need int prompt_ids whose str() matches skill tree entries
-        # The fixture uses string IDs like "ff_1". We can't easily map those to ints.
-        # Instead, test the composition logic directly with the active_prompt_set.
+        # Active prompt set: root skills + untracked
         active_prompts = set(gs.get_active_prompts())
         assert "ff_1" in active_prompts  # Active root skill
         assert "gs_1" not in active_prompts  # Locked skill
         assert "untracked_1" in active_prompts  # Untracked but always active
 
-        # Test 2: build_prompt_contexts composes tier gate with skill gate
-        # A prompt not in all_prompts is not in active_prompt_set → inactive
+        # Test 1: Untracked prompt + matching tier → active (tier gate decides)
         contexts = gs.build_prompt_contexts(
-            prompt_ids=[999],  # str(999)="999" not in any skill or all_prompts
+            prompt_ids=[999],  # str(999)="999" — not tracked
             metadata=[{"difficulty": "tutorial_gravity"}],
             difficulty_column="difficulty",
             active_tiers={"tutorial_gravity"},
         )
-        # Tier passes but skill gate fails (not in active prompts) → inactive
-        assert not contexts[0].is_active
+        assert contexts[0].is_active  # Untracked, tier passes → active
 
-        # Test 3: prompt in active tier but inactive tier → inactive
+        # Test 2: Untracked prompt + wrong tier → inactive (tier gate blocks)
         contexts2 = gs.build_prompt_contexts(
             prompt_ids=[999],
             metadata=[{"difficulty": "tier3"}],
             difficulty_column="difficulty",
             active_tiers={"tutorial_gravity"},
         )
-        assert not contexts2[0].is_active  # Tier gate fails
+        assert not contexts2[0].is_active  # Untracked, tier fails → inactive
+
+        # Test 3: Tracked prompt in active skill + wrong tier → ACTIVE (tutorial bypasses tier)
+        # "ff_1" is in freefall (active). Even if its tier doesn't match, tutorial is authority.
+        # We can't easily pass "ff_1" as an int prompt_id, but we can verify the logic:
+        # skill_key is not None AND pid_str in active_prompt_set → active regardless of tier
+        assert "ff_1" in gs._prompt_to_skill  # Tracked
+        assert "ff_1" in active_prompts  # Active skill → bypasses tier
+
+        # Test 4: Tracked prompt in locked skill → INACTIVE (tutorial blocks)
+        assert "gs_1" in gs._prompt_to_skill  # Tracked
+        assert "gs_1" not in active_prompts  # Locked skill → blocked
 
     def test_build_prompt_contexts_respects_skill_gate(self):
         """Prompts not in active prompt set are marked inactive."""

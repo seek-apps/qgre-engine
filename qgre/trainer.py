@@ -1011,8 +1011,10 @@ class QGRETrainer:
         Sets dataloader to only sample prompts from active tiers, with equal
         weight per tier (prevents large tiers drowning small ones).
 
-        When the tutorial system is enabled, prompts must ALSO be in an active
-        skill. Both gates compose: tier gate AND skill gate must pass.
+        When the tutorial system is enabled, tutorial-tracked prompts in active
+        skills BYPASS the tier gate (tutorial is the authority for its prompts).
+        Untracked prompts still respect the tier gate. Locked skill prompts are
+        always zeroed out.
         """
         if self._dataloader is None or not hasattr(self._dataloader, "set_difficulty_gate"):
             return
@@ -1023,14 +1025,13 @@ class QGRETrainer:
         allowed = set(self.game_state.active_tiers)
         self._dataloader.set_difficulty_gate(allowed, col)
 
-        # Tutorial composition: get active prompt IDs from skill tree
+        # Tutorial: tracked prompts in active skills bypass tier gate
         tutorial_active_pids = None
+        tutorial_tracked_pids = None
         if self.game_state.tutorial_enabled:
-            tutorial_active = self.game_state.get_active_prompts()
-            tutorial_active_pids = set(tutorial_active)
+            tutorial_active_pids = set(self.game_state.get_active_prompts())
+            tutorial_tracked_pids = set(self.game_state._prompt_to_skill.keys())
 
-        # Equal weight per tier: tier with fewer prompts gets higher per-prompt weight
-        # When tutorial active, also zero out prompts not in active skills
         from collections import Counter
         tier_counts = Counter(
             item["metadata"].get(col, "default") for item in self._dataloader.items
@@ -1040,13 +1041,19 @@ class QGRETrainer:
             tier = item["metadata"].get(col, "default")
             pid = item["prompt_id"]
             pid_str = str(pid)
-            if tier in allowed:
-                # If tutorial is active, also check skill gate
-                if tutorial_active_pids is not None and pid_str not in tutorial_active_pids:
-                    tier_weights[pid] = 0.0  # Prompt in allowed tier but locked skill
+
+            if tutorial_tracked_pids is not None and pid_str in tutorial_tracked_pids:
+                # Tutorial-tracked prompt: skill gate is the authority, tier gate bypassed
+                if pid_str in tutorial_active_pids:
+                    tier_weights[pid] = 1.0 / max(tier_counts.get(tier, 1), 1)
                 else:
+                    tier_weights[pid] = 0.0  # Locked skill
+            else:
+                # Untracked prompt: tier gate decides
+                if tier in allowed:
                     tier_weights[pid] = 1.0 / max(tier_counts[tier], 1)
-            # else: difficulty gate already zeros it out
+                # else: difficulty gate already zeros it out
+
         if tier_weights:
             self._dataloader.set_priorities(tier_weights)
 
@@ -1054,8 +1061,8 @@ class QGRETrainer:
         active_count = sum(1 for w in tier_weights.values() if w > 0) if tier_weights else 0
         if active_count == 0:
             warnings.warn(
-                f"Difficulty gate: zero prompts active after tutorial + tier composition. "
-                f"Allowed tiers: {sorted(allowed)}. Tutorial active prompt count: "
+                f"Difficulty gate: zero prompts active. "
+                f"Allowed tiers: {sorted(allowed)}. Tutorial active: "
                 f"{len(tutorial_active_pids) if tutorial_active_pids else 'N/A'}. "
                 f"Dataloader will fall back to uniform sampling."
             )
