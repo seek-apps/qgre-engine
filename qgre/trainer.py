@@ -17,7 +17,6 @@ from qgre.config import QGREConfig
 from qgre.data import PromptBatch, QGREDataLoader
 from qgre.logging import CompletionLogger, log_step_metrics, log_training_params
 from qgre.nemo_extracted.kl import masked_mean
-from qgre.nemo_extracted.llds import compute_llds_loss
 from qgre.nemo_extracted.logits import logprobs_from_logits
 from qgre.nemo_extracted.loss_functions import ClippedPGLossFn
 from qgre.segments import Segmenter, uniform_segmenter
@@ -146,13 +145,15 @@ class QGRETrainer:
         self._vprm_sq = sq
 
         # Loss function (NeMo RL extracted)
+        # On-policy SPO: ratio is always 1.0, clipping has no effect.
+        # KL regularization available via config (loss_mode="kl_cov", kl_cov_ratio>0).
         self.loss_fn = ClippedPGLossFn({
             "reference_policy_kl_penalty": alg.kl_cov_ratio if alg.loss_mode == "kl_cov" else 0.0,
             "reference_policy_kl_type": alg.reference_policy_kl_type,
             "kl_input_clamp_value": 20.0,
             "kl_output_clamp_value": 10.0,
-            "ratio_clip_min": alg.clip_ratio_low,
-            "ratio_clip_max": alg.clip_ratio_high,
+            "ratio_clip_min": 0.2,
+            "ratio_clip_max": 0.28,
             "ratio_clip_c": None,
             "use_on_policy_kl_approximation": True,
             "use_importance_sampling_correction": False,
@@ -162,11 +163,6 @@ class QGRETrainer:
             "remove_length_normalization": alg.loss_type == "dr_grpo",
             "lambda_return": alg.lambda_return,
         })
-
-        # LLDS requires stored generation-time logprobs to be meaningful.
-        # Without them, old_logprob == curr_logprob and all LLDS gates return zero.
-        # This flag is set to True when generation-time logprobs are wired (future work).
-        self._has_stored_logprobs = False
 
         # Fused logprobs: chunked lm_head projection saves ~2GB by not materializing
         # full [seq, vocab] logit tensor. Uses torch.checkpoint per chunk to prevent
@@ -649,21 +645,6 @@ class QGRETrainer:
                     length_penalty = lp_coef * (seq_lengths / max(mean_len, 1.0)).mean()
                     mb_loss = mb_loss + length_penalty
                     mb_metrics["length_penalty"] = length_penalty.item()
-
-            # LLDS auxiliary loss — prevents Lazy Likelihood Displacement death spiral
-            # (arXiv:2512.04220). Only meaningful when old_logprob != curr_logprob,
-            # which requires stored generation-time logprobs (not yet implemented).
-            llds_coef = self.config.algorithm.llds_coef
-            if llds_coef > 0 and self._has_stored_logprobs:
-                llds_loss, llds_mask = compute_llds_loss(
-                    log_prob=mb_lp[:, :min_len],
-                    old_log_prob=mb_old_lp[:, :min_len],
-                    advantages=mb_advs_shifted[:, :min_len],
-                    response_mask=mb_mask[:, :min_len].float(),
-                )
-                mb_loss = mb_loss + llds_coef * llds_loss
-                mb_metrics["llds_loss"] = llds_loss.item()
-                mb_metrics["llds_mask_ratio"] = llds_mask.sum().item() / max(mb_mask[:, :min_len].sum().item(), 1)
 
             # VPRM critic loss: normalize by sample count and add to policy loss
             if mb_critic_count > 0:

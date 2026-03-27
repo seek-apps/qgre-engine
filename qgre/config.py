@@ -107,15 +107,16 @@ class AlgorithmConfig:
     mode: str = "spo"  # "spo" or "grpo"
     spo: SPOConfig = field(default_factory=SPOConfig)
     grpo: GRPOConfig = field(default_factory=GRPOConfig)
-    clip_ratio_low: float = 0.2
-    clip_ratio_high: float = 0.28
+    # clip_ratio_low/high removed: force_on_policy_ratio=True makes clipping dead code.
+    # If off-policy training is added, re-introduce these and remove force_on_policy_ratio.
     # KL regularization requires multi-epoch training (ppo_epochs > 1) to be meaningful.
     # With on-policy (generate then immediately train, 1 epoch), KL between current and
     # generation is zero by definition — no optimizer step occurs between them.
     loss_mode: str = "pg"  # "pg" (no KL) or "kl_cov" (requires multi-epoch)
     kl_cov_ratio: float = 0.0
     reference_policy_kl_type: str = "k3"  # "k1" (linear/unbiased), "k2" (squared), "k3" (exponential)
-    llds_coef: float = 0.05
+    # llds_coef removed: requires stored generation-time logprobs (not implemented).
+    # Re-add when multi-epoch or off-policy training is supported.
     # entropy_coeff removed: -mean(logprob) has wrong gradient direction for entropy bonus.
     # neg_logprob_mean is logged as a metric only (no backprop). See Fix 3 notes.
     step_qualities: dict | None = None  # {step_num: [quality_names]} — domain-specific
