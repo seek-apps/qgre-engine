@@ -36,7 +36,7 @@ data:
 
 generation:
   temperature: 1.0
-  top_p: 0.85
+  top_p: 1.0
   lora_dropout_rate: 0.15
   lora_dropout_anneal_steps: 1500
   top_k: -1
