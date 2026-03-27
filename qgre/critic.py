@@ -175,28 +175,45 @@ class VPRMCritic(nn.Module):
             - advantages: quality_name → clipped advantage (float)
             - critic_losses: quality_name → MSE loss tensor (for backward)
         """
-        # Target predictions for stable advantages, online predictions for MSE loss
-        target_preds = self.forward(hidden_states, regions, use_target=True)
-        online_preds = self.forward(hidden_states, regions, use_target=False)
+        # Pool regions ONCE, then run both head sets against the same pools
+        step_ids_present = sorted({
+            int(r.split("_")[1]) for r in regions if r.startswith("STEP_")
+        })
+        region_ids = torch.tensor(
+            [int(r.split("_")[1]) if r.startswith("STEP_") else -1 for r in regions],
+            device=hidden_states.device,
+        )
+        region_pools: dict[str, torch.Tensor] = {}
+        for step_id in step_ids_present:
+            mask = (region_ids == step_id).float()
+            count = mask.sum()
+            if count > 0:
+                pooled = (hidden_states * mask.unsqueeze(-1)).sum(dim=0) / count
+                region_pools[f"STEP_{step_id}"] = pooled
 
         advantages: dict[str, float] = {}
         critic_losses: dict[str, torch.Tensor] = {}
 
         for q_name in self.quality_names:
             actual = actual_rewards.get(q_name, 0.0)
-            predicted = target_preds.get(q_name)  # Stable baseline from target
-            online_pred = online_preds.get(q_name)  # For MSE loss
+            step_num = self._quality_to_step[q_name]
+            region_key = f"STEP_{step_num}"
 
-            if predicted is None:
+            if region_key not in region_pools:
                 advantages[q_name] = 0.0
                 continue
 
-            adv = actual - predicted.detach().item()
+            pooled = region_pools[region_key].unsqueeze(0)
+
+            # Target prediction for stable advantage
+            target_pred = self.target_heads[q_name](pooled).squeeze(0).squeeze(0)
+            adv = actual - target_pred.detach().item()
             adv = max(-self.clip_advantage, min(self.clip_advantage, adv))
             advantages[q_name] = adv
 
-            # MSE loss from ONLINE predictions (not target) — online learns fast
-            if online_pred is not None and online_pred.requires_grad:
+            # Online prediction for MSE loss (online learns fast)
+            online_pred = self.heads[q_name](pooled).squeeze(0).squeeze(0)
+            if online_pred.requires_grad:
                 reward_target = torch.tensor(actual, device=online_pred.device, dtype=online_pred.dtype)
                 critic_losses[q_name] = (online_pred - reward_target) ** 2
 
