@@ -717,16 +717,16 @@ class QGRETrainer:
                             self.vprm_critic.sync_target_to_online()
                         elif self.global_step >= self._vprm_config.target_warmup_steps:
                             self.vprm_critic.update_target_network(tau=self._vprm_config.polyak_tau)
-                    # Divergence monitoring: MSE between online and target predictions
-                    if self.global_step % 50 == 0:
-                        with torch.no_grad():
-                            divergence = sum(
-                                (op.data - tp.data).pow(2).mean().item()
-                                for q in self.vprm_critic.quality_names
-                                for op, tp in zip(self.vprm_critic.heads[q].parameters(), self.vprm_critic.target_heads[q].parameters())
-                            )
-                            metrics["target_divergence"] = divergence
                 self.vprm_optimizer.zero_grad()
+                # Divergence monitoring — independent of has_grad (reads .data, no grad needed)
+                if self.global_step % 50 == 0:
+                    with torch.no_grad():
+                        divergence = sum(
+                            (op.data - tp.data).pow(2).mean().item()
+                            for q in self.vprm_critic.quality_names
+                            for op, tp in zip(self.vprm_critic.heads[q].parameters(), self.vprm_critic.target_heads[q].parameters())
+                        )
+                        metrics["target_divergence"] = divergence
             if self.scheduler is not None:
                 self.scheduler.step()
             # Report accumulated loss across gradient accumulation steps
