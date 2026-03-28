@@ -52,26 +52,38 @@ class UnslothBackend:
             target_modules=[
                 "q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj",
-                "embed_tokens", "lm_head",
             ],
+            modules_to_save=["lm_head", "embed_tokens"],
             lora_dropout=0.0,
             use_gradient_checkpointing="unsloth",
         )
 
-        # Verify pad token setup after Unsloth load.
-        # Unsloth assigns <|PAD_TOKEN|> (151669) for Qwen3 — this is correct:
-        #   - It's a real token in the vocab (not None)
-        #   - It's NOT a stop token (151643, 151645 are stop tokens)
-        #   - It's NOT the EOS token (151645)
-        # Do NOT use <|endoftext|> (151643) as pad — it's a stop token!
-        # The Unsloth warning "does not have a padding token" is cosmetic.
-        if tokenizer.pad_token_id is not None and tokenizer.pad_token_id == tokenizer.eos_token_id:
-            # PAD aliased to EOS — fix by using Unsloth's <|PAD_TOKEN|> or <|vision_pad|>
-            tokenizer.pad_token = "<|PAD_TOKEN|>"
-            tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids("<|PAD_TOKEN|>")
-            if tokenizer.pad_token_id is None:
-                tokenizer.pad_token = "<|vision_pad|>"
-                tokenizer.pad_token_id = 151654
+        # PAD token: MUST be set, MUST NOT equal EOS, MUST NOT be a stop token.
+        # Qwen3 proven config from training-dojo v2: PAD=151654 (<|vision_pad|>)
+        # If PAD=EOS, the loss function masks EOS → model never learns to stop.
+        # Lost 2 weeks to this in v1.
+        tokenizer.pad_token = "<|vision_pad|>"
+        tokenizer.pad_token_id = 151654
+        model.config.pad_token_id = 151654
+
+        # Verify — fail loud, not silent
+        assert tokenizer.pad_token_id != tokenizer.eos_token_id, \
+            f"PAD ({tokenizer.pad_token_id}) == EOS ({tokenizer.eos_token_id}) — model will never learn to stop"
+        assert tokenizer.pad_token_id not in self.generation_config.stop_token_ids, \
+            f"PAD ({tokenizer.pad_token_id}) is a stop token — loss will mask stop signals"
+
+        print(f"Tokenizer: PAD={tokenizer.pad_token!r} (ID:{tokenizer.pad_token_id}), "
+              f"EOS={tokenizer.eos_token!r} (ID:{tokenizer.eos_token_id}), "
+              f"Stop tokens: {self.generation_config.stop_token_ids}")
+
+        # Verify chat template renders correctly
+        test_messages = [{"role": "user", "content": "test"}]
+        test_rendered = tokenizer.apply_chat_template(
+            test_messages, tokenize=False, add_generation_prompt=True
+        )
+        assert "<|im_start|>" in test_rendered, \
+            f"Chat template broken — missing <|im_start|>. Got: {test_rendered!r}"
+        print(f"Chat template: OK — {test_rendered!r}")
 
         self.model = model
         self.tokenizer = tokenizer

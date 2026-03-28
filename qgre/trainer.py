@@ -207,26 +207,44 @@ class QGRETrainer:
         Uses AdamW8bit from bitsandbytes for ~4x memory savings on optimizer states.
         Falls back to regular AdamW if bitsandbytes not available.
         """
+        # Split params: embedding/lm_head modules_to_save get 10x smaller LR
+        # (Unsloth recommendation for modules_to_save to prevent drift)
+        embedding_params = []
+        other_params = []
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "embed_tokens" in name or "lm_head" in name:
+                embedding_params.append(param)
+            else:
+                other_params.append(param)
+
+        base_lr = self.config.training.lr
+        embed_lr = base_lr / 10  # 10x smaller for embeddings
+        param_groups = [
+            {"params": other_params, "lr": base_lr},
+            {"params": embedding_params, "lr": embed_lr},
+        ]
+
+        if embedding_params:
+            print(f"Optimizer: {len(other_params)} params at lr={base_lr}, "
+                  f"{len(embedding_params)} embedding params at lr={embed_lr}")
+        else:
+            print(f"Optimizer: {len(other_params)} params at lr={base_lr}, no embedding params")
+
         # AdamW8bit saves ~4x memory on optimizer states (PLAN.md line 323)
-        # Requires GPU tensors — falls back to regular AdamW on CPU
         use_8bit = False
         try:
             device = next(self.model.parameters()).device
             if device.type == "cuda":
                 from bitsandbytes.optim import AdamW8bit
-                self.optimizer = AdamW8bit(
-                    self.model.parameters(),
-                    lr=self.config.training.lr,
-                )
+                self.optimizer = AdamW8bit(param_groups)
                 use_8bit = True
         except (ImportError, StopIteration):
             pass
 
         if not use_8bit:
-            self.optimizer = torch.optim.AdamW(
-                self.model.parameters(),
-                lr=self.config.training.lr,
-            )
+            self.optimizer = torch.optim.AdamW(param_groups)
 
         cfg = self.config.training
         main_scheduler = None
