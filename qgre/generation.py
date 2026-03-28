@@ -52,6 +52,7 @@ class UnslothBackend:
             target_modules=[
                 "q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj",
+                "embed_tokens", "lm_head",
             ],
             lora_dropout=0.0,
             use_gradient_checkpointing="unsloth",
