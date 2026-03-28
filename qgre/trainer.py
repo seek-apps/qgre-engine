@@ -214,7 +214,7 @@ class QGRETrainer:
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
-            if "embed_tokens" in name or "lm_head" in name:
+            if any(mod in name for mod in ("embed_tokens", "lm_head")):
                 embedding_params.append(param)
             else:
                 other_params.append(param)

@@ -8,6 +8,9 @@ import torch
 
 from qgre.config import GenerationConfig, ModelConfig
 
+# Modules trained as full weights alongside LoRA (not low-rank decomposed)
+MODULES_TO_SAVE = ["lm_head", "embed_tokens"]
+
 
 @dataclass
 class GenerationOutput:
@@ -53,15 +56,12 @@ class UnslothBackend:
                 "q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj",
             ],
-            modules_to_save=["lm_head", "embed_tokens"],
+            modules_to_save=MODULES_TO_SAVE,
             lora_dropout=0.0,
             use_gradient_checkpointing="unsloth",
         )
 
-        # PAD token: MUST be set, MUST NOT equal EOS, MUST NOT be a stop token.
-        # Qwen3 proven config from training-dojo v2: PAD=151654 (<|vision_pad|>)
-        # If PAD=EOS, the loss function masks EOS → model never learns to stop.
-        # Lost 2 weeks to this in v1.
+        # PAD=vision_pad (151654). If PAD=EOS, loss masks EOS → model never stops.
         tokenizer.pad_token = "<|vision_pad|>"
         tokenizer.pad_token_id = 151654
         model.config.pad_token_id = 151654
