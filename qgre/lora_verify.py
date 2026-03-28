@@ -6,10 +6,10 @@ from typing import Any, Protocol
 
 
 class WeightSyncable(Protocol):
-    """Interface for anything that can save/load LoRA weights."""
+    """Interface for anything that can save/load weights (LoRA + modules_to_save)."""
 
-    def save_lora(self, path: str | Path) -> None: ...
-    def load_lora(self, path: str | Path) -> None: ...
+    def save_weights(self, path: str | Path) -> None: ...
+    def load_weights(self, path: str | Path) -> None: ...
 
 
 class LoRAVerifier:

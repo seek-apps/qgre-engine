@@ -330,15 +330,16 @@ class QGREStepAdvantageEstimator:
                     v = batch_means[step_num]
                     self._step_seen[pid].add(step_num)
 
-                step_advs[step_num][i] = r - v
-
-                # Target-aware aspiration gap: preserve directional signal from shaped rewards.
-                # Without this, the baseline eats the partial credit gradient (0.4 - 0.4 = 0).
-                # With this, sub-target completions get proportional negative push toward target.
-                if self._aspiration_beta > 0 and self._aspiration_target > 0:
-                    target = batch_contexts[i].aspiration_target if batch_contexts else self._aspiration_target
-                    warmup = batch_contexts[i].aspiration_warmup if batch_contexts else 1.0
-                    step_advs[step_num][i] += self._aspiration_beta * warmup * (r - target)
+                # Perfect score (1.0) = zero advantage. Nothing to learn — don't waste
+                # gradient reinforcing specific tokens. Imperfect = push toward 1.0.
+                if r >= 1.0:
+                    step_advs[step_num][i] = 0.0
+                else:
+                    step_advs[step_num][i] = r - v
+                    # Aspiration gap: push toward perfection (1.0).
+                    if self._aspiration_beta > 0:
+                        warmup = batch_contexts[i].aspiration_warmup if batch_contexts else 1.0
+                        step_advs[step_num][i] += self._aspiration_beta * warmup * (r - 1.0)
 
                 # Variance-aware baseline: slow lr when reward is constant
                 effective_lr = self.lr
@@ -590,13 +591,15 @@ def compute_advantages_vprm(
         else:
             step_advs[step_num] = 0.0
 
-    # Aspiration gap: preserve shaped reward gradient even when VPRM replaces SPO advantages
-    if aspiration_beta > 0 and aspiration_target > 0:
-        for step_num in step_nums:
-            qualities = [q for q in step_qualities[step_num] if q in active_qualities]
-            if qualities:
-                step_reward = sum(reward_result.scores.get(q, 0.0) for q in qualities) / len(qualities)
-                step_advs[step_num] += aspiration_beta * (step_reward - aspiration_target)
+    # Perfect score = zero advantage. Imperfect = push toward 1.0.
+    for step_num in step_nums:
+        qualities = [q for q in step_qualities[step_num] if q in active_qualities]
+        if qualities:
+            step_reward = sum(reward_result.scores.get(q, 0.0) for q in qualities) / len(qualities)
+            if step_reward >= 1.0:
+                step_advs[step_num] = 0.0
+            elif aspiration_beta > 0:
+                step_advs[step_num] += aspiration_beta * (step_reward - 1.0)
 
     apply_frontier_amplification(step_advs, step_nums, frontier_steps, frontier_amplification)
 

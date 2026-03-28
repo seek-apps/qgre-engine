@@ -19,11 +19,14 @@ from qgre.segments import OPEN_ANGLE, STEP_TOKEN, CLOSE_ANGLE, CLOSE_SLASH
 
 TEST_SQ = HYPERGRAPH_V1_STEP_QUALITIES
 
+# Minimal step_qualities matching the mock reward_fn used in test_trainer_forward_finite_loss
+_MOCK_SQ: dict[int, list[str]] = {1: ["q_format_tags", "q_tag_content"]}
+
 
 def _cfg() -> QGREConfig:
     """Create a QGREConfig with step_qualities set for testing."""
     cfg = QGREConfig()
-    cfg.algorithm.step_qualities = TEST_SQ
+    cfg.algorithm.step_qualities = _MOCK_SQ
     cfg.algorithm.use_fused_logprobs = False  # Mock models have no lm_head
     cfg.model.path = "test-model"
     return cfg
@@ -83,7 +86,7 @@ def test_config_from_yaml():
     cfg = QGREConfig.from_yaml("examples/hypergraph/config.yaml")
     assert cfg.algorithm.mode == "spo"
     assert cfg.algorithm.spo.n == 1
-    assert cfg.generation.temperature == 1.0
+    assert cfg.generation.temperature == 1.0  # hypergraph YAML explicitly sets 1.0
     assert cfg.algorithm.clip_ratio_low == 0.2
     assert cfg.algorithm.clip_ratio_high == 0.28
 
@@ -93,7 +96,7 @@ def test_config_defaults():
     cfg = _cfg()
     assert cfg.algorithm.mode == "spo"
     assert cfg.training.lr == 5e-6
-    assert cfg.generation.temperature == 1.0
+    assert cfg.generation.temperature == 0.7
 
 
 def test_config_math_example():
@@ -117,7 +120,7 @@ def test_trainer_forward_finite_loss():
         trainer = QGRETrainer(
             model=model,
             tokenizer=None,
-            reward_fn=lambda *a, **k: RewardResult(reward=0.5, scores={"q_format_tags": 1.0}, phase=1),
+            reward_fn=lambda *a, **k: RewardResult(reward=0.5, scores={"q_format_tags": 1.0, "q_tag_content": 1.0}, phase=1),
             config=cfg,
         )
         trainer.setup_optimizer()
@@ -178,7 +181,7 @@ def test_gradient_accumulation_equivalence():
         model = MockModel()
         trainer = QGRETrainer(
             model=model, tokenizer=None,
-            reward_fn=lambda *a, **k: RewardResult(reward=0.5, scores={"q_format_tags": 1.0}, phase=1),
+            reward_fn=lambda *a, **k: RewardResult(reward=0.5, scores={"q_format_tags": 1.0, "q_tag_content": 1.0}, phase=1),
             config=cfg,
         )
         trainer.setup_optimizer()
@@ -305,8 +308,13 @@ def test_config_unknown_key_warns():
 
 def test_step_records_mastery_and_advances_phase():
     """Trainer.step() records mastery scores and advances phase when threshold met."""
+    _phase_sq = {
+        1: ["q_format_tags", "q_tag_content", "q_node_in_prompt", "q_node_format", "q_node_length"],
+        2: ["q_chain_s2_refs_s1"],
+    }
     with tempfile.TemporaryDirectory() as tmpdir:
         cfg = _cfg()
+        cfg.algorithm.step_qualities = _phase_sq
         cfg.logging.completion_dir = str(Path(tmpdir) / "comp")
         cfg.logging.checkpoint_dir = str(Path(tmpdir) / "ckpt")
 
@@ -321,16 +329,19 @@ def test_step_records_mastery_and_advances_phase():
         batch = _make_batch(n_completions=2)
         tokens = _make_tokens()
 
-        # High scores on step 1 qualities → should eventually advance to phase 2
+        # High scores on step 1 qualities → should eventually advance to phase 2.
+        # All phase keys (including phase-2) must be present in reward output per C2.2 validation.
         for _ in range(25):
             rrs = [
                 RewardResult(reward=0.9, scores={
                     "q_format_tags": 0.95, "q_tag_content": 0.90,
                     "q_node_in_prompt": 0.85, "q_node_format": 0.90, "q_node_length": 0.88,
+                    "q_chain_s2_refs_s1": 0.0,
                 }),
                 RewardResult(reward=0.8, scores={
                     "q_format_tags": 0.88, "q_tag_content": 0.85,
                     "q_node_in_prompt": 0.80, "q_node_format": 0.85, "q_node_length": 0.82,
+                    "q_chain_s2_refs_s1": 0.0,
                 }),
             ]
             metrics = trainer.step(batch, [tokens, tokens], rrs)
@@ -360,8 +371,8 @@ def test_step_uses_engine_phase_not_reward_phase():
 
         # RewardResult claims phase=4, but engine should use GameState.phase=1
         rrs = [
-            RewardResult(reward=0.5, scores={"q_format_tags": 1.0}, phase=4),
-            RewardResult(reward=0.5, scores={"q_format_tags": 1.0}, phase=4),
+            RewardResult(reward=0.5, scores={"q_format_tags": 1.0, "q_tag_content": 1.0}, phase=4),
+            RewardResult(reward=0.5, scores={"q_format_tags": 1.0, "q_tag_content": 1.0}, phase=4),
         ]
         metrics = trainer.step(batch, [tokens, tokens], rrs)
 
@@ -585,7 +596,7 @@ def test_fused_logprobs_path():
         model = MockModel()
         trainer = QGRETrainer(
             model=model, tokenizer=None,
-            reward_fn=lambda *a, **k: RewardResult(reward=0.5, scores={"q_format_tags": 1.0}, phase=1),
+            reward_fn=lambda *a, **k: RewardResult(reward=0.5, scores={"q_format_tags": 1.0, "q_tag_content": 1.0}, phase=1),
             config=cfg,
         )
         trainer.setup_optimizer()

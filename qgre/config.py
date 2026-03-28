@@ -15,6 +15,7 @@ class ModelConfig:
     load_in_4bit: bool = True
     fast_inference: bool = True
     gpu_memory_utilization: float = 0.35  # Colocate: leaves ~65% VRAM for training (Leeroopedia heuristic)
+    max_lora_rank: int = 0  # 0 = auto (max(64, lora_rank * 2)); vLLM rejects adapters with rank > this
 
 
 @dataclass

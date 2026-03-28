@@ -745,18 +745,17 @@ class TestIntegration:
             batch_contexts=contexts,
         )
 
-        # Both get the same reward (0.5). But aspiration gap differs:
-        # Prompt 1: 0.5 * (0.5 - 0.85) = -0.175
-        # Prompt 2: 0.5 * (0.5 - 0.75) = -0.125
-        # So prompt 1 should get MORE negative aspiration push (higher target)
-        # The total advantages should differ between the two prompts
+        # Aspiration target is always 1.0 (perfection), not per-skill mastery threshold.
+        # Both prompts get same reward (0.5) → same aspiration gap: beta * (0.5 - 1.0)
+        # Per-skill targets only gate curriculum advancement, not gradient signal.
         adv_sum_1 = advs[0].sum().item()
         adv_sum_2 = advs[1].sum().item()
-        # Prompt 1 has higher target → more negative aspiration → lower advantage
-        assert adv_sum_1 < adv_sum_2, (
-            f"Prompt with higher aspiration target should have lower advantage: "
+        assert adv_sum_1 == adv_sum_2, (
+            f"Both prompts should get same aspiration push (target=1.0 for both): "
             f"prompt1={adv_sum_1:.4f}, prompt2={adv_sum_2:.4f}"
         )
+        # Verify aspiration is actually applied (not zero)
+        assert adv_sum_1 < 0, f"Aspiration should push negative (r=0.5 < target=1.0): {adv_sum_1}"
 
     def test_tutorial_with_aspiration_untracked_uses_global(self):
         """Untracked prompts use global aspiration target, not per-skill."""

@@ -50,9 +50,14 @@ def get_hidden_states_and_lm_head(model: nn.Module, input_ids: torch.Tensor, **k
     )
 
     # Get lm_head module — works on any HF CausalLM
+    # With modules_to_save, PEFT wraps lm_head in ModulesToSaveWrapper.
+    # Unwrap to get the actual nn.Linear inside.
     lm_head = None
     try:
         lm_head = model.get_output_embeddings()
+        # Unwrap PEFT ModulesToSaveWrapper → get the active adapter's nn.Linear
+        if hasattr(lm_head, "modules_to_save"):
+            lm_head = lm_head.modules_to_save["default"]
         if not isinstance(lm_head, nn.Linear):
             lm_head = None
     except AttributeError:

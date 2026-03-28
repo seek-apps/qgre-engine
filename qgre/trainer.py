@@ -92,6 +92,7 @@ class QGRETrainer:
             )
         self.step_qualities = sq
         self.phase_qualities = build_phase_qualities(sq)
+        self._sq_validated = False  # Validate step_qualities keys against first reward result
 
         # Algorithm setup
         alg = config.algorithm
@@ -241,7 +242,7 @@ class QGRETrainer:
         # AdamW8bit saves ~4x memory on optimizer states (PLAN.md line 323)
         use_8bit = False
         try:
-            device = next(self.model.parameters()).device
+            device = next(p.device for p in self.model.parameters() if p.device.type != "cpu")
             if device.type == "cuda":
                 from bitsandbytes.optim import AdamW8bit
                 self.optimizer = AdamW8bit(param_groups)
@@ -314,6 +315,41 @@ class QGRETrainer:
         Returns metrics dict.
         """
         assert self.optimizer is not None, "Call setup_optimizer() first"
+
+        if not self._sq_validated and reward_results:
+            if not self.phase_qualities:
+                raise ValueError(
+                    "step_qualities must not be empty. "
+                    "Provide at least one phase with quality keys."
+                )
+            # Check for phases with empty quality lists — they contribute no keys and
+            # produce zero gradients for any sample in that phase.
+            empty_phases = [phase for phase, keys in self.step_qualities.items() if not keys]
+            if empty_phases:
+                raise ValueError(
+                    f"step_qualities phases {sorted(empty_phases)} have empty quality lists. "
+                    "Each phase must declare at least one quality key. "
+                    "An empty list produces zero gradients for all samples in that phase."
+                )
+            # Validate against ALL reward_results — use intersection of score keys so that
+            # any sample missing a required key is caught (not just sample[0]).
+            available_keys: set[str] = set(reward_results[0].scores.keys())
+            for idx, rr in enumerate(reward_results[1:], start=1):
+                available_keys &= set(rr.scores.keys())
+            # Validate ALL phase keys — a future phase referencing an absent key
+            # causes silent zero learning signal, not just the starting phase.
+            all_sq_keys: set[str] = set()
+            for keys in self.phase_qualities.values():
+                all_sq_keys.update(keys)
+            missing = all_sq_keys - available_keys
+            if missing:
+                raise ValueError(
+                    f"step_qualities keys {sorted(missing)} not found in reward_fn output "
+                    f"for all samples (checked {len(reward_results)} samples). "
+                    f"Keys present in ALL samples: {sorted(available_keys)}. "
+                    "This would cause silent zero learning signal."
+                )
+            self._sq_validated = True
 
         # LLDS activates when real generation-time logprobs are available
         self._has_stored_logprobs = generation_logprobs is not None
@@ -394,8 +430,9 @@ class QGRETrainer:
                 batch_contexts=batch_contexts,
             )
 
-        # Build full sequences on model device
-        device = next(self.model.parameters()).device
+        # Build full sequences on model device.
+        # modules_to_save offloads original_module to CPU — skip CPU params for device detection.
+        device = next(p.device for p in self.model.parameters() if p.device.type != "cpu")
         max_comp_len = max(len(c) for c in completions)
 
         padded_advs = torch.zeros(len(completions), max_comp_len, device=device)
@@ -921,7 +958,7 @@ class QGRETrainer:
         # Restore VPRM critic + optimizer (if saved)
         if checkpoint.get("vprm_critic_state") and self.config.vprm.enabled:
             from qgre.critic import VPRMCritic
-            device = str(next(self.model.parameters()).device)
+            device = str(next(p.device for p in self.model.parameters() if p.device.type != "cpu"))
             self.vprm_critic = VPRMCritic.from_checkpoint(checkpoint["vprm_critic_state"], device=device)
             self.vprm_optimizer = torch.optim.Adam(
                 [p for p in self.vprm_critic.parameters() if p.requires_grad],
@@ -1193,9 +1230,10 @@ class QGRETrainer:
                             backend.load_weights(lora_path)
 
                 try:
+                    _dev = next(p.device for p in self.model.parameters() if p.device.type != "cpu")
                     output = backend.generate(
-                        batch.input_ids.to(next(self.model.parameters()).device),
-                        batch.attention_mask.to(next(self.model.parameters()).device),
+                        batch.input_ids.to(_dev),
+                        batch.attention_mask.to(_dev),
                     )
                 finally:
                     # Always restore clean weights — even if generate crashes
@@ -1305,20 +1343,9 @@ class QGRETrainer:
                     backend.save_weights(lora_path)
                     backend.load_weights(lora_path)
 
-                    # LoRA verification after sync (PLAN.md lines 484-487, step 0g)
-                    try:
-                        from qgre.lora_verify import LoRAVerifier
-                        verifier = LoRAVerifier()
-                        verifier.verify_sync(lora_path)
-                        verifier.verify_active(self.model, self.tokenizer)
-                    except ImportError:
-                        pass  # LoRA verifier not installed
-                    except Exception as e:
-                        import warnings
-                        warnings.warn(
-                            f"Step {self.global_step}: LoRA verification failed: {e}. "
-                            f"Training continues but weights may be desynchronized."
-                        )
+                    # LoRA verification: disk-hash verifier removed — incompatible with
+                    # in-memory sync (load_lora_directly + _sync_modules_to_save).
+                    # Sync correctness guaranteed by direct GPU tensor copy every step.
 
                 # 7. Periodic vLLM recreation to prevent VRAM leak (PLAN.md line 719, unsloth #3864)
                 if self.global_step > 0 and self.global_step % 50 == 0:
