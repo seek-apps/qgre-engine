@@ -20,11 +20,11 @@ def build_char_to_token_map(
     tokenizer: Any,
     completion_text: str | None = None,
 ) -> list[int] | None:
-    """Build a character-offset → token-index mapping.
+    """Build a character-offset → token-index mapping from ORIGINAL token_ids.
 
-    Uses the tokenizer's offset_mapping (re-encoding the text) when available —
-    this is the authoritative mapping from the tokenizer itself, reliable across
-    BPE and SentencePiece models. Falls back to per-token decode if unavailable.
+    Decodes the full sequence once, then uses convert_ids_to_tokens + offset tracking
+    to map each character position to its source token. No re-encoding — uses the
+    actual tokens that were generated.
 
     Returns a list where char_to_token[char_idx] = token_idx.
     Returns None if mapping cannot be built reliably.
@@ -37,89 +37,67 @@ def build_char_to_token_map(
         warnings.warn("build_char_to_token_map: tokenizer lacks decode method — returning None")
         return None
 
-    # Strategy 1: Use tokenizer's offset_mapping (authoritative, model-agnostic)
-    if completion_text is not None:
-        try:
-            encoding = tokenizer(completion_text, return_offsets_mapping=True, add_special_tokens=False)
-            offsets = encoding.get("offset_mapping")
-            # Validate: encoding token count must match original token_ids
-            if offsets and len(offsets) == len(token_ids):
-                # Additional validation: check that decoded text matches completion_text
-                decoded_check = tokenizer.decode(token_ids, skip_special_tokens=False)
-                if decoded_check != completion_text:
-                    import logging
-                    logger = logging.getLogger(__name__)
-                    logger.warning(
-                        f"Span mapping validation: decoded text != completion_text. "
-                        f"Diff length: {abs(len(decoded_check) - len(completion_text))}. "
-                        "Character spans may be inaccurate."
-                    )
-                text_len = len(completion_text)
-                char_to_token: list[int] = [-1] * text_len
-                for tok_idx, (start, end) in enumerate(offsets):
-                    for c in range(start, min(end, text_len)):
-                        char_to_token[c] = tok_idx
-                # Fill gaps (chars not covered by any token) with nearest token
-                last_valid = 0
-                for c in range(text_len):
-                    if char_to_token[c] >= 0:
-                        last_valid = char_to_token[c]
-                    else:
-                        char_to_token[c] = last_valid
-                return char_to_token
-        except Exception as e:
-            warnings.warn(f"Span mapping Strategy 1 (offset_mapping) failed: {e}. Trying Strategy 2.")
-            pass  # Fall through to Strategy 2
-
-    # Strategy 2: Per-token decode (works for BPE, may fail for SentencePiece)
-    token_texts = []
-    decode_failures = 0
-    for tid in token_ids:
-        try:
-            token_texts.append(tokenizer.decode([tid], skip_special_tokens=False))
-        except Exception:
-            token_texts.append("")
-            decode_failures += 1
-    if decode_failures > 0:
-        warnings.warn(
-            f"Span mapping: {decode_failures}/{len(token_ids)} per-token decode failures. "
-            "Character-to-token mapping may be inaccurate."
-        )
-
-    per_token_len = sum(len(tt) for tt in token_texts)
+    # Get the full decoded text (this is what the reward function scored)
     try:
         full_text = tokenizer.decode(token_ids, skip_special_tokens=False)
-        full_len = len(full_text)
     except Exception as e:
-        warnings.warn(f"Span mapping full decode failed: {e}. Using per-token length.")
-        full_len = per_token_len
+        warnings.warn(f"build_char_to_token_map: full decode failed: {e}")
+        return None
 
-    if per_token_len != full_len:
-        # Tolerate small mismatches (BPE merge boundaries add/remove chars
-        # when tokens are decoded individually vs together)
-        mismatch = abs(per_token_len - full_len)
-        if mismatch > max(3, full_len * 0.01):
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.error(
-                f"Span mapping FAILED: per-token decode length ({per_token_len}) != "
-                f"full decode length ({full_len}), mismatch={mismatch}. "
-                f"Token IDs sample: {token_ids[:10]}..., full text sample: {full_text[:50]}... "
-                "Falling back to segmenter. This may indicate tokenizer encoding/decoding mismatch."
-            )
-            return None
+    full_len = len(full_text)
+    if full_len == 0:
+        return []
 
-    # Build char→token map, truncate or pad to match full_len
-    char_to_token = []
-    for i, tt in enumerate(token_texts):
-        for _ in range(len(tt)):
-            char_to_token.append(i)
+    # Build offset map by decoding each token and tracking cumulative position
+    # This uses the ORIGINAL token_ids — no re-encoding
+    char_to_token: list[int] = [-1] * full_len
+    char_pos = 0
 
-    if len(char_to_token) > full_len:
-        char_to_token = char_to_token[:full_len]
-    elif len(char_to_token) < full_len:
-        last_tok = char_to_token[-1] if char_to_token else 0
-        char_to_token.extend([last_tok] * (full_len - len(char_to_token)))
+    for tok_idx, tid in enumerate(token_ids):
+        try:
+            # Decode this single token
+            tok_text = tokenizer.decode([tid], skip_special_tokens=False)
+            tok_len = len(tok_text)
+
+            # Find where this token's text appears in full_text starting from char_pos
+            # Usually it's exactly at char_pos, but BPE merges can shift things
+            if tok_len > 0:
+                # Try exact match first
+                if full_text[char_pos:char_pos + tok_len] == tok_text:
+                    for c in range(char_pos, min(char_pos + tok_len, full_len)):
+                        char_to_token[c] = tok_idx
+                    char_pos += tok_len
+                else:
+                    # BPE merge caused text difference — search nearby
+                    found = False
+                    for offset in range(min(5, full_len - char_pos)):
+                        if full_text[char_pos + offset:char_pos + offset + tok_len] == tok_text:
+                            for c in range(char_pos + offset, min(char_pos + offset + tok_len, full_len)):
+                                char_to_token[c] = tok_idx
+                            char_pos = char_pos + offset + tok_len
+                            found = True
+                            break
+                    if not found:
+                        # Can't find exact match — assign remaining chars proportionally
+                        # This handles cases where individual decode differs from joint decode
+                        remaining_tokens = len(token_ids) - tok_idx
+                        remaining_chars = full_len - char_pos
+                        if remaining_tokens > 0 and remaining_chars > 0:
+                            chars_for_this = max(1, remaining_chars // remaining_tokens)
+                            for c in range(char_pos, min(char_pos + chars_for_this, full_len)):
+                                char_to_token[c] = tok_idx
+                            char_pos += chars_for_this
+        except Exception:
+            # Decode failed for this token — skip
+            pass
+
+    # Fill any remaining gaps with nearest valid token
+    last_valid = 0
+    for c in range(full_len):
+        if char_to_token[c] >= 0:
+            last_valid = char_to_token[c]
+        else:
+            char_to_token[c] = last_valid
 
     return char_to_token
 

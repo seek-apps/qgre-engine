@@ -405,37 +405,34 @@ class QGRETrainer:
 
         # Compute per-token advantages — span-based (if scored_spans populated) or region-based (legacy)
         use_spans = any(rr.scored_spans for rr in reward_results)
+        batch_token_masks: list[dict[str, torch.Tensor]] = []  # Available for per-quality loss
         if use_spans:
             from qgre.spans import build_char_to_token_map, scored_spans_to_token_masks
             # Build per-sample token masks from scored_spans
             batch_token_masks: list[dict[str, torch.Tensor]] = []
             for i, rr in enumerate(reward_results):
                 if rr.scored_spans:
-                    # Decode completion for offset_mapping (authoritative char→token)
-                    comp_text = self.tokenizer.decode(completions[i], skip_special_tokens=False) if self.tokenizer else None
-                    # Validate: re-encoding should produce same token count as original
-                    # Some tokenizers have encode/decode asymmetry — warn and fall back to segmenter
-                    re_encoded_len = len(self.tokenizer.encode(comp_text, add_special_tokens=False))
-                    if re_encoded_len != len(completions[i]):
-                        import logging
-                        logging.getLogger(__name__).warning(
-                            f"Tokenizer encode/decode asymmetry: re-encoded {re_encoded_len} tokens "
-                            f"vs original {len(completions[i])}. Falling back to segmenter for sample {i}."
-                        )
-                        masks = {}
+                    # Build char→token map directly from original token_ids (no re-encoding)
+                    char_map = build_char_to_token_map(completions[i], self.tokenizer)
+                    if char_map is not None:
+                        masks = scored_spans_to_token_masks(rr.scored_spans, char_map, len(completions[i]))
                     else:
-                        char_map = build_char_to_token_map(completions[i], self.tokenizer, completion_text=comp_text)
-                        if char_map is not None:
-                            masks = scored_spans_to_token_masks(rr.scored_spans, char_map, len(completions[i]))
-                        else:
-                            masks = {}  # Fallback: empty masks → zero advantages (segmenter fallback below)
+                        masks = {}  # Mapping failed — fall back to segmenter
                 else:
                     masks = {}
                 batch_token_masks.append(masks)
 
             # Check if span mapping succeeded for any sample
+            # Debug: log span mapping status
+            non_empty_masks = sum(1 for m in batch_token_masks if m)
+            if non_empty_masks == 0:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"All span mappings failed: {len(batch_token_masks)} samples, "
+                    f"scored_spans present: {[bool(rr.scored_spans) for rr in reward_results]}"
+                )
             if any(m for m in batch_token_masks):
-                token_advantages = self.advantage_estimator.compute_advantages_with_spans(
+                token_advantages, _quality_metrics = self.advantage_estimator.compute_advantages_with_spans(
                     batch_prompt_ids=batch.prompt_ids,
                     batch_token_ids=completions,
                     batch_reward_results=reward_results,
@@ -769,14 +766,22 @@ class QGRETrainer:
             mb_kl_shifted = kl_region_weights[mb_start:mb_end, 1:] if kl_region_weights is not None else None
             min_len = min(mb_lp.shape[1], mb_old_lp.shape[1], mb_advs_shifted.shape[1], mb_mask.shape[1])
             mb_kl_weights = mb_kl_shifted[:, :min_len] if mb_kl_shifted is not None else None
-            mb_loss, mb_metrics = self.loss_fn(
+            # Request per-token loss when computing per-quality metrics
+            need_per_token = use_spans and batch_token_masks
+            loss_result = self.loss_fn(
                 curr_logprobs=mb_lp[:, :min_len],
                 prev_logprobs=mb_old_lp[:, :min_len],
                 advantages=mb_advs_shifted[:, :min_len],
                 mask=mb_mask[:, :min_len].float(),
                 reference_logprobs=mb_old_lp[:, :min_len],
                 kl_region_weights=mb_kl_weights,
+                return_per_token_loss=need_per_token,
             )
+            if need_per_token:
+                mb_loss, mb_metrics, mb_per_token_loss = loss_result
+            else:
+                mb_loss, mb_metrics = loss_result
+                mb_per_token_loss = None
 
             # neg_logprob_mean: monitor for policy collapse (metric only, not a loss term).
             # -mean(log p(token)) is NOT a valid entropy loss — its gradient pushes the wrong
@@ -785,6 +790,39 @@ class QGRETrainer:
             with torch.no_grad():
                 neg_logprob_mean = -masked_mean(mb_lp[:, :min_len], mb_mask[:, :min_len].float())
                 mb_metrics["neg_logprob_mean"] = neg_logprob_mean.item()
+
+            # Per-quality loss computation (when using span-based advantages)
+            # Uses actual per-token loss from ClippedPGLossFn (ratio * advantage),
+            # NOT the wrong formula (-logprob * advantage) used before.
+            #
+            # To match total loss normalization (seq-mean-token-sum-norm), we:
+            # 1. Sum per-token loss within each quality span
+            # 2. Track span counts to compute proper mean across samples
+            if mb_per_token_loss is not None and batch_token_masks:
+                with torch.no_grad():
+                    for mb_i_inner in range(mb_per_token_loss.shape[0]):
+                        # Map filtered index → original batch index for SPO filter
+                        filtered_i = mb_start + mb_i_inner
+                        if _spo_filter_idx is not None:
+                            orig_i = _spo_filter_idx[filtered_i]
+                        else:
+                            orig_i = filtered_i
+                        if orig_i < len(batch_token_masks) and batch_token_masks[orig_i]:
+                            for q_name, q_mask in batch_token_masks[orig_i].items():
+                                # Shift mask to align with loss positions (logprobs predict next token)
+                                q_mask_shifted = q_mask[1:min_len+1] if q_mask.shape[0] > min_len else q_mask[:min_len]
+                                if q_mask_shifted.shape[0] < min_len:
+                                    continue
+                                q_mask_shifted = q_mask_shifted.to(mb_per_token_loss.device)
+                                # Sum actual per-token loss contribution for this quality's span
+                                q_loss = (mb_per_token_loss[mb_i_inner] * q_mask_shifted[:min_len]).sum()
+                                q_count = q_mask_shifted[:min_len].sum()
+                                if q_count > 0:
+                                    # Accumulate sum and count separately for proper averaging later
+                                    loss_key = f"loss/{q_name}"
+                                    count_key = f"_loss_count/{q_name}"
+                                    mb_metrics[loss_key] = mb_metrics.get(loss_key, 0.0) + q_loss.item()
+                                    mb_metrics[count_key] = mb_metrics.get(count_key, 0.0) + q_count.item()
 
             # Dynamic length control (Huawei): penalize length when group accuracy is high
             lp_coef = self.config.algorithm.length_penalty_coef
@@ -852,6 +890,8 @@ class QGRETrainer:
         for k, v in all_metrics.items():
             if k in self._per_token_metrics:
                 metrics[k] = v / n_micro  # Per-token: average across micro-batches
+            elif k.startswith("_loss_count/"):
+                continue  # Skip count keys, used below for per-quality loss computation
             else:
                 metrics[k] = v  # Scalar: sum is correct (e.g., policy_loss is already normalized)
         if n_micro > 1 and "loss" not in self._per_token_metrics:
@@ -859,6 +899,17 @@ class QGRETrainer:
             metrics["loss"] = total_loss
         else:
             metrics["loss"] = total_loss
+
+        # Per-quality loss: compute mean from accumulated sum and count
+        # This gives mean per-token loss for each quality span across all samples
+        for k in list(all_metrics.keys()):
+            if k.startswith("loss/") and not k.startswith("_loss_count/"):
+                q_name = k[5:]  # Strip "loss/" prefix
+                count_key = f"_loss_count/{q_name}"
+                if count_key in all_metrics and all_metrics[count_key] > 0:
+                    metrics[k] = all_metrics[k] / all_metrics[count_key]
+                else:
+                    metrics[k] = 0.0
 
         # Track accumulated loss across gradient accumulation steps
         self._accumulated_loss += total_loss
@@ -1431,6 +1482,25 @@ class QGRETrainer:
                             vals = " │ ".join(f"{name:>12s} {last_scores.get(key, 0):.1f}" for name, key in fields)
                             rows.append((group_name, vals))
 
+                    # Per-quality loss row (from span-based computation)
+                    quality_losses = {k.replace("loss/", ""): v for k, v in metrics.items() if k.startswith("loss/")}
+                    if quality_losses:
+                        loss_items = sorted(quality_losses.items())[:6]  # Top 6 for space
+                        loss_vals = " │ ".join(f"{q[:10]:>10s} {v:.4f}" for q, v in loss_items)
+                        rows.append(("SpanLoss", loss_vals))
+
+                    # Learning coefficients (learnability from advantage estimator)
+                    if hasattr(self.advantage_estimator, '_reward_var') and self.advantage_estimator._reward_var:
+                        # Get learnability for last prompt's qualities
+                        last_pid = batch.prompt_ids[-1] if batch.prompt_ids else None
+                        if last_pid is not None and last_pid in self.advantage_estimator._reward_var:
+                            vars_dict = self.advantage_estimator._reward_var[last_pid]
+                            # Learnability = p(1-p), approximated from variance
+                            learn_items = [(q, min(v, 0.25)) for q, v in vars_dict.items() if v > 0][:5]
+                            if learn_items:
+                                learn_vals = " │ ".join(f"{q[:8]:>8s} {v:.3f}" for q, v in learn_items)
+                                rows.append(("Learning", learn_vals))
+
                     if self.game_state.tutorial_enabled:
                         tut = self.game_state.get_tutorial_metrics()
                         tut_vals = (f"{'active':>12s} {tut.get('tutorial/active_skills', 0)}   │ "
@@ -1444,8 +1514,10 @@ class QGRETrainer:
                     val_w = max((len(r[1]) for r in rows), default=40) + 2
                     total_w = label_w + val_w + 3  # 3 for " │ "
 
-                    # Header row
-                    header = f" Step {self.global_step}/{cfg.total_steps} │ Phase {self.game_state.phase} │ Tiers: {tiers_str} │ Reward: {reward_mean:.3f} │ Loss: {loss_val:.6f} │ Critic: {critic_val:.3f}"
+                    # Header row (show spans status based on per-quality loss presence)
+                    spans_active = any(k.startswith("loss/") for k in metrics)
+                    spans_str = "spans" if spans_active else "segmenter"
+                    header = f" Step {self.global_step}/{cfg.total_steps} │ Phase {self.game_state.phase} │ Tiers: {tiers_str} │ [{spans_str}] │ Reward: {reward_mean:.3f} │ Loss: {loss_val:.6f}"
                     header_w = max(total_w, len(header) + 2)
 
                     print(f"\n┌{'─' * header_w}┐")

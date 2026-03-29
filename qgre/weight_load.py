@@ -123,10 +123,9 @@ class WeightLoader:
                 f"modules_to_save partial sync failure: expected {expected}, synced {synced}. "
                 f"Missing: {set(expected) - set(synced)}"
             )
-        # WS-R1-7: Always synchronize at end, even if no modules_to_save (LoRA may be pending)
-        # WS-R2-1: Pass device for multi-GPU safety
-        target_device = tensor.device if tensor is not None else torch.cuda.current_device()
-        torch.cuda.synchronize(device=target_device)
+        # Only sync if we actually copied modules_to_save (restores pre-harden behavior)
+        if synced:
+            torch.cuda.synchronize()
 
     def get_vllm_model(self):
         """Navigate vLLM internals to get the base model for direct weight access.

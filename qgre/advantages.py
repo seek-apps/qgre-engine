@@ -147,6 +147,8 @@ class QGREStepAdvantageEstimator:
         var_threshold: float = 0.01,
         var_lr: float = 0.05,
         min_var_ratio: float = 0.01,
+        staleness_window: int = 50,
+        baseline_prior: float = 0.5,
     ):
         self.lr = lr
         self.mode = mode
@@ -163,19 +165,27 @@ class QGREStepAdvantageEstimator:
         self.step_qualities = step_qualities
         self.segmenter = segmenter or uniform_segmenter
         self._step_nums = sorted(self.step_qualities.keys())
-        self.V: dict[int, dict[int, float]] = defaultdict(lambda: defaultdict(float))
+        # Per-quality SPO baselines (keyed by quality name, not step number)
+        self.V: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        self.V_last_seen: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        self._quality_seen: dict[int, set[str]] = defaultdict(set)
+        # Legacy step-seen for backward compat (deprecated)
         self._step_seen: dict[int, set[int]] = defaultdict(set)
         # Target-aware aspiration gap
         self._aspiration_beta = 0.0  # Set from config via trainer
         self._aspiration_target = 0.0
 
-        # Variance-aware baseline: track per-(prompt, step) reward variance
+        # Variance-aware baseline: track per-(prompt, quality) reward variance
         self._var_aware = var_aware
         self._var_threshold = var_threshold
         self._var_lr = var_lr
         self._min_var_ratio = min_var_ratio
-        self._reward_var: dict[int, dict[int, float]] = defaultdict(lambda: defaultdict(lambda: self._var_threshold))
-        self._reward_mean: dict[int, dict[int, float]] = defaultdict(lambda: defaultdict(float))
+        self._reward_var: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(lambda: self._var_threshold))
+        self._reward_mean: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        # Staleness decay for sparse qualities
+        self._staleness_window = staleness_window
+        self._baseline_prior = baseline_prior
+        self._current_step = 0  # Updated externally by trainer
         # step_region_map: virtual steps (no segmenter region) → region step whose tokens carry their advantage
         # e.g., {7: 2} means step 7's advantage is added to STEP_2 tokens
         self.step_region_map = step_region_map or {}
@@ -196,6 +206,49 @@ class QGREStepAdvantageEstimator:
         self._region_extra_steps: dict[int, list[int]] = defaultdict(list)
         for virtual_step, region_step in self.step_region_map.items():
             self._region_extra_steps[region_step].append(virtual_step)
+
+    def get_baseline(self, prompt_id: int, quality_name: str) -> float:
+        """Get baseline with staleness decay for sparse qualities.
+
+        Qualities that haven't been seen in staleness_window steps decay
+        toward baseline_prior to prevent stale baselines from anchoring advantage.
+        """
+        V = self.V[prompt_id][quality_name]
+        last_seen = self.V_last_seen[prompt_id][quality_name]
+
+        if last_seen == 0:
+            return self._baseline_prior  # Never seen → use prior
+
+        # Guard: if current_step not yet set or negative staleness, use prior
+        if self._current_step == 0:
+            return self._baseline_prior
+        steps_since = self._current_step - last_seen
+        if steps_since < 0:
+            # Checkpoint restored with future last_seen — use prior
+            warnings.warn(
+                f"Negative staleness {steps_since} for prompt {prompt_id} quality {quality_name}. "
+                f"current_step={self._current_step}, last_seen={last_seen}. Using prior."
+            )
+            return self._baseline_prior
+
+        if steps_since > self._staleness_window:
+            # Continuous exponential decay (no discrete jumps)
+            decay = 0.9 ** (steps_since / self._staleness_window)
+            return V * decay + self._baseline_prior * (1 - decay)
+
+        return V
+
+    def update_baseline(
+        self, prompt_id: int, quality_name: str, reward: float, effective_lr: float
+    ) -> None:
+        """Update baseline and track last-seen step."""
+        V = self.V[prompt_id][quality_name]
+        self.V[prompt_id][quality_name] = V + effective_lr * (reward - V)
+        self.V_last_seen[prompt_id][quality_name] = self._current_step
+
+    def set_current_step(self, step: int) -> None:
+        """Called by trainer at start of each step."""
+        self._current_step = step
 
     def compute_advantages(
         self,
@@ -456,12 +509,18 @@ class QGREStepAdvantageEstimator:
 
     def state_dict(self) -> dict:
         return {
-            "V": {pid: dict(steps) for pid, steps in self.V.items()},
+            # Per-quality baselines (keyed by quality name string)
+            "V": {pid: dict(qualities) for pid, qualities in self.V.items()},
+            "V_last_seen": {pid: dict(qualities) for pid, qualities in self.V_last_seen.items()},
+            "quality_seen": {pid: list(qualities) for pid, qualities in self._quality_seen.items()},
+            # Legacy step_seen for backward compat
             "step_seen": {pid: list(steps) for pid, steps in self._step_seen.items()},
-            "reward_var": {pid: dict(steps) for pid, steps in self._reward_var.items()},
-            "reward_mean": {pid: dict(steps) for pid, steps in self._reward_mean.items()},
+            # Per-quality variance tracking
+            "reward_var": {pid: dict(qualities) for pid, qualities in self._reward_var.items()},
+            "reward_mean": {pid: dict(qualities) for pid, qualities in self._reward_mean.items()},
             "lr": self.lr,
             "mode": self.mode,
+            "current_step": self._current_step,
         }
 
     def compute_advantages_with_spans(
@@ -474,97 +533,156 @@ class QGREStepAdvantageEstimator:
         group_size: int | None = None,
         frontier_steps: set[int] | None = None,
         batch_contexts: list[PromptContext] | None = None,
-    ) -> list[torch.Tensor]:
-        """Compute per-token advantages using span-based token masks.
+    ) -> tuple[list[torch.Tensor], dict[str, dict[str, float]]]:
+        """Compute per-token advantages using PER-QUALITY span-based token masks.
 
-        Same per-step SPO/GRPO logic as compute_advantages(), but broadcasts
-        advantages to tokens using scored_spans masks instead of section regions.
+        Unlike step-level averaging, this computes independent advantages per quality
+        and broadcasts each quality's advantage to only its own span tokens.
 
-        Args:
-            batch_token_masks: per-sample dict of quality_name → [seq_len] boolean mask
-                (from qgre.spans.scored_spans_to_token_masks)
+        Returns:
+            (batch_advantages, batch_quality_metrics):
+            - batch_advantages: per-token advantage tensors
+            - batch_quality_metrics: per-sample dict of quality_name → {reward, baseline, advantage}
         """
         batch_size = len(batch_token_ids)
 
-        # Phase 1: Compute per-step rewards (same as region-based path)
-        all_step_rewards: list[dict[int, float]] = []
+        # Per-quality advantages for each sample
+        all_quality_advs: list[dict[str, float]] = []
+        batch_quality_metrics: dict[str, dict[str, float]] = {}
+
+        # Phase 1+2: Compute per-quality advantages directly (no step averaging)
         for i in range(batch_size):
-            step_rews: dict[int, float] = {}
-            for step_num, quality_keys in self.step_qualities.items():
-                active = [k for k in quality_keys if k in batch_active_qualities[i]]
-                if active:
-                    vals = [batch_reward_results[i].scores.get(k, 0.0) for k in active]
-                    step_rews[step_num] = sum(vals) / len(vals)
+            ctx = batch_contexts[i] if batch_contexts and i < len(batch_contexts) else None
+            pid = ctx.prompt_id if ctx is not None else batch_prompt_ids[i]
+            warmup = getattr(ctx, 'aspiration_warmup', 1.0) if ctx else 1.0
+
+            quality_advs: dict[str, float] = {}
+
+            for quality_name in batch_active_qualities[i]:
+                r = batch_reward_results[i].scores.get(quality_name, 0.0)
+                v = self.get_baseline(pid, quality_name)
+
+                # Warm-start: first observation → use prior
+                if quality_name not in self._quality_seen[pid]:
+                    v = self._baseline_prior
+                    self._quality_seen[pid].add(quality_name)
+
+                # Perfect score (1.0) = zero advantage — nothing to learn
+                if r >= 1.0:
+                    quality_advs[quality_name] = 0.0
                 else:
-                    step_rews[step_num] = 0.0
-            all_step_rewards.append(step_rews)
+                    adv = r - v
+                    # Aspiration gap: push toward target (usually mastery_threshold)
+                    if self._aspiration_beta > 0:
+                        adv += self._aspiration_beta * warmup * (r - self._aspiration_target)
+                    quality_advs[quality_name] = adv
 
-        # Phase 2: Per-step advantages via SPO or GRPO (same as region-based path)
-        step_advs: dict[int, torch.Tensor] = {
-            s: torch.zeros(batch_size) for s in self._step_nums
-        }
-        if self.mode == "spo":
-            self._compute_spo_advantages(batch_prompt_ids, all_step_rewards, step_advs, batch_size,
-                                         batch_contexts=batch_contexts)
-        else:
-            self._compute_grpo_advantages(
-                batch_prompt_ids, all_step_rewards, step_advs, batch_size,
-                group_size=group_size or batch_size,
-            )
+                # Variance-aware baseline learning rate
+                effective_lr = self.lr
+                if self._var_aware:
+                    r_mean = self._reward_mean[pid][quality_name]
+                    new_mean = r_mean + self._var_lr * (r - r_mean)
+                    self._reward_mean[pid][quality_name] = new_mean
+                    old_var = self._reward_var[pid][quality_name]
+                    new_var = old_var + self._var_lr * ((r - new_mean) ** 2 - old_var)
+                    if new_var < 0:
+                        warnings.warn(
+                            f"Negative variance {new_var:.6f} for prompt {pid} quality {quality_name}. "
+                            f"old_var={old_var:.6f}, r={r:.4f}, r_mean={r_mean:.4f}. Clamping to 0."
+                        )
+                    self._reward_var[pid][quality_name] = max(0.0, new_var)
+                    if new_var < self._var_threshold:
+                        effective_lr = self.lr * max(new_var / self._var_threshold, self._min_var_ratio)
 
-        self._normalize_step_advantages(step_advs)
+                # Update baseline using new per-quality method
+                self.update_baseline(pid, quality_name, r, effective_lr)
 
-        # Frontier amplification (same as region-based path)
-        apply_frontier_amplification(step_advs, self._step_nums, frontier_steps, self.frontier_amplification)
+                # Collect metrics for logging
+                batch_quality_metrics[f"sample_{i}/{quality_name}"] = {
+                    "reward": r,
+                    "baseline": v,
+                    "advantage": quality_advs[quality_name],
+                }
 
-        # Phase 3: Broadcast using span masks instead of region labels
+            all_quality_advs.append(quality_advs)
+
+        # Phase 3: Broadcast per-quality advantages to tokens (additive + normalized)
         batch_advantages: list[torch.Tensor] = []
         for i in range(batch_size):
             seq_len = len(batch_token_ids[i])
-            # Get device from batch_token_masks (already on GPU)
+            # Get device from batch_token_masks
             device = None
             if batch_token_masks[i]:
                 first_mask = next(iter(batch_token_masks[i].values()), None)
                 if first_mask is not None and isinstance(first_mask, torch.Tensor):
                     device = first_mask.device
+
             token_advs = torch.zeros(seq_len, device=device)
+            token_coverage = torch.zeros(seq_len, device=device)
             masks = batch_token_masks[i]
 
-            for step_num, quality_keys in self.step_qualities.items():
-                step_adv = step_advs[step_num][i].item()
-                if abs(step_adv) < 1e-10:
+            for quality_name in batch_active_qualities[i]:
+                if quality_name not in masks:
                     continue
-                # Build UNION mask for this step — each token gets step's advantage at most once
-                # regardless of how many qualities within the step cover that token.
-                step_mask = torch.zeros(seq_len, device=device)
-                for q_name in quality_keys:
-                    if q_name in masks:
-                        assert masks[q_name].shape[0] == seq_len, f"Mask shape mismatch: {masks[q_name].shape[0]} vs seq_len {seq_len}"
-                        step_mask = torch.maximum(step_mask, masks[q_name])
-                token_advs += step_adv * step_mask
+                q_adv = all_quality_advs[i].get(quality_name, 0.0)
+                if abs(q_adv) < 1e-10:
+                    continue
+                q_mask = masks[quality_name]
+                # Graceful handling instead of assert — don't crash on data-dependent mismatch
+                if q_mask.shape[0] != seq_len:
+                    warnings.warn(
+                        f"Mask shape mismatch for quality '{quality_name}': "
+                        f"mask has {q_mask.shape[0]} tokens but sequence has {seq_len}. "
+                        f"Skipping — check reward_fn scored_spans and tokenizer consistency."
+                    )
+                    continue
+                token_advs += q_adv * q_mask
+                token_coverage += q_mask
+
+            # Normalize: tokens covered by N qualities get advantage / N
+            # Preserves direction, bounds magnitude
+            token_coverage = torch.clamp(token_coverage, min=1.0)
+            token_advs = token_advs / token_coverage
 
             batch_advantages.append(token_advs)
 
-        return batch_advantages
+        return batch_advantages, batch_quality_metrics
 
     def load_state_dict(self, state: dict):
         self.lr = state.get("lr", self.lr)
         self.mode = state.get("mode", self.mode)
+        self._current_step = state.get("current_step", 0)
+
+        # Per-quality baselines (string keys)
         self.V = defaultdict(lambda: defaultdict(float))
-        for pid, steps in state.get("V", {}).items():
-            for step_num, val in steps.items():
-                self.V[int(pid)][int(step_num)] = float(val)
+        for pid, qualities in state.get("V", {}).items():
+            for quality_name, val in qualities.items():
+                # Handle both old (int step keys) and new (string quality keys)
+                self.V[int(pid)][str(quality_name)] = float(val)
+
+        self.V_last_seen = defaultdict(lambda: defaultdict(int))
+        for pid, qualities in state.get("V_last_seen", {}).items():
+            for quality_name, val in qualities.items():
+                self.V_last_seen[int(pid)][str(quality_name)] = int(val)
+
+        self._quality_seen = defaultdict(set)
+        for pid, qualities in state.get("quality_seen", {}).items():
+            self._quality_seen[int(pid)] = set(str(q) for q in qualities)
+
+        # Legacy step_seen for backward compat
         self._step_seen = defaultdict(set)
         for pid, steps in state.get("step_seen", {}).items():
             self._step_seen[int(pid)] = set(int(s) for s in steps)
-        # Merge loaded state into existing dict to preserve state for prompts not in checkpoint
-        for pid, steps in state.get("reward_var", {}).items():
-            for step_num, val in steps.items():
-                self._reward_var[int(pid)][int(step_num)] = float(val)
+
+        # Per-quality variance tracking (string keys)
+        for pid, qualities in state.get("reward_var", {}).items():
+            for quality_name, val in qualities.items():
+                self._reward_var[int(pid)][str(quality_name)] = float(val)
+
         self._reward_mean = defaultdict(lambda: defaultdict(float))
-        for pid, steps in state.get("reward_mean", {}).items():
-            for step_num, val in steps.items():
-                self._reward_mean[int(pid)][int(step_num)] = float(val)
+        for pid, qualities in state.get("reward_mean", {}).items():
+            for quality_name, val in qualities.items():
+                self._reward_mean[int(pid)][str(quality_name)] = float(val)
 
 
 def compute_advantages_vprm(

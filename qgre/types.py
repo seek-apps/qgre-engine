@@ -77,6 +77,8 @@ class SkillNode:
     _unlock_step: int | None = field(default=None, repr=False)  # Step when skill was unlocked
     _pre_unlock_baseline: float | None = field(default=None, repr=False)  # Mastery score of prerequisites at unlock time
     aspiration_warmup_steps: int = 20  # Ramp aspiration from 0→full over N steps after unlock
+    # Learnability-based advancement: advance only when variance collapses
+    learnability_threshold: float = 0.10  # Advance when p(1-p) < this
 
     def __post_init__(self):
         if not self.prerequisites:
@@ -98,6 +100,34 @@ class SkillNode:
         if not self.recent_scores:
             return 0.0
         return sum(self.recent_scores) / len(self.recent_scores)
+
+    @property
+    def learnability(self) -> float:
+        """Bernoulli variance = p(1-p). Maximized at p=0.5, zero at p=0 or p=1.
+
+        High learnability = skill still has variance = still learning.
+        Low learnability = skill is stable = ready to advance.
+        """
+        if len(self.recent_scores) < 5:
+            # Not enough data — return max learnability to prevent premature advancement
+            # 0.25 = variance at p=0.5 (maximum uncertainty)
+            return 0.25
+        p = self.mastery_score
+        return p * (1.0 - p)
+
+    @property
+    def ready_to_advance(self) -> bool:
+        """Ready when: mastery > threshold AND learnability < stale_threshold.
+
+        High mastery + low learnability = skill is learned, move on.
+        High mastery + high learnability = skill still has variance, stay.
+        """
+        if len(self.recent_scores) < self.mastery_window:
+            return False
+        if self.mastery_score < self.mastery_threshold:
+            return False
+        # Only advance when variance has collapsed (skill is stable)
+        return self.learnability < self.learnability_threshold
 
     def unlocked(self, skill_tree: dict[str, SkillNode]) -> bool:
         return all(skill_tree[pre].mastered for pre in self.prerequisites)
@@ -243,6 +273,7 @@ class GameState:
                 review_probability=sc.review_probability,
                 score_key=sc.score_key,
                 aspiration_warmup_steps=sc.aspiration_warmup_steps,
+                learnability_threshold=sc.learnability_threshold,
                 recent_scores=deque(maxlen=sc.mastery_window),
             )
 
@@ -421,24 +452,39 @@ class GameState:
         return active
 
     def record_completion(self, prompt_id: str, v_correct: float):
-        """Route a completion score to the appropriate skill node."""
+        """Route a completion score to the appropriate skill node.
+
+        Uses learnability-based advancement: skills only transition to MASTERED
+        when ready_to_advance=True (mastery threshold + low variance). This
+        prevents premature advancement when variance is still high.
+
+        Regression still uses mastered (with hysteresis) for stability.
+        """
         skill_key = self._prompt_to_skill.get(prompt_id)
         if skill_key is None:
             return  # Untracked prompt
 
         node = self.skill_tree[skill_key]
-        was_mastered_before = node.mastered
+        was_mastered_before = node.mastered  # For regression hysteresis
+        was_ready_before = node.ready_to_advance  # For advancement gating
         node.record_score(v_correct)
         is_mastered_now = node.mastered
+        is_ready_now = node.ready_to_advance
 
-        if is_mastered_now and not was_mastered_before:
+        # Advancement: uses ready_to_advance (mastery + low learnability variance)
+        # This prevents advancing when skill is still high-variance (in ZPD)
+        if is_ready_now and not was_ready_before:
             node._status = SkillStatus.MASTERED
             logger.info(f"[TUTORIAL] SKILL MASTERED: {node.name} "
                        f"(mastery={node.mastery_score:.2f}, "
-                       f"threshold={node.mastery_threshold})")
+                       f"learnability={node.learnability:.3f}, "
+                       f"threshold={node.mastery_threshold}, "
+                       f"learnability_threshold={node.learnability_threshold})")
             self._invalidate_prompt_cache()
             self._check_unlocks()
 
+        # Regression: uses mastered (hysteresis threshold) for stability
+        # Don't relock just because variance spiked temporarily
         elif was_mastered_before and not is_mastered_now:
             node._status = SkillStatus.ACTIVE
             logger.warning(f"[TUTORIAL] MASTERY REGRESSION: {node.name} "

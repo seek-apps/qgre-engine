@@ -96,7 +96,8 @@ class ClippedPGLossFn:
         mask: torch.Tensor,
         reference_logprobs: torch.Tensor | None = None,
         kl_region_weights: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict]:
+        return_per_token_loss: bool = False,
+    ) -> tuple[torch.Tensor, dict] | tuple[torch.Tensor, dict, torch.Tensor]:
         """Compute clipped PG loss.
 
         Args:
@@ -207,4 +208,8 @@ class ClippedPGLossFn:
                 "probs_ratio_clamped_mean": ratio_clamped_mean,
             }
 
+        if return_per_token_loss:
+            # Return per-token loss for per-quality loss computation
+            # weighted_loss is [batch, seq] — the per-token contribution before reduction
+            return loss, metrics, weighted_loss.detach()
         return loss, metrics

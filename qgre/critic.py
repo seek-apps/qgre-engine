@@ -55,11 +55,14 @@ class VPRMCritic(nn.Module):
         step_qualities: dict[int, list[str]],
         intermediate_dim: int = 128,
         clip_advantage: float = 5.0,
+        step_region_map: dict[int, int] | None = None,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.step_qualities = step_qualities
         self.clip_advantage = clip_advantage
+        # step_region_map: virtual_step → physical_region (e.g., {7: 2, 8: 3, 9: 6})
+        self.step_region_map = step_region_map or {}
 
         # Collect all unique quality names
         all_qualities: list[str] = []
@@ -86,10 +89,15 @@ class VPRMCritic(nn.Module):
             param.requires_grad = False
 
         # Map quality → step_num (for region assignment)
+        # Then apply step_region_map to get the actual region step
         self._quality_to_step: dict[str, int] = {}
+        self._quality_to_region: dict[str, int] = {}
         for step_num, qualities in step_qualities.items():
             for q in qualities:
                 self._quality_to_step[q] = step_num
+                # Apply step_region_map: virtual steps map to physical regions
+                region_step = self.step_region_map.get(step_num, step_num)
+                self._quality_to_region[q] = region_step
 
     @torch.no_grad()
     def update_target_network(self, tau: float = 0.01):
@@ -143,11 +151,12 @@ class VPRMCritic(nn.Module):
                 region_pools[f"STEP_{step_id}"] = pooled
 
         # Predict baseline for each quality using its region's pooled states
+        # Uses _quality_to_region which applies step_region_map for virtual steps
         heads = self.target_heads if use_target else self.heads
         predictions: dict[str, torch.Tensor] = {}
         for q_name in self.quality_names:
-            step_num = self._quality_to_step[q_name]
-            region_key = f"STEP_{step_num}"
+            region_step = self._quality_to_region[q_name]
+            region_key = f"STEP_{region_step}"
             if region_key in region_pools:
                 pooled = region_pools[region_key].unsqueeze(0)  # [1, hidden_dim]
                 predictions[q_name] = heads[q_name](pooled).squeeze(0).squeeze(0)
@@ -201,8 +210,9 @@ class VPRMCritic(nn.Module):
 
         for q_name in self.quality_names:
             actual = actual_rewards.get(q_name, 0.0)
-            step_num = self._quality_to_step[q_name]
-            region_key = f"STEP_{step_num}"
+            # Use _quality_to_region which applies step_region_map for virtual steps
+            region_step = self._quality_to_region[q_name]
+            region_key = f"STEP_{region_step}"
 
             if region_key not in region_pools:
                 if not hasattr(self, "_region_warned"):
@@ -294,14 +304,16 @@ class VPRMCritic(nn.Module):
             "quality_names": self.quality_names,
             "hidden_dim": self.hidden_dim,
             "step_qualities": self.step_qualities,
+            "step_region_map": self.step_region_map,
         }
 
     @classmethod
     def from_checkpoint(cls, checkpoint: dict, device: str = "cpu") -> VPRMCritic:
-        """Restore critic from checkpoint. Handles old checkpoints without target_heads."""
+        """Restore critic from checkpoint. Handles old checkpoints without target_heads or step_region_map."""
         critic = cls(
             hidden_dim=checkpoint["hidden_dim"],
             step_qualities=checkpoint["step_qualities"],
+            step_region_map=checkpoint.get("step_region_map"),  # May be None for old checkpoints
         )
         # Load with strict=False to handle old checkpoints without target_heads
         critic.load_state_dict(checkpoint["model_state"], strict=False)

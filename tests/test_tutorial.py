@@ -603,7 +603,8 @@ class TestConfigParsing:
         import yaml
 
         config_dict = {
-            "model": {"path": "test", "pad_token": "<pad>", "pad_token_id": 0},
+            "model": {"path": "test", "pad_token": "<pad>", "pad_token_id": 0, "lora_target_modules": ["q_proj"]},
+            "data": {"train_files": ["dummy.parquet"]},
             "generation": {"stop_token_ids": [2]},
             "tutorial": {
                 "enabled": True,
@@ -640,6 +641,9 @@ class TestConfigParsing:
         import yaml
 
         config_dict = {
+            "model": {"path": "test", "pad_token": "<pad>", "pad_token_id": 0, "lora_target_modules": ["q_proj"]},
+            "data": {"train_files": ["dummy.parquet"]},
+            "generation": {"stop_token_ids": [2]},
             "tutorial": {
                 "enabled": True,
                 "post_mastery_behavior": "invalid_mode",
@@ -873,3 +877,203 @@ class TestIntegration:
         assert 'tutorial/skill/freefall/aspiration_target' in metrics
         assert metrics['tutorial/skill/freefall/aspiration_target'] == 0.85
         assert metrics['tutorial/skill/gravity_spring/aspiration_target'] == 0.75
+
+
+# ─── Learnability-Based Advancement Tests ───
+
+
+class TestLearnabilityAdvancement:
+    """Tests for learnability-based skill advancement (variance gating)."""
+
+    def test_high_mastery_high_variance_no_advance(self):
+        """Skill with high mastery but high variance should NOT advance."""
+        config = TutorialConfig(
+            enabled=True,
+            post_mastery_behavior="review_only",
+            skill_tree={
+                "freefall": SkillConfig(
+                    prompts=["ff_1"],
+                    prerequisites=[],
+                    mastery_threshold=0.80,
+                    regression_threshold=0.60,
+                    mastery_window=20,
+                    learnability_threshold=0.10,  # Advance when p(1-p) < 0.10
+                ),
+            },
+        )
+        gs = GameState()
+        gs.init_tutorial(config, ["ff_1"])
+
+        # Fill window with alternating scores (high variance)
+        # Mean = 0.85, but variance is high
+        for i in range(20):
+            score = 0.95 if i % 2 == 0 else 0.75  # Alternating → high variance
+            gs.record_completion("ff_1", score)
+
+        node = gs.skill_tree["freefall"]
+        # Mastery should be ~0.85 (above threshold)
+        assert node.mastery_score >= 0.80
+        # Learnability = p(1-p) = 0.85 * 0.15 = 0.1275 > 0.10
+        assert node.learnability > 0.10
+        # Should NOT be ready to advance
+        assert not node.ready_to_advance
+        # Status should still be ACTIVE, not MASTERED
+        assert node.status == SkillStatus.ACTIVE
+
+    def test_high_mastery_low_variance_advances(self):
+        """Skill with high mastery and low variance SHOULD advance."""
+        config = TutorialConfig(
+            enabled=True,
+            post_mastery_behavior="review_only",
+            skill_tree={
+                "freefall": SkillConfig(
+                    prompts=["ff_1"],
+                    prerequisites=[],
+                    mastery_threshold=0.80,
+                    regression_threshold=0.60,
+                    mastery_window=20,
+                    learnability_threshold=0.10,
+                ),
+            },
+        )
+        gs = GameState()
+        gs.init_tutorial(config, ["ff_1"])
+
+        # Fill window with consistent high scores (low variance)
+        # All 0.95 → p = 0.95, learnability = 0.95 * 0.05 = 0.0475
+        for _ in range(20):
+            gs.record_completion("ff_1", 0.95)
+
+        node = gs.skill_tree["freefall"]
+        assert node.mastery_score >= 0.90
+        # Learnability = 0.95 * 0.05 = 0.0475 < 0.10
+        assert node.learnability < 0.10
+        assert node.ready_to_advance
+        assert node.status == SkillStatus.MASTERED
+
+    def test_variance_collapse_triggers_advancement(self):
+        """Skill that starts variable then stabilizes should eventually advance."""
+        config = TutorialConfig(
+            enabled=True,
+            post_mastery_behavior="review_only",
+            skill_tree={
+                "freefall": SkillConfig(
+                    prompts=["ff_1"],
+                    prerequisites=[],
+                    mastery_threshold=0.80,
+                    regression_threshold=0.60,
+                    mastery_window=10,  # Shorter window for test
+                    learnability_threshold=0.10,
+                ),
+            },
+        )
+        gs = GameState()
+        gs.init_tutorial(config, ["ff_1"])
+
+        # Phase 1: Variable scores (still learning)
+        for i in range(10):
+            score = 0.95 if i % 2 == 0 else 0.75
+            gs.record_completion("ff_1", score)
+
+        node = gs.skill_tree["freefall"]
+        assert node.status == SkillStatus.ACTIVE  # Not mastered yet
+
+        # Phase 2: Consistent high scores (variance collapses)
+        for _ in range(10):
+            gs.record_completion("ff_1", 0.92)
+
+        # Now variance has collapsed
+        assert node.learnability < 0.10
+        assert node.ready_to_advance
+        assert node.status == SkillStatus.MASTERED
+
+    def test_dependent_unlock_waits_for_ready_to_advance(self):
+        """Dependent skills should only unlock when prereqs are ready_to_advance."""
+        config = TutorialConfig(
+            enabled=True,
+            post_mastery_behavior="review_only",
+            skill_tree={
+                "freefall": SkillConfig(
+                    prompts=["ff_1"],
+                    prerequisites=[],
+                    mastery_threshold=0.80,
+                    mastery_window=20,
+                    learnability_threshold=0.10,
+                ),
+                "gravity_spring": SkillConfig(
+                    prompts=["gs_1"],
+                    prerequisites=["freefall"],
+                    mastery_threshold=0.75,
+                    mastery_window=20,
+                    learnability_threshold=0.12,
+                ),
+            },
+        )
+        gs = GameState()
+        gs.init_tutorial(config, ["ff_1", "gs_1"])
+
+        # Fill freefall with high-variance scores (mastery OK, learnability high)
+        for i in range(20):
+            score = 0.95 if i % 2 == 0 else 0.75
+            gs.record_completion("ff_1", score)
+
+        freefall = gs.skill_tree["freefall"]
+        gravity_spring = gs.skill_tree["gravity_spring"]
+
+        # Freefall has high mastery but high variance
+        assert freefall.mastery_score >= 0.80
+        assert freefall.learnability > 0.10
+        assert freefall.status == SkillStatus.ACTIVE  # Not MASTERED
+        # Gravity_spring should still be LOCKED
+        assert gravity_spring.status == SkillStatus.LOCKED
+
+        # Now stabilize freefall
+        for _ in range(20):
+            gs.record_completion("ff_1", 0.92)
+
+        # Freefall should now be MASTERED (variance collapsed)
+        assert freefall.status == SkillStatus.MASTERED
+        # Gravity_spring should now be ACTIVE (prereq mastered)
+        assert gravity_spring.status == SkillStatus.ACTIVE
+
+    def test_learnability_thresholds_vary_by_skill(self):
+        """Different skills can have different learnability thresholds."""
+        config = TutorialConfig(
+            enabled=True,
+            skill_tree={
+                "easy_skill": SkillConfig(
+                    prompts=["easy_1"],
+                    prerequisites=[],
+                    mastery_threshold=0.80,
+                    mastery_window=10,
+                    learnability_threshold=0.05,  # Strict — must be very stable
+                ),
+                "hard_skill": SkillConfig(
+                    prompts=["hard_1"],
+                    prerequisites=[],
+                    mastery_threshold=0.80,
+                    mastery_window=10,
+                    learnability_threshold=0.15,  # Lenient — some variance OK
+                ),
+            },
+        )
+        gs = GameState()
+        gs.init_tutorial(config, ["easy_1", "hard_1"])
+
+        # Both get same scores: p=0.88 → learnability = 0.88 * 0.12 = 0.1056
+        for _ in range(10):
+            gs.record_completion("easy_1", 0.88)
+            gs.record_completion("hard_1", 0.88)
+
+        easy = gs.skill_tree["easy_skill"]
+        hard = gs.skill_tree["hard_skill"]
+
+        # easy_skill: learnability 0.1056 > 0.05 → NOT ready
+        assert easy.learnability > 0.05
+        assert not easy.ready_to_advance
+        assert easy.status == SkillStatus.ACTIVE
+
+        # hard_skill: learnability 0.1056 < 0.15 → ready
+        assert hard.learnability < 0.15
+        assert hard.ready_to_advance
+        assert hard.status == SkillStatus.MASTERED

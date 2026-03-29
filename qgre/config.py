@@ -80,6 +80,9 @@ class SPOConfig:
     var_threshold: float = 0.01  # Variance below this triggers slowdown
     var_lr: float = 0.05  # EMA rate for variance tracking
     min_var_ratio: float = 0.01  # Floor: baseline lr never drops below lr * min_var_ratio
+    # Per-quality baseline staleness: decay toward prior when quality hasn't been seen in N steps
+    staleness_window: int = 50  # Steps before baseline starts decaying toward prior
+    baseline_prior: float = 0.5  # Prior value for unseen/stale qualities (middle of [0,1])
 
 
 @dataclass
@@ -119,6 +122,9 @@ class SkillConfig:
     review_probability: float = 0.15
     score_key: str | None = None  # Quality key from RewardResult.scores to track mastery (e.g. "q_V_correct"). None = overall reward.
     aspiration_warmup_steps: int = 20  # After unlock, ramp aspiration beta from 0 → full over N steps
+    # Learnability-based advancement: advance only when variance collapses (skill is stable)
+    # learnability = p(1-p) where p = mastery_score. At p=0.5: 0.25 (max), p=0.9: 0.09 (ready)
+    learnability_threshold: float = 0.10  # Advance when p(1-p) < this (p > 0.89 or p < 0.11)
 
 
 _VALID_POST_MASTERY_BEHAVIORS = {"review_only", "pause", "continue_all"}
@@ -219,6 +225,7 @@ class LoggingConfig:
     completion_dir: str = "output/completions"
     checkpoint_dir: str = "output/checkpoints"
     log_freq: int = 5  # Print progress table every N steps
+    grad_log_freq: int = 10  # Log per-quality gradient flow proxy every N steps
 
 
 @dataclass
