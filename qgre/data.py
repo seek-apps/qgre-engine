@@ -94,15 +94,47 @@ class QGREDataLoader:
                 if self.system_prompt_column and row.get(self.system_prompt_column):
                     messages.append({"role": "system", "content": row[self.system_prompt_column]})
                 messages.append({"role": "user", "content": text})
-                try:
+
+                # Pre-check: detect if enable_thinking parameter is supported
+                # (avoids try/except overhead on every prompt)
+                if not hasattr(self, "_enable_thinking_supported"):
+                    import inspect
+                    try:
+                        sig = inspect.signature(self.tokenizer.apply_chat_template)
+                        self._enable_thinking_supported = "enable_thinking" in sig.parameters
+                    except (ValueError, TypeError):
+                        # signature() can fail on some C extensions — try/except as fallback
+                        self._enable_thinking_supported = None
+
+                if self._enable_thinking_supported is True:
                     token_ids = self.tokenizer.apply_chat_template(
                         messages, tokenize=True, add_generation_prompt=True,
                         enable_thinking=False,
                     )
-                except TypeError:
+                elif self._enable_thinking_supported is False:
                     token_ids = self.tokenizer.apply_chat_template(
                         messages, tokenize=True, add_generation_prompt=True,
                     )
+                else:
+                    # Fallback: signature check failed, try with parameter and catch TypeError
+                    try:
+                        token_ids = self.tokenizer.apply_chat_template(
+                            messages, tokenize=True, add_generation_prompt=True,
+                            enable_thinking=False,
+                        )
+                        self._enable_thinking_supported = True
+                    except TypeError as e:
+                        if "enable_thinking" not in str(e):
+                            raise
+                        self._enable_thinking_supported = False
+                        token_ids = self.tokenizer.apply_chat_template(
+                            messages, tokenize=True, add_generation_prompt=True,
+                        )
+                # transformers 5.x returns BatchEncoding, extract input_ids
+                if hasattr(token_ids, "input_ids"):
+                    token_ids = token_ids.input_ids
+                    if isinstance(token_ids, list) and len(token_ids) == 1:
+                        token_ids = token_ids[0]
             else:
                 token_ids = self.tokenizer.encode(text)
 

@@ -19,6 +19,11 @@ class ModelConfig:
     weight_sync_strategy: str = "direct_copy"  # "direct_copy" (4-bit) or "merge" (full-precision deployment)
     pad_token: str = ""  # Required — set per-model in YAML. Must NOT be EOS, stop token, or vision-reserved.
     pad_token_id: int = -1  # Required — set per-model in YAML.
+    lora_target_modules: list[str] = field(default_factory=lambda: [
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    ])  # LoRA target modules — model-architecture-specific. Qwen3/LLaMA default shown.
+    modules_to_save: list[str] = field(default_factory=lambda: ["lm_head"])  # embed_tokens removed — fim_pad is pre-trained
 
 
 @dataclass
@@ -48,7 +53,8 @@ class GenerationConfig:
     top_k: int = 20
     min_p: float = 0.1
     max_tokens: int = 4096
-    stop_token_ids: list[int] = field(default_factory=lambda: [151643, 151645])  # Qwen3: <|endoftext|> + <|im_end|>
+    stop_token_ids: list[int] = field(default_factory=list)  # Required per-model. Qwen3: [151643, 151645]
+    max_logprobs: int = 5  # vLLM max_logprobs for LLDS logprob extraction
     # LoRA dropout during generation: partially revert to base model for exploration
     lora_dropout_rate: float = 0.0  # 0.0 = disabled, 0.15 = recommended
     lora_dropout_anneal_steps: int = 500  # Linear anneal to 0 over this many steps
@@ -163,6 +169,9 @@ class AlgorithmConfig:
     # Fused logprobs: chunked lm_head projection saves ~2GB VRAM by not materializing full logit tensor
     use_fused_logprobs: bool = True
     fused_logprob_chunk_size: int = 256  # Tokens per chunk (lower = less memory, more kernel launches)
+    kl_input_clamp: float = 20.0   # Clamp KL input before computing penalty (prevents gradient explosion)
+    kl_output_clamp: float = 10.0  # Clamp KL output after computing penalty
+    spo_filter_threshold: float = 0.001  # Skip sequences with max|advantage| below this (near-zero signal)
     # Region-specific KL multipliers (THR-style, PLAN.md lines 798-802)
     # THINK=explore freely, FORMAT=lock structure, STEP=focus on quality
     kl_think_multiplier: float = 0.1   # Low KL for think tokens (explore)
@@ -197,6 +206,11 @@ class TrainingConfig:
     stagnation_timeout: int = 200
     plateau_window: int = 50
     plateau_threshold: float = 0.02
+    embedding_lr_ratio: float = 0.1  # Embedding/lm_head LR = base_lr * this (lower prevents drift)
+    micro_batch_seq_threshold: int = 2048  # Sequences >= this use micro_batch_size=1 (VRAM safety)
+    kv_cache_flush_freq: int = 50  # Flush vLLM KV cache every N steps (0=never)
+    quality_window_size: int = 20  # Rolling window for mastery score tracking
+    seed: int = -1  # Random seed for training. -1 = time-based (non-reproducible), 0+ = fixed seed.
 
 
 @dataclass
@@ -204,6 +218,7 @@ class LoggingConfig:
     mlflow_experiment: str = "qgre-training"
     completion_dir: str = "output/completions"
     checkpoint_dir: str = "output/checkpoints"
+    log_freq: int = 5  # Print progress table every N steps
 
 
 @dataclass
@@ -219,12 +234,33 @@ class QGREConfig:
     vprm: VPRMConfig = field(default_factory=VPRMConfig)
     tutorial: TutorialConfig = field(default_factory=TutorialConfig)
 
+    def validate(self) -> None:
+        """Validate config for common misconfigurations. Called after from_yaml()."""
+        import warnings
+        if not self.model.pad_token or self.model.pad_token_id < 0:
+            raise ValueError(
+                "model.pad_token and model.pad_token_id are required.\n"
+                "Set per-model in YAML. Qwen3 example: pad_token='<|fim_pad|>', pad_token_id=151662"
+            )
+        if not self.model.lora_target_modules:
+            raise ValueError(
+                "model.lora_target_modules must not be empty.\n"
+                "Set per-model architecture. Qwen3/LLaMA: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]"
+            )
+        if not self.generation.stop_token_ids:
+            warnings.warn(
+                "generation.stop_token_ids is empty — generation may not terminate.\n"
+                "Set per-model. Qwen3: [151643, 151645]"
+            )
+
     @staticmethod
     def from_yaml(path: str | Path) -> QGREConfig:
         """Load config from YAML file."""
         with open(path) as f:
             raw = yaml.safe_load(f)
-        return QGREConfig._from_dict(raw)
+        cfg = QGREConfig._from_dict(raw)
+        cfg.validate()
+        return cfg
 
     @staticmethod
     def _from_dict(d: dict) -> QGREConfig:

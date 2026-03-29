@@ -210,6 +210,10 @@ class TestVPRMConfig:
         yaml_content = """
 model:
   path: test
+  pad_token: "<pad>"
+  pad_token_id: 0
+generation:
+  stop_token_ids: [2]
 vprm:
   enabled: true
   intermediate_dim: 64

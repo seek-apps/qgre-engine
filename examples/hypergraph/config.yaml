@@ -8,6 +8,9 @@ model:
   load_in_4bit: true
   fast_inference: true
   gpu_memory_utilization: 0.35  # Colocate: leaves room for training forward + backward
+  pad_token: "<|fim_pad|>"
+  pad_token_id: 151662
+  modules_to_save: [lm_head]  # embed_tokens removed — fim_pad is pre-trained, saves ~1.2 GB
 
 data:
   train_files:

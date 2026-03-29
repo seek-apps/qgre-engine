@@ -57,7 +57,7 @@ def main():
         r=config.model.lora_rank,
         lora_alpha=config.model.lora_alpha,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        modules_to_save=["lm_head", "embed_tokens"],
+        modules_to_save=["lm_head"],  # Phase 2: embed_tokens removed (fim_pad is pre-trained)
         lora_dropout=0.0,
         use_gradient_checkpointing="unsloth",
     )

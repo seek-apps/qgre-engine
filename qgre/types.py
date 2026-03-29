@@ -155,6 +155,7 @@ class GameState:
     stagnation_timeout: int = 200
     plateau_window: int = 50
     plateau_threshold: float = 0.02
+    quality_window_size: int = 20  # Rolling window for mastery score tracking
 
     # Tutorial skill tree
     tutorial_enabled: bool = False
@@ -548,9 +549,16 @@ class GameState:
     def can_tier_unlock(self, tier_name: str) -> bool:
         """Check if tutorial prerequisites allow this tier to unlock.
 
-        A tier can unlock only if all tutorial skills that have prompts in it
-        are at least ACTIVE (not LOCKED). This prevents gravity_spring prompts
-        from entering training before freefall and spring_only are mastered.
+        A tier can unlock only if all PREREQUISITE skills of skills in that tier
+        are MASTERED. This prevents premature tier advancement before the model
+        has demonstrated consistent mastery on the prerequisite tutorial skills.
+
+        For example, to unlock "combined" tier (which has gravity_spring prompts),
+        the prerequisites of gravity_spring (freefall, spring_only) must be mastered.
+
+        Mastery requires mastery_window completions (default 20) at or above
+        mastery_threshold. This ensures the model has seen enough examples before
+        advancing to harder tiers.
 
         Uses _tier_to_skills mapping built during init_tutorial.
         """
@@ -559,12 +567,25 @@ class GameState:
         skills_in_tier = self._tier_to_skills.get(tier_name, [])
         if not skills_in_tier:
             return True
+
+        # Collect all prerequisite skills that must be mastered
+        prereq_skills = set()
         for skill_key in skills_in_tier:
             node = self.skill_tree[skill_key]
-            if node.status == SkillStatus.LOCKED:
-                print(f"  │ 🔒 Tier '{tier_name}' blocked — skill '{skill_key}' is LOCKED")
+            for prereq in node.prerequisites:
+                prereq_skills.add(prereq)
+
+        # Check each prerequisite is mastered
+        for prereq_key in prereq_skills:
+            prereq_node = self.skill_tree[prereq_key]
+            if not prereq_node.mastered:
+                completions = len(prereq_node.recent_scores)
+                needed = prereq_node.mastery_window
+                score = prereq_node.mastery_score
+                threshold = prereq_node.mastery_threshold
+                print(f"  │ ⏳ Tier '{tier_name}' blocked — prerequisite skill '{prereq_key}' not mastered "
+                      f"({completions}/{needed} completions, score {score:.2f}/{threshold:.2f})")
                 return False
-        return True
         return True
 
     def get_aspiration_target(self, prompt_id: str) -> float:
@@ -710,7 +731,7 @@ class GameState:
         if tier not in self.tier_mastery:
             self.tier_mastery[tier] = {}
         if step_num not in self.tier_mastery[tier]:
-            self.tier_mastery[tier][step_num] = deque(maxlen=QUALITY_WINDOW_SIZE)
+            self.tier_mastery[tier][step_num] = deque(maxlen=self.quality_window_size)
         self.tier_mastery[tier][step_num].append(score)
 
     def get_tier_step_mastery(self, tier: str, step_num: int) -> float:

@@ -45,18 +45,25 @@ class WeightBus:
         exporter: WeightExporter,
         loader: WeightLoader,
         model: nn.Module,
+        modules_to_save: list[str] | None = None,
     ) -> None:
         """Push updated weights from training model to inference engine.
 
         Called after optimizer.step() (step-end sync) and after LoRA dropout
         (pre-generate sync with noisy weights).
+
+        Args:
+            exporter: WeightExporter instance
+            loader: WeightLoader instance
+            model: PEFT-wrapped training model
+            modules_to_save: Expected modules (e.g., ["lm_head"]). Warns if missing.
         """
         if self.strategy == SyncStrategy.MERGE:
             exporter.merge_lora(model)
-            loader.sync_modules_to_save(exporter.get_modules_to_save(model))
+            loader.sync_modules_to_save(exporter.get_modules_to_save(model, expected=modules_to_save))
         elif self.strategy == SyncStrategy.DIRECT_COPY:
             loader.sync_lora_direct(model, first_call=not self._initialized)
-            loader.sync_modules_to_save(exporter.get_modules_to_save(model))
+            loader.sync_modules_to_save(exporter.get_modules_to_save(model, expected=modules_to_save))
 
         self._initialized = True
 

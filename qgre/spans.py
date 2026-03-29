@@ -32,6 +32,11 @@ def build_char_to_token_map(
     if not token_ids:
         return []
 
+    # Pre-validation: tokenizer must have decode method
+    if not hasattr(tokenizer, "decode"):
+        warnings.warn("build_char_to_token_map: tokenizer lacks decode method — returning None")
+        return None
+
     # Strategy 1: Use tokenizer's offset_mapping (authoritative, model-agnostic)
     if completion_text is not None:
         try:
@@ -57,17 +62,25 @@ def build_char_to_token_map(
 
     # Strategy 2: Per-token decode (works for BPE, may fail for SentencePiece)
     token_texts = []
+    decode_failures = 0
     for tid in token_ids:
         try:
             token_texts.append(tokenizer.decode([tid], skip_special_tokens=False))
         except Exception:
             token_texts.append("")
+            decode_failures += 1
+    if decode_failures > 0:
+        warnings.warn(
+            f"Span mapping: {decode_failures}/{len(token_ids)} per-token decode failures. "
+            "Character-to-token mapping may be inaccurate."
+        )
 
     per_token_len = sum(len(tt) for tt in token_texts)
     try:
         full_text = tokenizer.decode(token_ids, skip_special_tokens=False)
         full_len = len(full_text)
-    except Exception:
+    except Exception as e:
+        warnings.warn(f"Span mapping full decode failed: {e}. Using per-token length.")
         full_len = per_token_len
 
     if per_token_len != full_len:

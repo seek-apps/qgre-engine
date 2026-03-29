@@ -11,9 +11,6 @@ from qgre.weight_bus import SyncStrategy
 from qgre.weight_export import WeightExporter
 from qgre.weight_load import WeightLoader
 
-# Modules trained as full weights alongside LoRA (not low-rank decomposed)
-MODULES_TO_SAVE = ["lm_head", "embed_tokens"]
-
 
 @dataclass
 class GenerationOutput:
@@ -44,29 +41,102 @@ class UnslothBackend:
     def load(self) -> tuple[Any, Any]:
         """Load model and tokenizer. Returns (model, tokenizer)."""
         from unsloth import FastLanguageModel
+        import unsloth.models.llama as _llama_mod
 
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=self.model_config.path,
-            max_seq_length=self.generation_config.max_tokens + self.max_prompt_length,
-            load_in_4bit=self.model_config.load_in_4bit,
-            fast_inference=self.model_config.fast_inference,
-            gpu_memory_utilization=self.model_config.gpu_memory_utilization,
-            max_lora_rank=self.model_config.max_lora_rank or self.model_config.lora_rank,
-            fix_tokenizer=False,  # We configure tokenizer from our config, not Unsloth defaults
-        )
+        # Prevent Unsloth's patch_tokenizer from modifying our tokenizer/model.
+        # It runs unconditionally (ignoring fix_tokenizer) and would:
+        # 1. Add <|PAD_TOKEN|> via add_special_tokens (may resize embeddings)
+        # 2. Set model.config.pad_token_id to wrong value
+        # 3. Set model.generation_config.pad_token_id to wrong value
+        # We configure pad_token from YAML config below (single source of truth).
+        _orig_patch = _llama_mod.patch_tokenizer
+        _llama_mod.patch_tokenizer = lambda model, tokenizer: (model, tokenizer)
 
-        model = FastLanguageModel.get_peft_model(
-            model,
-            r=self.model_config.lora_rank,
-            lora_alpha=self.model_config.lora_alpha,
-            target_modules=[
-                "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj",
-            ],
-            modules_to_save=MODULES_TO_SAVE,
-            lora_dropout=0.0,
-            use_gradient_checkpointing="unsloth",
-        )
+        # Suppress vLLM's env var validation during from_pretrained.
+        # Unsloth sets VLLM_ATTENTION_BACKEND inside from_pretrained, but vLLM V1
+        # no longer reads it (uses internal config) and warns "Unknown vLLM environment
+        # variable". The seed=0 warning is inherent to VLLM_ENABLE_V1_MULTIPROCESSING=0
+        # which Unsloth requires for weight access. Both are expected and non-actionable
+        # during init — we restore random state after load.
+        import vllm.envs as _vllm_envs
+        _orig_validate = _vllm_envs.validate_environ
+        _vllm_envs.validate_environ = lambda hard_fail=False: None
+        # Also patch on arg_utils module where it's imported by name
+        from vllm.engine import arg_utils as _arg_utils
+        if hasattr(_arg_utils, 'envs'):
+            _arg_utils.envs.validate_environ = lambda hard_fail=False: None
+        # Suppress seed=0 warning from arg_utils (inherent to MULTIPROCESSING=0)
+        import logging
+        _arg_utils_logger = logging.getLogger("vllm.engine.arg_utils")
+        _arg_utils_level = _arg_utils_logger.level
+        _arg_utils_logger.setLevel(logging.ERROR)
+
+        try:
+            model, tokenizer = FastLanguageModel.from_pretrained(
+                model_name=self.model_config.path,
+                max_seq_length=self.generation_config.max_tokens + self.max_prompt_length,
+                load_in_4bit=self.model_config.load_in_4bit,
+                fast_inference=self.model_config.fast_inference,
+                gpu_memory_utilization=self.model_config.gpu_memory_utilization,
+                max_lora_rank=self.model_config.max_lora_rank or self.model_config.lora_rank,
+            )
+        finally:
+            _llama_mod.patch_tokenizer = _orig_patch
+            _vllm_envs.validate_environ = _orig_validate
+            if hasattr(_arg_utils, 'envs'):
+                _arg_utils.envs.validate_environ = _orig_validate
+            _arg_utils_logger.setLevel(_arg_utils_level)
+
+        # Clean up VLLM_ATTENTION_BACKEND env var that Unsloth sets.
+        # Not needed for vLLM V1 (internal config), prevents future warnings.
+        import os
+        os.environ.pop("VLLM_ATTENTION_BACKEND", None)
+
+        # Untie word embeddings BEFORE get_peft_model to prevent PEFT from
+        # warning about tie_word_embeddings + modules_to_save (PEFT #2777).
+        # If both lm_head and embed_tokens are in modules_to_save (not the default),
+        # they must be independent — tied storage means training one silently
+        # overwrites the other. Default is ["lm_head"] only (Phase 2 optimization).
+        #
+        # Three things must happen:
+        # 1. Set config flag (controls future model behavior)
+        # 2. Clear _tied_weights_keys (PEFT reads this class attr, ignores config)
+        # 3. Actually untie the weight tensors (clone lm_head.weight so it's independent)
+        if getattr(model.config, "tie_word_embeddings", False):
+            model.config.tie_word_embeddings = False
+        # PEFT checks _tied_weights_keys (class attr on Qwen3ForCausalLM) regardless
+        # of tie_word_embeddings config flag. Clear it on the instance to suppress.
+        if getattr(model, "_tied_weights_keys", None):
+            model._tied_weights_keys = []
+        # Ensure lm_head.weight is physically independent from embed_tokens.weight
+        lm_head = getattr(model, "lm_head", None)
+        embed = getattr(model.model, "embed_tokens", None) if hasattr(model, "model") else None
+        if lm_head is not None and embed is not None:
+            if lm_head.weight.data_ptr() == embed.weight.data_ptr():
+                lm_head.weight = torch.nn.Parameter(lm_head.weight.clone())
+                model.config.tie_word_embeddings = False
+
+        # Suppress expected warnings during PEFT adapter initialization:
+        # - "should probably TRAIN" (logging.warning from transformers) — modules_to_save
+        #   creates random adapter copies. We ARE about to train.
+        # - "tie_word_embeddings" (warnings.warn from PEFT) — already handled above.
+        import logging
+        import warnings
+        _tf_logger = logging.getLogger("transformers.modeling_utils")
+        _tf_level = _tf_logger.level
+        _tf_logger.setLevel(logging.ERROR)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*tie_word_embeddings.*")
+            model = FastLanguageModel.get_peft_model(
+                model,
+                r=self.model_config.lora_rank,
+                lora_alpha=self.model_config.lora_alpha,
+                target_modules=self.model_config.lora_target_modules,
+                modules_to_save=self.model_config.modules_to_save,
+                lora_dropout=0.0,
+                use_gradient_checkpointing="unsloth",
+            )
+        _tf_logger.setLevel(_tf_level)
 
         # Null modules_to_save in PEFT config object so that when Unsloth's load_lora
         # bootstraps adapter_config.json (on first call, lora_request_id==1), it writes
@@ -75,17 +145,6 @@ class UnslothBackend:
         peft_cfg = model.peft_config.get("default")
         if peft_cfg and getattr(peft_cfg, "modules_to_save", None):
             peft_cfg.modules_to_save = None
-
-        # PEFT should untie embeddings when both lm_head and embed_tokens are in
-        # modules_to_save (PEFT PR #2777). Verify — if tied, they share storage and
-        # training one silently overwrites the other.
-        if getattr(model.config, "tie_word_embeddings", False):
-            import warnings
-            warnings.warn(
-                "tie_word_embeddings=True after get_peft_model with modules_to_save. "
-                "PEFT should have untied them. Setting to False manually."
-            )
-            model.config.tie_word_embeddings = False
 
         # Configure tokenizer from YAML config — single source of truth for all models.
         # fix_tokenizer=False above prevents Unsloth from overriding with <|PAD_TOKEN|>.
@@ -99,6 +158,8 @@ class UnslothBackend:
         tokenizer.pad_token = pad_token
         tokenizer.pad_token_id = pad_token_id
         model.config.pad_token_id = pad_token_id
+        if getattr(model, "generation_config", None) is not None:
+            model.generation_config.pad_token_id = pad_token_id
 
         # Validate PAD token
         resolved_id = tokenizer.convert_tokens_to_ids(pad_token)
@@ -136,14 +197,39 @@ class UnslothBackend:
             if llm is not None:
                 engine = getattr(llm, 'llm_engine', llm)
                 if hasattr(engine, 'model_config'):
-                    engine.model_config.max_logprobs = 5
-                    import warnings
-                    warnings.warn("Patched vLLM max_logprobs=5 for LLDS logprob extraction")
+                    engine.model_config.max_logprobs = self.generation_config.max_logprobs
+                    print(f"vLLM max_logprobs patched to {self.generation_config.max_logprobs} for LLDS logprob extraction")
         except Exception as e:
             import warnings
             warnings.warn(f"Could not patch vLLM max_logprobs: {e}. LLDS may not receive logprobs.")
 
         return model, tokenizer
+
+    def restore_random_state(self, seed: int = -1) -> None:
+        """Restore global random state after vLLM init.
+
+        vLLM's gpu_worker calls set_random_seed(0) during init, which resets
+        random/numpy/torch global state in our process (VLLM_ENABLE_V1_MULTIPROCESSING=0).
+        This makes all training runs identically seeded from 0 — same dropout masks,
+        same data ordering if using global state. Call this after load() to restore
+        proper stochastic behavior.
+
+        Args:
+            seed: -1 = time-based (non-reproducible), 0+ = fixed seed.
+        """
+        import random
+        import time
+        import numpy as np
+
+        if seed < 0:
+            seed = int(time.time() * 1000) % (2**32)
+
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        print(f"Random state restored: seed={seed}")
 
     def set_training_mode(self):
         """Switch to training mode — disables Unsloth inplace optimizations.

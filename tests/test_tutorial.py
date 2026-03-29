@@ -603,7 +603,8 @@ class TestConfigParsing:
         import yaml
 
         config_dict = {
-            "model": {"path": "test"},
+            "model": {"path": "test", "pad_token": "<pad>", "pad_token_id": 0},
+            "generation": {"stop_token_ids": [2]},
             "tutorial": {
                 "enabled": True,
                 "post_mastery_behavior": "pause",

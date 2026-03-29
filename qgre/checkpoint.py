@@ -30,6 +30,7 @@ def gamestate_to_dict(gs: GameState) -> dict:
         "stagnation_timeout": gs.stagnation_timeout,
         "plateau_window": gs.plateau_window,
         "plateau_threshold": gs.plateau_threshold,
+        "quality_window_size": gs.quality_window_size,
     }
 
 
@@ -45,6 +46,7 @@ def gamestate_from_dict(d: dict) -> GameState:
     gs.stagnation_timeout = d.get("stagnation_timeout", 200)
     gs.plateau_window = d.get("plateau_window", 50)
     gs.plateau_threshold = d.get("plateau_threshold", 0.02)
+    gs.quality_window_size = d.get("quality_window_size", QUALITY_WINDOW_SIZE)
 
     # 2D tier fields
     gs.tier_phases = d.get("tier_phases", {"default": d.get("phase", 1)})

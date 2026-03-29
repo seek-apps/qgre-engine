@@ -17,6 +17,13 @@ if "expandable_segments" not in _cuda_conf:
 # See: docs/fix-fused-logprobs-compiled-cache.md
 os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
 
+# Point vLLM at tuned LoRA kernel configs (if available).
+# Without this, vLLM uses conservative defaults for Triton LoRA kernels.
+# Generate configs with: python scripts/tune_lora_kernels.py
+_kernel_config_dir = os.path.join(os.path.dirname(__file__), "..", "output", "vllm_kernel_configs")
+if os.path.isdir(_kernel_config_dir) and not os.environ.get("VLLM_TUNED_CONFIG_FOLDER"):
+    os.environ["VLLM_TUNED_CONFIG_FOLDER"] = os.path.abspath(_kernel_config_dir)
+
 # Delete compiled cache to force recompilation with correct env var.
 # Standard Unsloth practice (issues #4181, #4294, #3763). 10-30s cost.
 import shutil
@@ -93,6 +100,11 @@ def cmd_train(args):
     from qgre.generation import UnslothBackend
     backend = UnslothBackend(config.model, config.generation, max_prompt_length=config.data.max_prompt_length)
     model, tokenizer = backend.load()
+
+    # Restore random state: vLLM's gpu_worker sets seed=0 during init, which
+    # resets random/numpy/torch global state in our process. Without this,
+    # every training run starts from identical seed=0.
+    backend.restore_random_state(config.training.seed)
 
     # Load training data
     from qgre.data import QGREDataLoader, load_prompts_from_parquet

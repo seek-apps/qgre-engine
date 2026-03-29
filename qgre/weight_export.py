@@ -30,12 +30,21 @@ class WeightExporter:
         """Restore LoRA A/B as separate adapters (reverse of merge)."""
         model.unmerge_adapter()
 
-    def get_modules_to_save(self, model: nn.Module) -> dict[str, torch.Tensor]:
+    def get_modules_to_save(
+        self, model: nn.Module, expected: list[str] | None = None
+    ) -> dict[str, torch.Tensor]:
         """Extract lm_head/embed_tokens trainable weights from ModulesToSaveWrapper.
+
+        Args:
+            model: PEFT-wrapped model
+            expected: Optional list of expected module names (e.g., ["lm_head"]).
+                      If provided, warns when expected modules are missing from state_dict.
 
         Returns dict mapping module name to weight tensor (views, not copies).
         These are the active adapter weights, not the frozen originals.
         """
+        import warnings
+
         weights = {}
         state_dict = model.state_dict()
         for key, tensor in state_dict.items():
@@ -45,6 +54,24 @@ class WeightExporter:
                 weights["lm_head"] = tensor
             elif "embed_tokens" in key:
                 weights["embed_tokens"] = tensor
+
+        # Warn if expected modules are missing or unexpected modules present
+        if expected:
+            expected_set = set(expected)
+            found_set = set(weights.keys())
+            missing = expected_set - found_set
+            unexpected = found_set - expected_set
+            if missing:
+                warnings.warn(
+                    f"get_modules_to_save: expected {missing} but not found in state_dict. "
+                    f"Check modules_to_save config matches PEFT wrapper. Found: {list(weights.keys())}"
+                )
+            if unexpected:
+                warnings.warn(
+                    f"get_modules_to_save: found unexpected modules {unexpected}. "
+                    f"Expected {expected}, got {list(weights.keys())}. "
+                    f"Config may be out of sync with PEFT wrapper — check modules_to_save."
+                )
         return weights
 
     def get_lora_tensors(self, model: nn.Module) -> dict[str, torch.Tensor]:

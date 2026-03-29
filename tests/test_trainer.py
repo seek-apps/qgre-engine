@@ -29,6 +29,9 @@ def _cfg() -> QGREConfig:
     cfg.algorithm.step_qualities = _MOCK_SQ
     cfg.algorithm.use_fused_logprobs = False  # Mock models have no lm_head
     cfg.model.path = "test-model"
+    cfg.model.pad_token = "<|fim_pad|>"
+    cfg.model.pad_token_id = 151662
+    cfg.generation.stop_token_ids = [151643, 151645]
     return cfg
 
 
@@ -104,6 +107,72 @@ def test_config_math_example():
     cfg = QGREConfig.from_yaml("examples/math/config.yaml")
     assert cfg.algorithm.mode == "grpo"
     assert cfg.algorithm.grpo.n == 4
+
+
+def test_config_new_fields_defaults():
+    """New configurable fields have correct defaults."""
+    cfg = _cfg()
+    assert cfg.model.lora_target_modules == [
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    ]
+    assert cfg.model.modules_to_save == ["lm_head"]  # embed_tokens removed — fim_pad is pre-trained
+    assert cfg.generation.max_logprobs == 5
+    assert cfg.algorithm.kl_input_clamp == 20.0
+    assert cfg.algorithm.kl_output_clamp == 10.0
+    assert cfg.algorithm.spo_filter_threshold == 0.001
+    assert cfg.training.embedding_lr_ratio == 0.1
+    assert cfg.training.micro_batch_seq_threshold == 2048
+    assert cfg.training.kv_cache_flush_freq == 50
+    assert cfg.training.quality_window_size == 20
+    assert cfg.logging.log_freq == 5
+
+
+def test_config_custom_target_modules_from_yaml():
+    """Custom lora_target_modules from YAML."""
+    raw = {
+        "model": {"path": "test", "pad_token": "<pad>", "pad_token_id": 0,
+                   "lora_target_modules": ["qkv_proj", "o_proj"]},
+        "generation": {"stop_token_ids": [2]},
+        "algorithm": {"step_qualities": {1: ["q_test"]}},
+    }
+    cfg = QGREConfig._from_dict(raw)
+    cfg.validate()
+    assert cfg.model.lora_target_modules == ["qkv_proj", "o_proj"]
+
+
+def test_config_validate_missing_pad_token():
+    """Validation catches missing pad_token."""
+    cfg = QGREConfig()
+    cfg.model.path = "test"
+    with pytest.raises(ValueError, match="pad_token"):
+        cfg.validate()
+
+
+def test_config_validate_empty_target_modules():
+    """Validation catches empty lora_target_modules."""
+    cfg = _cfg()
+    cfg.model.lora_target_modules = []
+    with pytest.raises(ValueError, match="lora_target_modules"):
+        cfg.validate()
+
+
+def test_config_validate_empty_stop_tokens_warns():
+    """Empty stop_token_ids emits warning (not error)."""
+    cfg = _cfg()
+    cfg.generation.stop_token_ids = []
+    import warnings
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        cfg.validate()
+        assert any("stop_token_ids" in str(warning.message) for warning in w)
+
+
+def test_config_stop_token_ids_empty_default():
+    """Default stop_token_ids is empty (forces explicit config)."""
+    from qgre.config import GenerationConfig
+    gen = GenerationConfig()
+    assert gen.stop_token_ids == []
 
 
 # --- Trainer tests ---

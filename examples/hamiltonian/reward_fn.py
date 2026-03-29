@@ -289,6 +289,80 @@ def _remap_variables(student: sp.Basic, teacher: sp.Basic) -> sp.Basic:
     return student
 
 
+def _score_terms_structurally(student: sp.Basic, teacher: sp.Basic) -> float | None:
+    """Score expression by matching polynomial terms structurally.
+
+    Returns fraction of teacher terms matched (same monomial, coefficient within 10%).
+    Returns None if expressions aren't polynomial-like (trig, exp, etc.).
+
+    This catches missing terms that numerical closeness misses:
+    - V = 3x² + 19.6x (teacher) vs V = 19.6x (student)
+    - Numerical: student/teacher ≈ 0.94 at x=0.4 → 0.85 partial credit
+    - Structural: 1/2 terms matched → 0.50 partial credit
+    """
+    try:
+        # Expand to standard polynomial form
+        student_exp = sp.expand(student)
+        teacher_exp = sp.expand(teacher)
+
+        # Get terms as {monomial_base: coefficient} dict
+        # e.g., 3*x**2 + 19.6*x → {x**2: 3, x: 19.6}
+        def get_terms(expr):
+            terms = {}
+            if expr.is_Add:
+                for term in expr.args:
+                    coeff, base = term.as_coeff_Mul()
+                    if base == 1:  # constant term
+                        base = sp.Integer(1)
+                    terms[base] = float(coeff)
+            elif expr.is_Mul or expr.is_Pow or expr.is_Symbol:
+                coeff, base = expr.as_coeff_Mul()
+                if base == 1:
+                    base = sp.Integer(1)
+                terms[base] = float(coeff)
+            elif expr.is_Number:
+                terms[sp.Integer(1)] = float(expr)
+            else:
+                return None  # Not a simple polynomial
+            return terms
+
+        teacher_terms = get_terms(teacher_exp)
+        student_terms = get_terms(student_exp)
+
+        if teacher_terms is None or student_terms is None:
+            return None
+        if not teacher_terms:
+            return None
+
+        # Match terms: same base, coefficient within 10%
+        matched = 0
+        coeff_accuracy_sum = 0.0
+        for base, t_coeff in teacher_terms.items():
+            if base in student_terms:
+                s_coeff = student_terms[base]
+                if abs(t_coeff) < 1e-10:
+                    if abs(s_coeff) < 1e-10:
+                        matched += 1
+                        coeff_accuracy_sum += 1.0
+                else:
+                    ratio = s_coeff / t_coeff
+                    if 0.9 <= ratio <= 1.1:  # Within 10%
+                        matched += 1
+                        coeff_accuracy_sum += 1.0 - abs(1.0 - ratio)
+                    elif 0.5 <= ratio <= 2.0:  # Within 2x — partial term credit
+                        matched += 0.5
+                        coeff_accuracy_sum += 0.5 * (1.0 - min(abs(1.0 - ratio), 1.0))
+
+        # Score = (matched_terms / total_terms) * avg_coefficient_accuracy
+        term_coverage = matched / len(teacher_terms)
+        avg_coeff_acc = coeff_accuracy_sum / max(matched, 1)
+
+        return term_coverage * avg_coeff_acc
+
+    except Exception:
+        return None
+
+
 def _score_expression(
     student_str: str | None,
     teacher_str: str,
@@ -304,7 +378,7 @@ def _score_expression(
     Returns 0.0-1.0:
     - 1.0: exact symbolic or numerical match (including after variable remapping)
     - 0.8: correct up to sign (V vs -V — valid physics, different reference frame)
-    - 0.2-0.85: partial credit based on numerical closeness
+    - 0.2-0.7: partial credit based on structural term matching (robust)
     - 0.2: attempted but unparseable
     - 0.0: not found
     """
@@ -410,8 +484,16 @@ def _score_expression(
     except Exception:
         pass
 
-    # Partial credit based on numerical closeness
+    # Partial credit: structural term matching (robust) > numerical closeness (fallback)
+    # Structural matching catches missing terms that numerical closeness misses.
     try:
+        structural_score = _score_terms_structurally(candidate, teacher)
+        if structural_score is not None:
+            # Scale structural score: 0.0 (no terms) to 0.7 (all terms, slight coeff error)
+            # Missing terms get proportionally lower scores (e.g., 1/2 terms → 0.35 max)
+            return 0.2 + 0.5 * structural_score
+
+        # Fallback: numerical closeness for non-polynomial expressions (trig, exp, etc.)
         free = (candidate.free_symbols | teacher.free_symbols) - {sp.Symbol('pi')}
         numerical_score = 0.0
         if free:
@@ -434,8 +516,9 @@ def _score_expression(
         else:
             sym_overlap = len(student_syms & teacher_syms) / len(teacher_syms)
 
-        partial = 0.2 + 0.5 * numerical_score + 0.2 * sym_overlap
-        return min(partial, 0.85)
+        # Cap at 0.70 — partial credit should not exceed mastery threshold
+        partial = 0.2 + 0.4 * numerical_score + 0.1 * sym_overlap
+        return min(partial, 0.70)
     except Exception:
         return 0.2
 

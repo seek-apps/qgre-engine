@@ -126,12 +126,30 @@ class WeightLoader:
         Returns None if engine not yet created (lazy init).
         """
         for obj in [self._model, getattr(self._model, "model", None)]:
-            engine = getattr(obj, "vllm_engine", None) if obj is not None else None
-            if engine is not None:
-                try:
-                    return engine.llm_engine.model_executor.driver_worker.model_runner.model
-                except AttributeError:
-                    continue
+            if obj is None:
+                continue
+            engine = getattr(obj, "vllm_engine", None)
+            if engine is None:
+                continue
+
+            # Traverse vLLM engine chain with explicit attribute checks
+            # to avoid AttributeError in production
+            llm_engine = getattr(engine, "llm_engine", None)
+            if llm_engine is None:
+                continue
+            model_executor = getattr(llm_engine, "model_executor", None)
+            if model_executor is None:
+                continue
+            driver_worker = getattr(model_executor, "driver_worker", None)
+            if driver_worker is None:
+                continue
+            model_runner = getattr(driver_worker, "model_runner", None)
+            if model_runner is None:
+                continue
+            model = getattr(model_runner, "model", None)
+            if model is not None:
+                return model
+
         return None
 
     def flush_kv_cache(self) -> None:
@@ -140,41 +158,70 @@ class WeightLoader:
         Does NOT delete vllm_engine, fast_generate, or NCCL state.
         Only flushes KV cache pages via scheduler + zeros GPU cache tensors.
         """
-        engine = (
-            getattr(self._model, "vllm_engine", None)
-            or getattr(getattr(self._model, "model", None), "vllm_engine", None)
-        )
+        # Find vllm_engine with explicit None checks
+        engine = getattr(self._model, "vllm_engine", None)
         if engine is None:
+            base_model = getattr(self._model, "model", None)
+            if base_model is not None:
+                engine = getattr(base_model, "vllm_engine", None)
+        if engine is None:
+            return
+
+        # Pre-check: verify llm_engine exists before attempting scheduler access
+        llm_engine = getattr(engine, "llm_engine", None)
+        if llm_engine is None:
+            if not getattr(self, "_kv_scheduler_warned", False):
+                warnings.warn("KV cache flush: llm_engine not found (engine not fully initialized)")
+                self._kv_scheduler_warned = True
             return
 
         # Flush KV cache blocks via scheduler
         try:
-            llm_engine = engine.llm_engine
-            schedulers = getattr(llm_engine, "scheduler", [llm_engine.scheduler]) \
-                if hasattr(llm_engine, "scheduler") else []
+            scheduler_attr = getattr(llm_engine, "scheduler", None)
+            if scheduler_attr is None:
+                schedulers = []
+            elif isinstance(scheduler_attr, list):
+                schedulers = scheduler_attr
+            else:
+                schedulers = [scheduler_attr]
+
             for scheduler in schedulers:
                 if hasattr(scheduler, "free_finished_seqs"):
                     scheduler.free_finished_seqs()
-                if hasattr(scheduler, "block_manager"):
-                    bm = scheduler.block_manager
-                    if hasattr(bm, "gpu_allocator") and hasattr(bm.gpu_allocator, "free_all"):
-                        bm.gpu_allocator.free_all()
-        except Exception:
-            pass
+                block_manager = getattr(scheduler, "block_manager", None)
+                if block_manager is not None:
+                    gpu_allocator = getattr(block_manager, "gpu_allocator", None)
+                    if gpu_allocator is not None and hasattr(gpu_allocator, "free_all"):
+                        gpu_allocator.free_all()
+        except AttributeError as e:
+            # Expected if vLLM API changed. Warn once so user knows flush is skipped.
+            if not getattr(self, "_kv_scheduler_warned", False):
+                warnings.warn(f"KV cache scheduler flush skipped (vLLM API change): {e}")
+                self._kv_scheduler_warned = True
+        except Exception as e:
+            warnings.warn(f"KV cache scheduler flush failed: {e}")
 
-        # Zero GPU cache tensors directly
-        try:
-            worker = engine.llm_engine.model_executor.driver_worker
-            if hasattr(worker, "gpu_cache"):
-                for layer_cache in worker.gpu_cache:
+        # Zero GPU cache tensors directly — pre-check each attribute in chain
+        model_executor = getattr(llm_engine, "model_executor", None)
+        driver_worker = getattr(model_executor, "driver_worker", None) if model_executor else None
+        gpu_cache = getattr(driver_worker, "gpu_cache", None) if driver_worker else None
+
+        if gpu_cache is None:
+            # No gpu_cache attribute — may be different vLLM version
+            if not getattr(self, "_kv_worker_warned", False):
+                warnings.warn("KV cache tensor zeroing skipped: gpu_cache not found on driver_worker")
+                self._kv_worker_warned = True
+        else:
+            try:
+                for layer_cache in gpu_cache:
                     if isinstance(layer_cache, torch.Tensor):
                         layer_cache.zero_()
                     elif isinstance(layer_cache, (list, tuple)):
                         for t in layer_cache:
                             if isinstance(t, torch.Tensor):
                                 t.zero_()
-        except Exception:
-            pass
+            except Exception as e:
+                warnings.warn(f"KV cache tensor zeroing failed: {e}")
 
         gc.collect()
         torch.cuda.empty_cache()

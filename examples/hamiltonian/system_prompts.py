@@ -38,6 +38,18 @@ EQUATIONS:
   dq/dt = p/3
   dp/dt = -29.4
 
+EXAMPLE 3 — mass m=2 hanging from vertical spring k=4, g=9.8 (COMBINED SYSTEM):
+The potential energy is the SUM of spring potential AND gravity potential.
+V = V_spring + V_gravity = (k/2)*x² + m*g*x = 2*x² + 19.6*x
+COORDINATES: q = x
+MOMENTUM: p = 2*dx/dt
+KINETIC: T = p²/4
+POTENTIAL: V = 2*x² + 19.6*x
+HAMILTONIAN: H = p²/4 + 2*x² + 19.6*x
+EQUATIONS:
+  dq/dt = p/2
+  dp/dt = -4*x - 19.6
+
 OUTPUT FORMAT — always end with these exact labels:
 COORDINATES: q = [coordinate]
 MOMENTUM: p = [expression with mass number]

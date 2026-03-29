@@ -65,6 +65,7 @@ class QGRETrainer:
             stagnation_timeout=config.training.stagnation_timeout,
             plateau_window=config.training.plateau_window,
             plateau_threshold=config.training.plateau_threshold,
+            quality_window_size=config.training.quality_window_size,
         )
         self._dataloader = None  # Set in train()
 
@@ -150,8 +151,8 @@ class QGRETrainer:
         self.loss_fn = ClippedPGLossFn({
             "reference_policy_kl_penalty": alg.kl_cov_ratio if alg.loss_mode == "kl_cov" else 0.0,
             "reference_policy_kl_type": alg.reference_policy_kl_type,
-            "kl_input_clamp_value": 20.0,
-            "kl_output_clamp_value": 10.0,
+            "kl_input_clamp_value": alg.kl_input_clamp,
+            "kl_output_clamp_value": alg.kl_output_clamp,
             "ratio_clip_min": alg.clip_ratio_low,
             "ratio_clip_max": alg.clip_ratio_high,
             "ratio_clip_c": None,
@@ -208,20 +209,21 @@ class QGRETrainer:
         Uses AdamW8bit from bitsandbytes for ~4x memory savings on optimizer states.
         Falls back to regular AdamW if bitsandbytes not available.
         """
-        # Split params: embedding/lm_head modules_to_save get 10x smaller LR
+        # Split params: embedding/lm_head modules_to_save get reduced LR
         # (Unsloth recommendation for modules_to_save to prevent drift)
+        modules_to_save_names = tuple(self.config.model.modules_to_save)
         embedding_params = []
         other_params = []
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
-            if any(mod in name for mod in ("embed_tokens", "lm_head")):
+            if any(mod in name for mod in modules_to_save_names):
                 embedding_params.append(param)
             else:
                 other_params.append(param)
 
         base_lr = self.config.training.lr
-        embed_lr = base_lr / 10  # 10x smaller for embeddings
+        embed_lr = base_lr * self.config.training.embedding_lr_ratio
         param_groups = [
             {"params": other_params, "lr": base_lr},
             {"params": embedding_params, "lr": embed_lr},
@@ -234,7 +236,7 @@ class QGRETrainer:
             import warnings
             warnings.warn(
                 "No embedding/lm_head params with requires_grad=True found. "
-                "If using modules_to_save=['lm_head', 'embed_tokens'], this means it failed."
+                "If using modules_to_save=['lm_head'], this means PEFT adapter init failed."
             )
             # Remove empty param group — optimizer doesn't like empty groups
             param_groups = [{"params": other_params, "lr": base_lr}]
@@ -247,8 +249,14 @@ class QGRETrainer:
                 from bitsandbytes.optim import AdamW8bit
                 self.optimizer = AdamW8bit(param_groups)
                 use_8bit = True
-        except (ImportError, StopIteration):
-            pass
+        except ImportError:
+            pass  # bitsandbytes not installed
+        except StopIteration:
+            import warnings
+            warnings.warn(
+                "Model has no parameters — cannot determine device for AdamW8bit. "
+                "Falling back to standard AdamW."
+            )
 
         if not use_8bit:
             self.optimizer = torch.optim.AdamW(param_groups)
@@ -500,7 +508,7 @@ class QGRETrainer:
         # SPO low-advantage filter: skip sequences with near-zero signal (PLAN.md lines 658-671)
         _spo_filter_idx = None  # Maps filtered indices → original batch indices
         if self.config.algorithm.mode == "spo":
-            useful = (padded_advs.abs() > 0.001).any(dim=-1)
+            useful = (padded_advs.abs() > self.config.algorithm.spo_filter_threshold).any(dim=-1)
             if useful.sum() == 0:
                 # All advantages near-zero — skip backward pass but still record mastery + log completions
                 metrics = {"loss": 0.0, "reward/mean": sum(rr.reward for rr in reward_results) / len(reward_results),
@@ -552,7 +560,7 @@ class QGRETrainer:
         # At 4096 tokens, Unsloth MLP activation = 2 × 4096 × 8960 × 2B = 140MB per seq.
         # micro_batch_size=1 for seq ≥ 2048, micro_batch_size=2 for shorter.
         actual_batch = comp_tensor.shape[0]  # May differ from len(completions) after SPO filter
-        micro_batch_size = 1 if max_comp_len >= 2048 else max(1, min(2, actual_batch))
+        micro_batch_size = 1 if max_comp_len >= self.config.training.micro_batch_seq_threshold else max(1, min(2, actual_batch))
         n_micro = (actual_batch + micro_batch_size - 1) // micro_batch_size
         total_loss = 0.0
         all_metrics = {}
@@ -947,10 +955,39 @@ class QGRETrainer:
             warnings.warn(f"Checkpoint resume: skipped {skipped} keys not in model (bnb quant metadata)")
         self.model.load_state_dict(filtered, strict=False)
 
+        # Validate optimizer compatibility before loading
+        optimizer_loaded = False
         if checkpoint.get("optimizer_state_dict") and self.optimizer:
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            ckpt_opt = checkpoint["optimizer_state_dict"]
+            ckpt_groups = len(ckpt_opt.get("param_groups", []))
+            model_groups = len(self.optimizer.param_groups)
+
+            if ckpt_groups != model_groups:
+                print(f"┌{'─'*60}┐")
+                print(f"│{'⚠️  CHECKPOINT CONFIG MISMATCH':^60}│")
+                print(f"├{'─'*60}┤")
+                print(f"│  Checkpoint optimizer: {ckpt_groups} param groups{' '*(35-len(str(ckpt_groups)))}│")
+                print(f"│  Current optimizer:    {model_groups} param groups{' '*(35-len(str(model_groups)))}│")
+                print(f"│  (modules_to_save likely changed){' '*24}│")
+                print(f"├{'─'*60}┤")
+                print(f"│  Model weights: ✓ LOADED{' '*34}│")
+                print(f"│  Optimizer state: ✗ RESET (momentum lost){' '*16}│")
+                print(f"│  Game state: ✓ LOADED{' '*36}│")
+                print(f"│  Step counter: ✓ LOADED{' '*34}│")
+                print(f"└{'─'*60}┘")
+            else:
+                self.optimizer.load_state_dict(ckpt_opt)
+                optimizer_loaded = True
+
+        scheduler_loaded = False
         if checkpoint.get("scheduler_state_dict") and self.scheduler:
-            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            if optimizer_loaded:
+                try:
+                    self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                    scheduler_loaded = True
+                except (ValueError, KeyError):
+                    pass  # Scheduler reset if optimizer was reset
+            # If optimizer wasn't loaded, scheduler starts fresh too
         if checkpoint.get("game_state"):
             self.game_state = checkpoint["game_state"]
         if checkpoint.get("advantage_estimator_state"):
@@ -982,8 +1019,14 @@ class QGRETrainer:
             pass  # LoRA verification unavailable — Unsloth not installed
         else:
             try:
-                LoRAVerifier.verify_active(self.model, self.tokenizer)
-            except AttributeError as e:
+                is_active = LoRAVerifier.verify_active(self.model, self.tokenizer)
+                if not is_active:
+                    import warnings
+                    warnings.warn(
+                        "LoRA verification returned False after resume. "
+                        "LoRA adapters may not be active. Check model state."
+                    )
+            except Exception as e:
                 import warnings
                 warnings.warn(
                     f"LoRA verification failed after resume: {e}. "
@@ -1199,8 +1242,11 @@ class QGRETrainer:
                 "algorithm": {"mode": self.config.algorithm.mode, "loss_type": self.config.algorithm.loss_type},
                 "training": {"lr": cfg.lr, "total_steps": cfg.total_steps},
             })
-        except Exception:
-            pass  # MLflow may not be configured
+        except ImportError:
+            pass  # MLflow not installed
+        except Exception as e:
+            import warnings
+            warnings.warn(f"MLflow setup failed: {e}. Metrics will not be tracked.")
 
         # Try to resume from checkpoint
         self.resume(self.config.logging.checkpoint_dir)
@@ -1228,7 +1274,10 @@ class QGRETrainer:
                     if current_rate > 0:
                         restore_lora = apply_lora_dropout(self.model, current_rate)
                         # Sync noisy weights to vLLM via Weight Sync Bus
-                        weight_bus.sync(backend.weight_exporter, backend.weight_loader, self.model)
+                        weight_bus.sync(
+                            backend.weight_exporter, backend.weight_loader, self.model,
+                            modules_to_save=self.config.model.modules_to_save,
+                        )
 
                 try:
                     _dev = next((p.device for p in self.model.parameters() if p.device.type != "cpu"), next(self.model.parameters()).device)
@@ -1268,7 +1317,7 @@ class QGRETrainer:
                 step_rewards = {int(k.split("_")[-1]): v for k, v in metrics.items()
                                if k.startswith("mastery/step_")}
                 # Log mastery and phase to stdout for debugging curriculum
-                if self.global_step % 5 == 0:
+                if self.global_step % self.config.logging.log_freq == 0:
                     tiers_str = "/".join(self.game_state.active_tiers)
                     reward_mean = metrics.get("reward/mean", 0.0)
                     critic_val = metrics.get("critic_loss", 0)
@@ -1331,8 +1380,14 @@ class QGRETrainer:
                         step_rewards=step_rewards if step_rewards else None,
                         extra={k: v for k, v in metrics.items() if k == "phase"},
                     )
-                except Exception:
-                    pass  # MLflow may not be configured
+                except ImportError:
+                    pass  # MLflow not installed
+                except Exception as e:
+                    # Warn once per unique error, don't spam logs
+                    if not hasattr(self, "_mlflow_warned"):
+                        import warnings
+                        warnings.warn(f"MLflow logging failed: {e}. Further errors will be silent.")
+                        self._mlflow_warned = True
 
                 # 5. Save checkpoint
                 if self.global_step % cfg.save_freq == 0:
@@ -1340,10 +1395,14 @@ class QGRETrainer:
 
                 # 6. Weight sync via Weight Sync Bus (LoRA + modules_to_save → vLLM)
                 if backend.weight_loader is not None:
-                    weight_bus.sync(backend.weight_exporter, backend.weight_loader, self.model)
+                    weight_bus.sync(
+                        backend.weight_exporter, backend.weight_loader, self.model,
+                        modules_to_save=self.config.model.modules_to_save,
+                    )
 
                 # 7. Periodic vLLM KV cache flush to prevent VRAM leak (unsloth #3864)
-                if self.global_step > 0 and self.global_step % 50 == 0:
+                flush_freq = self.config.training.kv_cache_flush_freq
+                if flush_freq > 0 and self.global_step > 0 and self.global_step % flush_freq == 0:
                     if backend.weight_loader is not None:
                         try:
                             backend.weight_loader.flush_kv_cache()

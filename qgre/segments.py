@@ -114,6 +114,12 @@ def _hif_json_segmenter_impl(token_ids: list[int], tokenizer: Any) -> list[str]:
     if not token_ids:
         return []
 
+    # Pre-validation: check tokenizer has decode method
+    if not hasattr(tokenizer, "decode"):
+        import warnings
+        warnings.warn("Segmenter: tokenizer lacks decode method — returning default regions")
+        return ["STEP_5"] * len(token_ids)
+
     n = len(token_ids)
     regions = ["STEP_5"] * n  # Default: last step (overall quality)
 
@@ -135,16 +141,29 @@ def _hif_json_segmenter_impl(token_ids: list[int], tokenizer: Any) -> list[str]:
     # Build character→token index mapping
     try:
         text = tokenizer.decode(token_ids, skip_special_tokens=False)
-    except Exception:
+    except Exception as e:
+        import warnings
+        warnings.warn(
+            f"Segmenter full decode failed for {len(token_ids)} tokens: {e}. "
+            f"Falling back to think-annotated + STEP_5 default."
+        )
         return regions  # If decode fails, return think-annotated + STEP_5 default
 
     # Get per-token text lengths for char→token mapping
     token_texts = []
+    decode_failures = 0
     for tid in token_ids:
         try:
             token_texts.append(tokenizer.decode([tid], skip_special_tokens=False))
         except Exception:
             token_texts.append("")
+            decode_failures += 1
+    if decode_failures > 0:
+        import warnings
+        warnings.warn(
+            f"Segmenter per-token decode: {decode_failures}/{len(token_ids)} failures. "
+            f"Region mapping may be inaccurate."
+        )
 
     # Build char_offset → token_index mapping
     char_to_token = []
@@ -233,6 +252,12 @@ def _hamiltonian_segmenter_impl(token_ids: list[int], tokenizer: Any) -> list[st
     if not token_ids:
         return []
 
+    # Pre-validation: check tokenizer has decode method
+    if not hasattr(tokenizer, "decode"):
+        import warnings
+        warnings.warn("Hamiltonian segmenter: tokenizer lacks decode method — returning default regions")
+        return ["STEP_1"] * len(token_ids)
+
     n = len(token_ids)
     regions = ["STEP_1"] * n  # Default: derivation text → format quality
 
@@ -253,16 +278,28 @@ def _hamiltonian_segmenter_impl(token_ids: list[int], tokenizer: Any) -> list[st
     # Pass 2: Decode and find label positions
     try:
         text = tokenizer.decode(token_ids, skip_special_tokens=False)
-    except Exception:
+    except Exception as e:
+        import warnings
+        warnings.warn(
+            f"Hamiltonian segmenter full decode failed for {len(token_ids)} tokens: {e}. "
+            f"Falling back to think-annotated + STEP_1 default."
+        )
         return regions
 
     # Build char→token index mapping
     token_texts = []
+    decode_failures = 0
     for tid in token_ids:
         try:
             token_texts.append(tokenizer.decode([tid], skip_special_tokens=False))
         except Exception:
             token_texts.append("")
+            decode_failures += 1
+    if decode_failures > 0:
+        import warnings
+        warnings.warn(
+            f"Hamiltonian segmenter per-token decode: {decode_failures}/{len(token_ids)} failures."
+        )
 
     char_to_token = []
     for i, tt in enumerate(token_texts):
@@ -322,6 +359,12 @@ def _label_segmenter_impl(
     if not token_ids:
         return []
 
+    # Pre-validation: check tokenizer has decode method
+    if not hasattr(tokenizer, "decode"):
+        import warnings
+        warnings.warn(f"Label segmenter: tokenizer lacks decode method — returning {default_region} for all tokens")
+        return [default_region] * len(token_ids)
+
     n = len(token_ids)
     regions = [default_region] * n
 
@@ -342,16 +385,28 @@ def _label_segmenter_impl(
     # Pass 2: Decode and find label positions
     try:
         text = tokenizer.decode(token_ids, skip_special_tokens=False)
-    except Exception:
+    except Exception as e:
+        import warnings
+        warnings.warn(
+            f"Label segmenter full decode failed for {len(token_ids)} tokens: {e}. "
+            f"Falling back to think-annotated + {default_region} default."
+        )
         return regions
 
     # Build char→token index mapping
     token_texts = []
+    decode_failures = 0
     for tid in token_ids:
         try:
             token_texts.append(tokenizer.decode([tid], skip_special_tokens=False))
         except Exception:
             token_texts.append("")
+            decode_failures += 1
+    if decode_failures > 0:
+        import warnings
+        warnings.warn(
+            f"Label segmenter per-token decode: {decode_failures}/{len(token_ids)} failures."
+        )
 
     char_to_token = []
     for i, tt in enumerate(token_texts):
