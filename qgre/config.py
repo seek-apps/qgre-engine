@@ -252,6 +252,30 @@ class QGREConfig:
                 "generation.stop_token_ids is empty — generation may not terminate.\n"
                 "Set per-model. Qwen3: [151643, 151645]"
             )
+        # CFG-R2-1: Validate train_files is non-empty
+        if not self.data.train_files:
+            raise ValueError(
+                "data.train_files is empty — no training data configured.\n"
+                "Add at least one parquet file path to data.train_files in YAML."
+            )
+        # CFG-R3-1: metadata_columns must be list[str], not string
+        if not isinstance(self.data.metadata_columns, list):
+            raise ValueError(
+                f"data.metadata_columns must be list[str], got {type(self.data.metadata_columns).__name__}.\n"
+                "String iterates as characters. Use YAML list syntax: [col1, col2]"
+            )
+        # CFG-R3-3: tier_order must be list[str], not string
+        if self.data.tier_order is not None and not isinstance(self.data.tier_order, list):
+            raise ValueError(
+                f"data.tier_order must be list[str], got {type(self.data.tier_order).__name__}.\n"
+                "String iterates as characters. Use YAML list syntax: [tier1, tier2, tier3]"
+            )
+        # CFG-R3-2: initial_tiers must be list[str], not string
+        if self.data.initial_tiers is not None and not isinstance(self.data.initial_tiers, list):
+            raise ValueError(
+                f"data.initial_tiers must be list[str], got {type(self.data.initial_tiers).__name__}.\n"
+                "String iterates as characters. Use YAML list syntax: [tier1, tier2]"
+            )
 
     @staticmethod
     def from_yaml(path: str | Path) -> QGREConfig:
@@ -279,11 +303,17 @@ class QGREConfig:
             cfg.model = ModelConfig(**_pick(ModelConfig, d["model"], "model"))
         if "data" in d:
             data_fields = _pick(DataConfig, d["data"], "data")
-            # Ensure difficulty_schedule keys are ints
+            # CFG-R1-1: Ensure difficulty_schedule keys are ints with clear error message
             if "difficulty_schedule" in data_fields and data_fields["difficulty_schedule"] is not None:
-                data_fields["difficulty_schedule"] = {
-                    int(k): list(v) for k, v in data_fields["difficulty_schedule"].items()
-                }
+                try:
+                    data_fields["difficulty_schedule"] = {
+                        int(k): list(v) for k, v in data_fields["difficulty_schedule"].items()
+                    }
+                except (ValueError, TypeError) as e:
+                    raise ValueError(
+                        f"data.difficulty_schedule keys must be integers (phase numbers). "
+                        f"Got non-integer key: {e}"
+                    ) from e
             cfg.data = DataConfig(**data_fields)
         if "generation" in d:
             cfg.generation = GenerationConfig(**_pick(GenerationConfig, d["generation"], "generation"))
@@ -302,11 +332,17 @@ class QGREConfig:
                     default_region=ls_raw.get("default_region", "STEP_1"),
                     ignore_case=ls_raw.get("ignore_case", False),
                 )
-            # Ensure step_qualities keys are ints (YAML may parse them as ints or strings)
+            # CFG-R1-7: Ensure step_qualities keys are ints with clear error message
             if "step_qualities" in algo_fields and algo_fields["step_qualities"] is not None:
-                algo_fields["step_qualities"] = {
-                    int(k): list(v) for k, v in algo_fields["step_qualities"].items()
-                }
+                try:
+                    algo_fields["step_qualities"] = {
+                        int(k): list(v) for k, v in algo_fields["step_qualities"].items()
+                    }
+                except (ValueError, TypeError) as e:
+                    raise ValueError(
+                        f"algorithm.step_qualities keys must be integers (step numbers). "
+                        f"Got non-integer key: {e}"
+                    ) from e
             # Ensure step_region_map keys/values are ints
             if "step_region_map" in algo_fields and algo_fields["step_region_map"] is not None:
                 algo_fields["step_region_map"] = {

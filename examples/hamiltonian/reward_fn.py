@@ -1385,7 +1385,8 @@ def _score_correct_coefficient(text: str, meta: dict) -> float:
             extracted_H = _extract_H(text)
             if extracted_H is not None:
                 any_extracted = True
-                h_score = _score_expression(extracted_H, meta["H_expr"], [], constant_subs=meta.get("_constant_subs"))
+                # CFG-R1-3: Use .get() consistently to avoid KeyError
+                h_score = _score_expression(extracted_H, meta.get("H_expr", ""), [], constant_subs=meta.get("_constant_subs"))
                 component_scores.append(h_score)
 
         # ── Score equations ──────────────────────────────────────────────────
@@ -1413,16 +1414,19 @@ def _score_correct_coefficient(text: str, meta: dict) -> float:
                             eq_component_scores.append(sum(part_scores) / len(part_scores))
 
                 if has_dpdt:
-                    expected_parts = [e.strip() for e in meta["dpdt"].split(";") if e.strip()]
-                    part_scores = []
-                    for exp_part in expected_parts:
-                        best = max(
-                            (_score_expression(ext, exp_part, [], constant_subs=csubs) for ext in extracted_eqs),
-                            default=0.0,
-                        )
-                        part_scores.append(best)
-                    if part_scores:
-                        eq_component_scores.append(sum(part_scores) / len(part_scores))
+                    # CFG-R1-3: Use .get() consistently to avoid KeyError
+                    dpdt_str = meta.get("dpdt", "")
+                    if dpdt_str:
+                        expected_parts = [e.strip() for e in dpdt_str.split(";") if e.strip()]
+                        part_scores = []
+                        for exp_part in expected_parts:
+                            best = max(
+                                (_score_expression(ext, exp_part, [], constant_subs=csubs) for ext in extracted_eqs),
+                                default=0.0,
+                            )
+                            part_scores.append(best)
+                        if part_scores:
+                            eq_component_scores.append(sum(part_scores) / len(part_scores))
 
             if eq_component_scores:
                 eq_score = sum(eq_component_scores) / len(eq_component_scores)

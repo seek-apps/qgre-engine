@@ -221,12 +221,26 @@ class VPRMCritic(nn.Module):
 
             # Target prediction for stable advantage
             target_pred = self.target_heads[q_name](pooled).squeeze(0).squeeze(0)
+            # ADV-R2-5: Check for NaN before .item()
+            if torch.isnan(target_pred):
+                import warnings
+                warnings.warn(f"NaN target prediction for quality '{q_name}' — setting advantage to 0.0")
+                advantages[q_name] = 0.0
+                continue
             adv = actual - target_pred.detach().item()
             adv = max(-self.clip_advantage, min(self.clip_advantage, adv))
             advantages[q_name] = adv
 
             # Online prediction for MSE loss (online learns fast)
             online_pred = self.heads[q_name](pooled).squeeze(0).squeeze(0)
+            # ADV-R2-6: Warn when no gradient will flow
+            if not online_pred.requires_grad:
+                if not hasattr(self, "_no_grad_warned"):
+                    self._no_grad_warned = set()
+                if q_name not in self._no_grad_warned:
+                    import warnings
+                    warnings.warn(f"Critic head '{q_name}' has requires_grad=False — no loss recorded, critic will not learn")
+                    self._no_grad_warned.add(q_name)
             if online_pred.requires_grad:
                 reward_target = torch.tensor(actual, device=online_pred.device, dtype=online_pred.dtype)
                 critic_losses[q_name] = (online_pred - reward_target) ** 2

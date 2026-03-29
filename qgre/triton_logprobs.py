@@ -47,6 +47,12 @@ if HAS_TRITON:
         # Load the label for this position
         label = tl.load(label_ptr + pid)
 
+        # GEN-R2-1: Validate label bounds
+        if label >= vocab_size or label < 0:
+            # Out-of-bounds label → return -inf (zero probability)
+            tl.store(output_ptr + pid, float("-inf"))
+            return
+
         # Load hidden state for this position: [hidden_dim]
         h_offs = tl.arange(0, hidden_dim)
         h = tl.load(hidden_ptr + pid * hidden_dim + h_offs).to(tl.float32)
@@ -111,6 +117,9 @@ if HAS_TRITON:
             exp_vals = tl.exp(tl.where(mask, logits - max_logit, float("-inf")))
             sum_exp += tl.sum(exp_vals)
 
+        # GEN-R2-3: Clamp sum_exp to prevent log(0) = -inf → result = +inf
+        sum_exp = tl.maximum(sum_exp, 1e-30)
+
         # log_softmax(label) = label_logit - max_logit - log(sum_exp)
         log_prob = label_logit - max_logit - tl.log(sum_exp)
         tl.store(output_ptr + pid, log_prob)
@@ -142,6 +151,10 @@ def triton_logprobs_from_hidden(
 
     # Qwen3: vocab=151936, divisible by 128 but NOT 256
     BLOCK_V = 128
+
+    # Return empty tensor early if seq_len=0 or batch=0
+    if seq_len == 0 or batch == 0:
+        return torch.empty(batch, seq_len, dtype=torch.float32, device=hidden_states.device)
 
     result = torch.empty(batch, seq_len, dtype=torch.float32, device=hidden_states.device)
 

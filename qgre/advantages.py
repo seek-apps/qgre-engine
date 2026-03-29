@@ -23,7 +23,8 @@ def apply_frontier_amplification(
     """
     if frontier_steps and amplification > 0:
         for sn in step_nums:
-            if sn in frontier_steps:
+            # ADV-R1-7: Check if step exists in step_advs before amplifying
+            if sn in frontier_steps and sn in step_advs:
                 step_advs[sn] = step_advs[sn] * (1.0 + amplification)
 
 
@@ -321,6 +322,12 @@ class QGREStepAdvantageEstimator:
         batch_size: int,
         batch_contexts: list[PromptContext] | None = None,
     ):
+        # ADV-R1-2: Validate batch_contexts length if provided
+        if batch_contexts is not None and len(batch_contexts) < batch_size:
+            raise ValueError(
+                f"batch_contexts length ({len(batch_contexts)}) < batch_size ({batch_size}). "
+                "Must provide context for all samples."
+            )
         # Pre-compute batch mean per step for warm-start (PLAN.md spec: use batch mean, not sample)
         batch_means: dict[int, float] = {}
         for step_num in self._step_nums:
@@ -329,7 +336,9 @@ class QGREStepAdvantageEstimator:
 
         for step_num in self._step_nums:
             for i in range(batch_size):
-                pid = batch_contexts[i].prompt_id if batch_contexts else batch_prompt_ids[i]
+                # ADV-R2-4: Check for None before accessing attributes
+                ctx = batch_contexts[i] if batch_contexts and i < len(batch_contexts) else None
+                pid = ctx.prompt_id if ctx is not None else batch_prompt_ids[i]
                 r = all_step_rewards[i].get(step_num, 0.0)
                 v = self.V[pid][step_num]
 
@@ -345,8 +354,10 @@ class QGREStepAdvantageEstimator:
                 else:
                     step_advs[step_num][i] = r - v
                     # Aspiration gap: push toward perfection (1.0).
+                    # ADV-R2-1: Safe attribute access with getattr
                     if self._aspiration_beta > 0:
-                        warmup = batch_contexts[i].aspiration_warmup if batch_contexts else 1.0
+                        ctx = batch_contexts[i] if batch_contexts and i < len(batch_contexts) and batch_contexts[i] is not None else None
+                        warmup = getattr(ctx, 'aspiration_warmup', 1.0) if ctx else 1.0
                         step_advs[step_num][i] += self._aspiration_beta * warmup * (r - 1.0)
 
                 # Variance-aware baseline: slow lr when reward is constant
@@ -357,7 +368,8 @@ class QGREStepAdvantageEstimator:
                     new_mean = r_mean + self._var_lr * (r - r_mean)
                     self._reward_mean[pid][step_num] = new_mean
                     old_var = self._reward_var[pid][step_num]
-                    new_var = old_var + self._var_lr * ((r - r_mean) ** 2 - old_var)
+                    # ADV-R2-2: Use new_mean for variance (not stale r_mean)
+                    new_var = old_var + self._var_lr * ((r - new_mean) ** 2 - old_var)
                     if new_var < 0:
                         # Negative variance indicates numerical instability in EMA — log and clamp
                         warnings.warn(
@@ -545,7 +557,7 @@ class QGREStepAdvantageEstimator:
         self._step_seen = defaultdict(set)
         for pid, steps in state.get("step_seen", {}).items():
             self._step_seen[int(pid)] = set(int(s) for s in steps)
-        self._reward_var = defaultdict(lambda: defaultdict(lambda: self._var_threshold))
+        # Merge loaded state into existing dict to preserve state for prompts not in checkpoint
         for pid, steps in state.get("reward_var", {}).items():
             for step_num, val in steps.items():
                 self._reward_var[int(pid)][int(step_num)] = float(val)
@@ -615,6 +627,12 @@ def compute_advantages_vprm(
         else:
             step_advs[step_num] = 0.0
 
+    # ADV-R1-8: Initialize virtual steps with 0.0 advantage
+    if step_region_map:
+        for vs in step_region_map.keys():
+            if vs not in step_advs:
+                step_advs[vs] = 0.0
+
     # Perfect score = zero advantage. Imperfect = push toward 1.0.
     for step_num in step_nums:
         qualities = [q for q in step_qualities[step_num] if q in active_qualities]
@@ -634,7 +652,11 @@ def compute_advantages_vprm(
 
     # Total critic loss
     if critic_losses:
-        total_critic_loss = torch.stack(list(critic_losses.values())).mean()
+        losses = [loss for loss in critic_losses.values() if not torch.isnan(loss)]
+        if len(losses) < len(critic_losses):
+            import warnings
+            warnings.warn(f"Filtered {len(critic_losses) - len(losses)} NaN critic losses before aggregation")
+        total_critic_loss = torch.stack(losses).mean() if losses else torch.tensor(0.0, device=device)
     else:
         total_critic_loss = torch.tensor(0.0, device=device)
 

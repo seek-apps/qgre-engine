@@ -48,14 +48,14 @@ def selective_log_softmax(
         selected = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
         return (selected - lse).to(torch.float32)
     else:
-        # bf16/fp16: logsumexp loses precision. Use per-row log_softmax instead.
-        # Still memory-efficient: processes one row at a time.
+        # GEN-R1-5: bf16/fp16: convert to FP32 BEFORE log_softmax for stability
+        # logsumexp in BF16 loses precision — compute log_softmax in FP32.
         token_logprobs = torch.zeros_like(index, dtype=torch.float32)
         for i, (logits_row, index_row) in enumerate(zip(logits, index)):
-            logprobs_row = logits_row.log_softmax(dim=-1)
+            logprobs_row = logits_row.float().log_softmax(dim=-1)
             token_logprobs[i] = torch.gather(
                 logprobs_row, dim=-1, index=index_row.unsqueeze(-1)
-            ).squeeze(-1).to(torch.float32)
+            ).squeeze(-1)
         return token_logprobs
 
 

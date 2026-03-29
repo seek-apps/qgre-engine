@@ -76,6 +76,11 @@ class QGRETrainer:
         self._tier_advance_phase = data_cfg.tier_advance_quality_phase
         self._tier_advance_threshold = data_cfg.tier_advance_threshold
         if self._tier_order and data_cfg.initial_tiers:
+            # Type check: ensure lists, not strings
+            if not isinstance(data_cfg.initial_tiers, list):
+                raise ValueError(f"initial_tiers must be list[str], got {type(data_cfg.initial_tiers).__name__}")
+            if not isinstance(self._tier_order, list):
+                raise ValueError(f"tier_order must be list[str], got {type(self._tier_order).__name__}")
             self.game_state.active_tiers = list(data_cfg.initial_tiers)
             for t in data_cfg.initial_tiers:
                 self.game_state.tier_phases.setdefault(t, 1)
@@ -680,9 +685,9 @@ class QGRETrainer:
                 mb_gen_lp = gen_logprobs_padded[mb_start:mb_end, 1:]  # Shift to match mb_lp indexing
                 min_lp_len = min(mb_lp.shape[1], mb_gen_lp.shape[1])
                 mb_old_lp = mb_gen_lp[:, :min_lp_len]
-                # Pad if mb_lp is longer (shouldn't happen, but defensive)
+                # Use large negative value instead of -inf to avoid inf in KL computation
                 if mb_lp.shape[1] > min_lp_len:
-                    pad = torch.zeros(mb_lp.shape[0], mb_lp.shape[1] - min_lp_len, device=device)
+                    pad = torch.full((mb_lp.shape[0], mb_lp.shape[1] - min_lp_len), -1e9, device=device)
                     mb_old_lp = torch.cat([mb_old_lp, pad], dim=1)
             else:
                 mb_old_lp = mb_lp.detach()
@@ -816,6 +821,13 @@ class QGRETrainer:
                 mb_loss = mb_loss + mb_critic_loss
                 mb_metrics["critic_loss"] = mb_critic_loss.item()
 
+            # TRN-R1-2: Check loss for NaN/inf BEFORE backward() to prevent optimizer corruption
+            if not torch.isfinite(mb_loss):
+                raise RuntimeError(
+                    f"Step {self.global_step} micro-batch {mb_i+1}/{n_micro}: "
+                    f"loss is {mb_loss.item()} — aborting before backward() to prevent gradient corruption."
+                )
+
             (mb_loss / n_micro).backward()
             total_loss += mb_loss.item() / n_micro
 
@@ -826,20 +838,27 @@ class QGRETrainer:
             if self.config.training.empty_cache_between_microbatches and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+            # TRN-R1-3: Track metric types for correct aggregation
             if not all_metrics:
                 all_metrics = {k: v for k, v in mb_metrics.items()}
+                # Track which metrics are per-token (should be averaged), not summed
+                self._per_token_metrics = {"kl", "llds_loss", "llds_mask_ratio", "critic_loss"}
             else:
                 for k, v in mb_metrics.items():
                     all_metrics[k] = all_metrics.get(k, 0) + v
 
-        metrics = {k: v / n_micro for k, v in all_metrics.items()} if n_micro > 1 else all_metrics
-        metrics["loss"] = total_loss
-        loss_val = total_loss  # For NaN check
-
-        if not (torch.isfinite(torch.tensor(loss_val))):
-            raise RuntimeError(
-                f"Step {self.global_step}: loss is {loss_val} — aborting to prevent weight corruption."
-            )
+        # TRN-R1-3: Aggregate per-token metrics correctly (average), not scalar sum
+        metrics = {}
+        for k, v in all_metrics.items():
+            if k in self._per_token_metrics:
+                metrics[k] = v / n_micro  # Per-token: average across micro-batches
+            else:
+                metrics[k] = v  # Scalar: sum is correct (e.g., policy_loss is already normalized)
+        if n_micro > 1 and "loss" not in self._per_token_metrics:
+            # Total loss is sum of micro-batch losses (each already divided by n_micro)
+            metrics["loss"] = total_loss
+        else:
+            metrics["loss"] = total_loss
 
         # Track accumulated loss across gradient accumulation steps
         self._accumulated_loss += total_loss
@@ -961,6 +980,7 @@ class QGRETrainer:
             cuda_rng_state=torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
             vprm_critic_state=self.vprm_critic.state_dict_with_meta() if self.vprm_critic else None,
             vprm_optimizer_state=self.vprm_optimizer.state_dict() if self.vprm_optimizer else None,
+            accumulated_loss=self._accumulated_loss,  # TRN-R2-1: Save accumulation state
         )
 
     def resume(self, checkpoint_dir: str | Path) -> bool:
@@ -1065,6 +1085,14 @@ class QGRETrainer:
             torch.set_rng_state(checkpoint["rng_state"])
         if checkpoint.get("cuda_rng_state") is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state(checkpoint["cuda_rng_state"])
+
+        # TRN-R2-1: Restore accumulated loss
+        self._accumulated_loss = checkpoint.get("accumulated_loss", 0.0)
+
+        # TRN-R2-5: Set _resumed_mid_accumulation flag when resuming mid-accumulation
+        n_accum = self.config.training.gradient_accumulation_steps
+        if self.global_step % n_accum != 0:
+            self._resumed_mid_accumulation = True
 
         # Re-validate fused logprobs after resume — model weights changed
         self._fused_validated = False

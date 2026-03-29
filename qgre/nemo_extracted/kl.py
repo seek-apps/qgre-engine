@@ -76,10 +76,10 @@ def masked_mean(
         if global_normalization_factor is None
         else global_normalization_factor
     )
-    # Check if mask.sum() == 0 and return 0.0 explicitly
+    # TRN-R1-5: Always return tensor (not scalar 0.0) for consistent type
     if isinstance(normalization_factor, torch.Tensor):
         if (normalization_factor == 0).all():
             return torch.zeros_like(torch.sum(values * mask, dim=dim))
     elif normalization_factor == 0:
-        return 0.0
+        return torch.tensor(0.0, device=values.device, dtype=values.dtype)
     return torch.sum(values * mask, dim=dim) / (normalization_factor + 1e-8)

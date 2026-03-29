@@ -208,7 +208,10 @@ class UnslothBackend:
                     print(f"vLLM max_logprobs patched to {self.generation_config.max_logprobs} for LLDS logprob extraction")
         except Exception as e:
             import warnings
-            warnings.warn(f"Could not patch vLLM max_logprobs: {e}. LLDS may not receive logprobs.")
+            warnings.warn(
+                f"Could not patch vLLM max_logprobs: {e}. "
+                "LLDS will be disabled because vLLM cannot return sufficient logprobs for all continuation tokens."
+            )
 
         return model, tokenizer
 
@@ -337,14 +340,14 @@ class UnslothBackend:
                     if sampled_id in pos_dict:
                         sample_lps.append(pos_dict[sampled_id].logprob)
                     else:
-                        # vLLM should always include sampled token with logprobs >= 1.
-                        # If missing, fall back to first entry but warn.
+                        # GEN-R1-3: vLLM should always include sampled token with logprobs >= 1.
+                        # If missing, token was truncated from top-k — return -inf instead of wrong value.
                         import warnings
                         warnings.warn(
                             f"Sampled token {sampled_id} not in logprobs dict at position {t} "
-                            f"(keys: {list(pos_dict.keys())}). Using first entry."
+                            f"(keys: {list(pos_dict.keys())}). Returning -inf (token was below top-k cutoff)."
                         )
-                        sample_lps.append(next(iter(pos_dict.values())).logprob)
+                        sample_lps.append(float('-inf'))
             all_logprobs.append(sample_lps)
 
         has_logprobs = all(len(lps) > 0 for lps in all_logprobs) if all_logprobs else False

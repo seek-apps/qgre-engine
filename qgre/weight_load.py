@@ -82,6 +82,7 @@ class WeightLoader:
             )
 
         synced = []
+        expected = list(weights.keys())
         for name, tensor in weights.items():
             if name == "lm_head":
                 try:
@@ -116,13 +117,16 @@ class WeightLoader:
                 target.data.copy_(tensor.to(target.dtype))
                 synced.append(name)
 
-        if weights and not synced:
+        # WS-R1-4: Track expected vs synced and raise if mismatch
+        if expected and set(expected) != set(synced):
             raise RuntimeError(
-                f"modules_to_save sync failed: expected to sync {list(weights.keys())} "
-                "but none matched vLLM model structure."
+                f"modules_to_save partial sync failure: expected {expected}, synced {synced}. "
+                f"Missing: {set(expected) - set(synced)}"
             )
-        if synced:
-            torch.cuda.synchronize()
+        # WS-R1-7: Always synchronize at end, even if no modules_to_save (LoRA may be pending)
+        # WS-R2-1: Pass device for multi-GPU safety
+        target_device = tensor.device if tensor is not None else torch.cuda.current_device()
+        torch.cuda.synchronize(device=target_device)
 
     def get_vllm_model(self):
         """Navigate vLLM internals to get the base model for direct weight access.
@@ -153,6 +157,13 @@ class WeightLoader:
                 continue
             model = getattr(model_runner, "model", None)
             if model is not None:
+                # WS-R1-5: Validate traversal result has expected vLLM model structure
+                if not hasattr(model, "lm_head"):
+                    warnings.warn(
+                        "vLLM model traversal returned object without lm_head — "
+                        "may be wrong type due to vLLM version change. Skipping."
+                    )
+                    continue
                 return model
 
         return None

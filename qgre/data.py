@@ -291,5 +291,13 @@ class QGREDataLoader:
 def load_prompts_from_parquet(path: str | Path) -> list[dict[str, Any]]:
     """Load prompts from a parquet file. Returns list of dicts."""
     import pandas as pd
-    df = pd.read_parquet(path)
+    # CFG-R2-3: Add context on FileNotFoundError
+    try:
+        df = pd.read_parquet(path)
+    except FileNotFoundError as e:
+        raise FileNotFoundError(
+            f"Training data file not found: {path}\n"
+            f"Check data.train_files in config YAML and verify paths are correct.\n"
+            f"Original error: {e}"
+        ) from e
     return df.to_dict(orient="records")
