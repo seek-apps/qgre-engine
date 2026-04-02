@@ -57,7 +57,6 @@ class WeightLoader:
 
         # WS3-001: Track dropout state, skip sync if dropout active
         if apply_lora_dropout is not None and getattr(apply_lora_dropout, '_dropout_active', False):
-            import warnings
             warnings.warn(
                 "WS3-001: sync_lora_direct called while LoRA dropout is active. "
                 "Skipping sync to avoid race condition. Call restore() first."
@@ -185,7 +184,6 @@ class WeightLoader:
                     synced.append(name)
         except Exception as e:
             # WS3-006: Rollback on failure (log error, don't crash)
-            import warnings
             warnings.warn(
                 f"WS3-006: modules_to_save sync failed mid-operation. "
                 f"Synced: {synced}, expected: {expected}. Error: {e}. "
