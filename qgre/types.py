@@ -109,7 +109,8 @@ class TrainingContext:
 class TrainerState:
     """All mutable trainer state in one place.
 
-    Tracks accumulation progress, resumption flags, and sync requirements.
+    Tracks accumulation progress, resumption flags, sync requirements,
+    and RNG state for reproducibility.
     Serializable checkpoint component.
     """
     global_step: int = 0
@@ -119,6 +120,9 @@ class TrainerState:
     resumed_mid_accumulation: bool = False
     fused_validated: bool = False
     needs_weight_sync: bool = False
+    # RNG state for reproducibility across resume
+    rng_state: object | None = None  # torch.get_rng_state() output
+    cuda_rng_state: object | None = None  # torch.cuda.get_rng_state() output
 
 
 @dataclass
@@ -139,11 +143,12 @@ class DataLoaderState:
 class AdvantageEstimatorState:
     """Estimator config and accumulated statistics.
 
-    Tracks clip parameters and region mapping for advantage computation.
-    Serializable checkpoint component.
+    Wraps the advantage estimator's full state_dict for checkpoint serialization.
+    The actual state structure is managed by QGREStepAdvantageEstimator.
     """
-    clip_advantage: float = 5.0
-    step_region_map: dict | None = None
+    # Full state dict from QGREStepAdvantageEstimator.state_dict()
+    # Contains: V, V_last_seen, quality_seen, step_seen, reward_var, reward_mean, etc.
+    state_dict: dict | None = None
 
 
 @dataclass
@@ -162,16 +167,26 @@ class WeightLoaderState:
 class CheckpointState:
     """Master container holding all component states.
 
+    The single source of truth for checkpoint serialization.
     Provides validation on construction and forward compatibility
     for schema evolution.
     """
+    # Component states (required)
     trainer: TrainerState
     dataloader: DataLoaderState
     advantage_estimator: AdvantageEstimatorState
     weight_loader: WeightLoaderState
     game_state: GameState
+    # PyTorch model states (optional - None when saving state-only checkpoint)
+    model_state_dict: dict | None = None
+    optimizer_state_dict: dict | None = None
+    scheduler_state_dict: dict | None = None
+    # VPRM critic states (optional)
     vprm_critic_state: dict | None = None
     vprm_optimizer_state: dict | None = None
+    # Training context (optional)
+    training_context: dict | None = None
+    # Schema version for migration
     schema_version: int = CHECKPOINT_SCHEMA_VERSION
 
     def __post_init__(self):
@@ -192,13 +207,12 @@ class CheckpointState:
             if getattr(self, field_name, None) is None:
                 raise ValueError(f"Required field cannot be None: {field_name}")
 
-        # Validate field types
+        # Validate field types for component states
         type_checks = [
             ("trainer", TrainerState),
             ("dataloader", DataLoaderState),
             ("advantage_estimator", AdvantageEstimatorState),
             ("weight_loader", WeightLoaderState),
-            ("game_state", GameState),
         ]
         for field_name, expected_type in type_checks:
             value = getattr(self, field_name)
@@ -207,6 +221,13 @@ class CheckpointState:
                     f"Field '{field_name}' has incorrect type: "
                     f"expected {expected_type.__name__}, got {type(value).__name__}"
                 )
+
+        # game_state can be GameState or dict (migration path — dict converted by checkpoint.py)
+        if not isinstance(self.game_state, (GameState, dict)):
+            raise TypeError(
+                f"Field 'game_state' has incorrect type: "
+                f"expected GameState or dict, got {type(self.game_state).__name__}"
+            )
 
         # Validate optional field types
         if self.vprm_critic_state is not None and not isinstance(self.vprm_critic_state, dict):
@@ -220,10 +241,25 @@ class CheckpointState:
                 f"got {type(self.vprm_optimizer_state).__name__}"
             )
 
+        # Validate optional dict fields
+        optional_dict_fields = [
+            "model_state_dict", "optimizer_state_dict", "scheduler_state_dict",
+            "vprm_critic_state", "vprm_optimizer_state", "training_context"
+        ]
+        for field_name in optional_dict_fields:
+            value = getattr(self, field_name, None)
+            if value is not None and not isinstance(value, dict):
+                raise TypeError(
+                    f"Field '{field_name}' must be dict or None, "
+                    f"got {type(value).__name__}"
+                )
+
         # Check for extra fields (forward compatibility warning)
         expected_fields = {
             "trainer", "dataloader", "advantage_estimator", "weight_loader",
-            "game_state", "vprm_critic_state", "vprm_optimizer_state", "schema_version"
+            "game_state", "model_state_dict", "optimizer_state_dict",
+            "scheduler_state_dict", "vprm_critic_state", "vprm_optimizer_state",
+            "training_context", "schema_version"
         }
         actual_fields = set(self.__dict__.keys())
         extra_fields = actual_fields - expected_fields
@@ -243,13 +279,15 @@ class CheckpointState:
     def from_dict(cls, d: dict) -> "CheckpointState":
         """Reconstruct CheckpointState from dict (e.g. from asdict() or torch.load()).
 
-        Handles nested dataclass reconstruction so round-trip works:
-            cs = CheckpointState(...)
-            cs_dict = asdict(cs)
-            cs2 = CheckpointState.from_dict(cs_dict)  # ✓ Works
+        Handles both:
+        1. New format: nested StateSpec dicts (trainer: {...}, dataloader: {...})
+        2. Old format: flat fields (global_step, accumulated_loss, etc.)
+
+        Migration: Old format is detected by absence of "trainer" key.
+        When migrating, fills defaults and logs warning.
 
         Args:
-            d: Dictionary with nested state dicts
+            d: Dictionary from asdict() or torch.load()
 
         Returns:
             CheckpointState instance with all nested dataclasses reconstructed
@@ -258,15 +296,80 @@ class CheckpointState:
             ValueError: If required keys are missing
             TypeError: If reconstruction fails due to type mismatch
         """
-        # Reconstruct nested dataclasses from their dict representations
-        trainer = TrainerState(**d["trainer"]) if isinstance(d["trainer"], dict) else d["trainer"]
-        dataloader = DataLoaderState(**d["dataloader"]) if isinstance(d["dataloader"], dict) else d["dataloader"]
-        advantage_estimator = AdvantageEstimatorState(**d["advantage_estimator"]) if isinstance(d["advantage_estimator"], dict) else d["advantage_estimator"]
-        weight_loader = WeightLoaderState(**d["weight_loader"]) if isinstance(d["weight_loader"], dict) else d["weight_loader"]
+        import warnings
 
-        # GameState is more complex — it has init_tutorial method, so we need to be careful
-        # For now, just reconstruct directly from dict if it's a dict
-        game_state = GameState(**d["game_state"]) if isinstance(d["game_state"], dict) else d["game_state"]
+        # Detect old format: has global_step at top level but no trainer key
+        is_old_format = "global_step" in d and "trainer" not in d
+
+        if is_old_format:
+            warnings.warn(
+                "Loading old checkpoint format (schema_version 1). "
+                "Migrating to StateSpec format with defaults.",
+                UserWarning
+            )
+            # Migrate: build StateSpec dicts from flat fields
+            trainer = TrainerState(
+                global_step=d.get("global_step", 0),
+                accumulated_loss=d.get("accumulated_loss", 0.0),
+                accumulation_count=d.get("accumulation_count", 0),
+                accumulated_samples=d.get("accumulated_samples", 0),
+                resumed_mid_accumulation=False,  # Default
+                fused_validated=False,  # Default
+                needs_weight_sync=False,  # Default
+                rng_state=d.get("rng_state"),
+                cuda_rng_state=d.get("cuda_rng_state"),
+            )
+            # Old format uses advantage_estimator_state (dict), wrap in StateSpec
+            advantage_estimator = AdvantageEstimatorState(
+                state_dict=d.get("advantage_estimator_state")
+            )
+            # Old format uses dataloader_state (dict), wrap in StateSpec
+            dl_state = d.get("dataloader_state")
+            dataloader = DataLoaderState(
+                epoch=dl_state.get("epoch", 0) if dl_state else 0,
+                step_in_epoch=dl_state.get("step_in_epoch", 0) if dl_state else 0,
+                total_steps=dl_state.get("total_steps", 0) if dl_state else 0,
+                priority_weights=dl_state.get("priority_weights") if dl_state else None,
+                difficulty_gate=dl_state.get("difficulty_gate") if dl_state else None,
+            )
+            # VPRM states go into WeightLoaderState
+            weight_loader = WeightLoaderState(
+                load_lora_called=False,  # Default
+                initialized=False,  # Default
+                cleaned_up=False,  # Default
+            )
+            # GameState uses gamestate_from_dict in checkpoint.py — here we just pass through
+            game_state_raw = d.get("game_state")
+            if game_state_raw is None:
+                game_state = GameState()
+            elif isinstance(game_state_raw, GameState):
+                game_state = game_state_raw
+            else:
+                # Assume it's already been converted by checkpoint.py's gamestate_from_dict
+                game_state = game_state_raw
+        else:
+            # New format: reconstruct nested dataclasses from their dict representations
+            trainer_d = d.get("trainer", {})
+            trainer = TrainerState(**trainer_d) if isinstance(trainer_d, dict) else trainer_d
+
+            dataloader_d = d.get("dataloader", {})
+            dataloader = DataLoaderState(**dataloader_d) if isinstance(dataloader_d, dict) else dataloader_d
+
+            ae_d = d.get("advantage_estimator", {})
+            advantage_estimator = AdvantageEstimatorState(**ae_d) if isinstance(ae_d, dict) else ae_d
+
+            wl_d = d.get("weight_loader", {})
+            weight_loader = WeightLoaderState(**wl_d) if isinstance(wl_d, dict) else wl_d
+
+            game_state_raw = d.get("game_state")
+            if game_state_raw is None:
+                game_state = GameState()
+            elif isinstance(game_state_raw, dict):
+                # Don't reconstruct GameState from dict here — checkpoint.py handles that
+                # via gamestate_from_dict which handles deque reconstruction
+                game_state = game_state_raw  # Will be converted by caller
+            else:
+                game_state = game_state_raw
 
         return cls(
             trainer=trainer,
@@ -274,8 +377,12 @@ class CheckpointState:
             advantage_estimator=advantage_estimator,
             weight_loader=weight_loader,
             game_state=game_state,
+            model_state_dict=d.get("model_state_dict"),
+            optimizer_state_dict=d.get("optimizer_state_dict"),
+            scheduler_state_dict=d.get("scheduler_state_dict"),
             vprm_critic_state=d.get("vprm_critic_state"),
             vprm_optimizer_state=d.get("vprm_optimizer_state"),
+            training_context=d.get("training_context"),
             schema_version=d.get("schema_version", CHECKPOINT_SCHEMA_VERSION),
         )
 

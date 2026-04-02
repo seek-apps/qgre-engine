@@ -88,7 +88,8 @@ def test_gamestate_stagnation_fields_roundtrip():
     assert old.stagnation_timeout == 200
     assert old.plateau_window == 50
     assert old.plateau_threshold == 0.02
-    assert old.tier_steps_at_phase_start == {}
+    # DP-R3-01: Missing tier_steps_at_phase_start entries are initialized from step_count
+    assert old.tier_steps_at_phase_start == {"default": 100}
 
 
 def test_gamestate_phase_advance():
@@ -145,11 +146,14 @@ def test_checkpoint_save_load_roundtrip(mock_game_state):
         )
 
         loaded = load_checkpoint(path)
-        assert loaded["global_step"] == 50
-        assert isinstance(loaded["game_state"], GameState)
-        assert loaded["game_state"].phase == mock_game_state.phase
-        assert loaded["advantage_estimator_state"] == {"V": {1: {1: 0.5}}}
-        assert torch.equal(loaded["rng_state"], rng_state)
+        # CheckpointState: access via attributes
+        assert loaded.trainer.global_step == 50
+        assert isinstance(loaded.game_state, GameState)
+        assert loaded.game_state.phase == mock_game_state.phase
+        # AdvantageEstimatorState wraps full state_dict — check it was preserved
+        assert loaded.advantage_estimator.state_dict is not None
+        assert loaded.advantage_estimator.state_dict.get("V", {}).get(1, {}).get(1) == 0.5
+        assert torch.equal(loaded.trainer.rng_state, rng_state)
 
 
 def test_checkpoint_discovery_finds_latest():
@@ -189,9 +193,9 @@ def test_checkpoint_rng_state_restored():
         # Generate some random numbers
         seq1 = torch.randn(5)
 
-        # Restore RNG state
+        # Restore RNG state — CheckpointState has rng_state in trainer
         loaded = load_checkpoint(path)
-        torch.set_rng_state(loaded["rng_state"])
+        torch.set_rng_state(loaded.trainer.rng_state)
 
         # Generate again — should match
         seq2 = torch.randn(5)
@@ -218,8 +222,9 @@ def test_checkpoint_includes_advantage_estimator_state(mock_game_state):
         )
 
         loaded = load_checkpoint(path)
-        assert loaded["advantage_estimator_state"]["V"][42][1] == 0.85
-        assert loaded["advantage_estimator_state"]["step_seen"][42] == [1, 2, 4]
+        # CheckpointState: advantage_estimator wraps state_dict
+        assert loaded.advantage_estimator.state_dict["V"][42][1] == 0.85
+        assert loaded.advantage_estimator.state_dict["step_seen"][42] == [1, 2, 4]
 
 
 def test_gamestate_preserves_defaultdict_behavior():

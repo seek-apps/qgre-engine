@@ -21,7 +21,13 @@ from qgre.nemo_extracted.llds import compute_llds_loss
 from qgre.nemo_extracted.logits import logprobs_from_logits
 from qgre.nemo_extracted.loss_functions import ClippedPGLossFn
 from qgre.segments import Segmenter, uniform_segmenter
-from qgre.types import CHECKPOINT_SCHEMA_VERSION, GameState, RewardResult, TrainingContext
+from qgre.types import (
+    CHECKPOINT_SCHEMA_VERSION,
+    CheckpointState,
+    GameState,
+    RewardResult,
+    TrainingContext,
+)
 
 
 class GenerationBackend(Protocol):
@@ -1281,9 +1287,10 @@ class QGRETrainer:
             return False
 
         checkpoint = load_checkpoint(latest)
-        self.global_step = checkpoint["global_step"]
+        # CheckpointState: access trainer fields via checkpoint.trainer
+        self.global_step = checkpoint.trainer.global_step
 
-        if not checkpoint.get("model_state_dict"):
+        if not checkpoint.model_state_dict:
             raise RuntimeError(
                 f"Checkpoint {latest} missing model_state_dict — cannot resume with random weights"
             )
@@ -1291,7 +1298,7 @@ class QGRETrainer:
         # a freshly initialized model (absmax, quant_map, quant_state, etc.)
         # These are saved by model.state_dict() but cause errors on load_state_dict()
         # because bnb creates them lazily during quantization, not at init time.
-        state_dict = checkpoint["model_state_dict"]
+        state_dict = checkpoint.model_state_dict
         model_keys = set(self.model.state_dict().keys())
         filtered = {k: v for k, v in state_dict.items() if k in model_keys}
         skipped = len(state_dict) - len(filtered)
@@ -1302,8 +1309,8 @@ class QGRETrainer:
 
         # Validate optimizer compatibility before loading
         optimizer_loaded = False
-        if checkpoint.get("optimizer_state_dict") and self.optimizer:
-            ckpt_opt = checkpoint["optimizer_state_dict"]
+        if checkpoint.optimizer_state_dict and self.optimizer:
+            ckpt_opt = checkpoint.optimizer_state_dict
             ckpt_groups = len(ckpt_opt.get("param_groups", []))
             model_groups = len(self.optimizer.param_groups)
 
@@ -1325,11 +1332,11 @@ class QGRETrainer:
                 optimizer_loaded = True
 
         scheduler_loaded = False
-        if checkpoint.get("scheduler_state_dict") and self.scheduler:
+        if checkpoint.scheduler_state_dict and self.scheduler:
             if optimizer_loaded:
                 # Check if T_max changed (indicating new schedule)
                 if hasattr(self.scheduler, "T_max"):
-                    ckpt_T_max = checkpoint["scheduler_state_dict"].get("T_max")
+                    ckpt_T_max = checkpoint.scheduler_state_dict.get("T_max")
                     current_T_max = self.scheduler.T_max
                     if ckpt_T_max is not None and ckpt_T_max != current_T_max:
                         import warnings
@@ -1340,7 +1347,7 @@ class QGRETrainer:
                         )
                     else:
                         try:
-                            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                            self.scheduler.load_state_dict(checkpoint.scheduler_state_dict)
                             scheduler_loaded = True
                         except (ValueError, KeyError) as e:
                             warnings.warn(
@@ -1349,7 +1356,7 @@ class QGRETrainer:
                             )
                 else:
                     try:
-                        self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                        self.scheduler.load_state_dict(checkpoint.scheduler_state_dict)
                         scheduler_loaded = True
                     except (ValueError, KeyError) as e:
                         warnings.warn(
@@ -1357,24 +1364,25 @@ class QGRETrainer:
                             "Learning rate schedule will restart from step 0."
                         )
             # If optimizer wasn't loaded, scheduler starts fresh too
-        if checkpoint.get("game_state"):
-            self.game_state = checkpoint["game_state"]
-        if checkpoint.get("advantage_estimator_state"):
-            self.advantage_estimator.load_state_dict(checkpoint["advantage_estimator_state"])
+        if checkpoint.game_state:
+            self.game_state = checkpoint.game_state
+        # CheckpointState: advantage_estimator is AdvantageEstimatorState which wraps state_dict
+        if checkpoint.advantage_estimator and checkpoint.advantage_estimator.state_dict:
+            self.advantage_estimator.load_state_dict(checkpoint.advantage_estimator.state_dict)
         # CP3-003: Warn if checkpoint has critic but config disabled
-        if checkpoint.get("vprm_critic_state") and not self.config.vprm.enabled:
+        if checkpoint.vprm_critic_state and not self.config.vprm.enabled:
             import warnings
             warnings.warn(
                 "CP3-003: Checkpoint contains VPRM critic state but config.vprm.enabled=False. "
                 "Critic will not be restored. Set vprm.enabled=True to restore critic."
             )
         # Restore VPRM critic + optimizer (if saved)
-        if checkpoint.get("vprm_critic_state") and self.config.vprm.enabled:
+        if checkpoint.vprm_critic_state and self.config.vprm.enabled:
             from qgre.critic import VPRMCritic
             device = next((p.device for p in self.model.parameters() if p.device.type != "cpu"), next(self.model.parameters()).device)
 
             # C12: Validate step_qualities match between checkpoint and config
-            ckpt_step_qualities = checkpoint["vprm_critic_state"]["step_qualities"]
+            ckpt_step_qualities = checkpoint.vprm_critic_state["step_qualities"]
             config_step_qualities = self.step_qualities
             if ckpt_step_qualities != config_step_qualities:
                 import warnings
@@ -1388,48 +1396,51 @@ class QGRETrainer:
             # (allows config changes without breaking restore)
             from qgre.critic import VPRMCritic
             self.vprm_critic = VPRMCritic(
-                hidden_dim=checkpoint["vprm_critic_state"]["hidden_dim"],
+                hidden_dim=checkpoint.vprm_critic_state["hidden_dim"],
                 step_qualities=config_step_qualities,  # Use current config
                 intermediate_dim=self._vprm_config.intermediate_dim,  # C14: from config
-                step_region_map=checkpoint["vprm_critic_state"].get("step_region_map"),
+                step_region_map=checkpoint.vprm_critic_state.get("step_region_map"),
             )
             # Load weights with strict=False to handle architecture mismatches
-            self.vprm_critic.load_state_dict(checkpoint["vprm_critic_state"]["model_state"], strict=False)
+            self.vprm_critic.load_state_dict(checkpoint.vprm_critic_state["model_state"], strict=False)
             self.vprm_critic.to(device)
 
             # Store checkpoint hidden_dim for validation on first forward pass
-            self._vprm_checkpoint_hidden_dim = checkpoint["vprm_critic_state"]["hidden_dim"]
+            self._vprm_checkpoint_hidden_dim = checkpoint.vprm_critic_state["hidden_dim"]
             self.vprm_optimizer = torch.optim.Adam(
                 [p for p in self.vprm_critic.parameters() if p.requires_grad],
                 lr=self._vprm_config.lr,
             )
-            if checkpoint.get("vprm_optimizer_state"):
-                self.vprm_optimizer.load_state_dict(checkpoint["vprm_optimizer_state"])
+            if checkpoint.vprm_optimizer_state:
+                self.vprm_optimizer.load_state_dict(checkpoint.vprm_optimizer_state)
             self._vprm_initialized = True
-        if checkpoint.get("rng_state") is not None:
+        # CheckpointState: RNG state is in trainer
+        if checkpoint.trainer.rng_state is not None:
             import warnings
             warnings.warn(
                 "Restoring RNG state from checkpoint. Note: this overrides config.training.seed. "
                 "If you changed the seed in config after this checkpoint, it will be ignored."
             )
-            torch.set_rng_state(checkpoint["rng_state"])
-        if checkpoint.get("cuda_rng_state") is not None and torch.cuda.is_available():
+            torch.set_rng_state(checkpoint.trainer.rng_state)
+        if checkpoint.trainer.cuda_rng_state is not None and torch.cuda.is_available():
             # CP3-002: Save device index in checkpoint, restore to same device
             # Note: checkpoint format already includes device index in cuda_rng_state
             # This is correct — no fix needed, but documenting expected behavior
-            torch.cuda.set_rng_state(checkpoint["cuda_rng_state"])
+            torch.cuda.set_rng_state(checkpoint.trainer.cuda_rng_state)
 
-        # TRN-R2-1: Restore accumulated loss
-        self._accumulated_loss = checkpoint.get("accumulated_loss", 0.0)
+        # TRN-R2-1: Restore accumulated loss from TrainerState
+        self._accumulated_loss = checkpoint.trainer.accumulated_loss
         # TL-R3-04: Restore _accumulated_samples for accurate averaging
-        self._accumulated_samples = checkpoint.get("accumulated_samples", 0)
+        self._accumulated_samples = checkpoint.trainer.accumulated_samples
         # DI1: Store dataloader state for restore in train() when dataloader is available
-        self._pending_dataloader_state = checkpoint.get("dataloader_state")
-        self._accumulation_count = checkpoint.get("accumulation_count", 0)
+        # CheckpointState: dataloader is now DataLoaderState dataclass
+        from dataclasses import asdict
+        self._pending_dataloader_state = asdict(checkpoint.dataloader) if checkpoint.dataloader else None
+        self._accumulation_count = checkpoint.trainer.accumulation_count
 
         # Restore training context (device, dtype, step)
-        if checkpoint.get("training_context"):
-            self.ctx = TrainingContext.from_dict(checkpoint["training_context"])
+        if checkpoint.training_context:
+            self.ctx = TrainingContext.from_dict(checkpoint.training_context)
         else:
             # Fallback: reconstruct from global_step if not in checkpoint (backward compat)
             _device = next((p.device for p in self.model.parameters() if p.device.type != "cpu"), torch.device("cuda"))
