@@ -301,6 +301,14 @@ class QGRETrainer:
             # Remove empty param group — optimizer doesn't like empty groups
             param_groups = [{"params": other_params, "lr": base_lr}]
 
+        # Validate model has trainable parameters before setting up optimizer
+        trainable_count = sum(1 for p in self.model.parameters() if p.requires_grad)
+        if trainable_count == 0:
+            raise RuntimeError(
+                "Model has no trainable parameters. Cannot start training. "
+                "Check PEFT adapter configuration and requires_grad settings."
+            )
+
         # AdamW8bit saves ~4x memory on optimizer states (PLAN.md line 323)
         use_8bit = False
         try:
@@ -311,12 +319,6 @@ class QGRETrainer:
                 use_8bit = True
         except ImportError:
             pass  # bitsandbytes not installed
-        except StopIteration:
-            import warnings
-            warnings.warn(
-                "Model has no parameters — cannot determine device for AdamW8bit. "
-                "Falling back to standard AdamW."
-            )
 
         if not use_8bit:
             self.optimizer = torch.optim.AdamW(param_groups)

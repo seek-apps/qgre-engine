@@ -236,8 +236,10 @@ def save_checkpoint(
         # Clean up temp file on failure
         try:
             temp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        except Exception as cleanup_err:
+            warnings.warn(
+                f"Failed to clean up temp file {temp_path} after checkpoint save error: {cleanup_err}"
+            )
         raise RuntimeError(f"Failed to save checkpoint to {path}: {e}") from e
 
 
