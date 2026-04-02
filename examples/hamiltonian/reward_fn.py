@@ -1752,10 +1752,15 @@ def _find_expression_spans(text: str) -> dict[str, list[tuple[int, int]]]:
         # Good structure found — train on labeled sections only
         spans["q_format"] = all_labeled_spans
         spans["q_has_math"] = all_labeled_spans
-    else:
+    elif len(text) > 0:
         # No structure found — train on full completion so bad output gets negative signal
+        # Skip if text is empty (zero-width span is meaningless for training)
         spans["q_format"] = [(0, len(text))]
         spans["q_has_math"] = [(0, len(text))]
+    else:
+        # Empty text — no spans
+        spans["q_format"] = []
+        spans["q_has_math"] = []
 
     # Grounding: target sections with numerical values (T, V, H, equations)
     grounding_spans = []

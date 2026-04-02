@@ -228,8 +228,13 @@ class QGRETrainer:
         self._attention_log = []  # Per-step attention statistics
 
         # Training context — device, dtype, step counter (created once, reused across training)
-        # Device inference: use model's device or fallback to cuda
-        _device = next((p.device for p in model.parameters() if p.device.type != "cpu"), torch.device("cuda"))
+        # Device inference: use model's actual device, fallback to cuda only if CUDA available
+        model_devices = [p.device for p in model.parameters()]
+        if model_devices:
+            # Use first non-CPU device if available, otherwise use the model's actual device
+            _device = next((d for d in model_devices if d.type != "cpu"), model_devices[0])
+        else:
+            _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.ctx = TrainingContext.from_config(config, device=str(_device))
 
     @property
@@ -655,6 +660,10 @@ class QGRETrainer:
         # Response mask
         prompt_lengths = [0] * comp_tensor.shape[0]
         response_mask = self.compute_response_mask(comp_tensor, prompt_lengths)[:, 1:]
+        # LLDS shift: Align advantages and logprobs with response mask (all skip first position)
+        padded_advs = padded_advs[:, 1:]
+        if gen_logprobs_padded is not None:
+            gen_logprobs_padded = gen_logprobs_padded[:, 1:]
 
         if response_mask.sum() == 0:
             raise RuntimeError(
@@ -1443,7 +1452,11 @@ class QGRETrainer:
             self.ctx = TrainingContext.from_dict(checkpoint.training_context)
         else:
             # Fallback: reconstruct from global_step if not in checkpoint (backward compat)
-            _device = next((p.device for p in self.model.parameters() if p.device.type != "cpu"), torch.device("cuda"))
+            model_devices = [p.device for p in self.model.parameters()]
+            if model_devices:
+                _device = next((d for d in model_devices if d.type != "cpu"), model_devices[0])
+            else:
+                _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.ctx = TrainingContext.from_config(self.config, device=str(_device))
             self.ctx.step = self.global_step
 

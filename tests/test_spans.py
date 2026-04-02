@@ -98,13 +98,16 @@ class TestScoredSpansToTokenMasks:
         token_ids = simple_tokenizer.encode(text)
         char_map = build_char_to_token_map(token_ids, simple_tokenizer)
 
-        # Two H expressions
+        # Two H expressions — first gets +1.0, second gets REPETITION_MARKER (-1.0)
+        # Design: reward original answer, penalize repetitions
         spans = {"q_correct_H": [(0, 5), (12, 18)]}  # "H = a" and " H = b"
         masks = scored_spans_to_token_masks(spans, char_map, len(token_ids), training_ctx)
 
         mask = masks["q_correct_H"]
-        assert mask[0:5].sum() == 5.0  # First span
-        assert mask[12:18].sum() >= 5.0  # Second span (boundary token may vary)
+        assert mask[0:5].sum() == 5.0  # First span: +1.0 per token
+        # Second span gets REPETITION_MARKER = -1.0 (penalized repetition)
+        # Span (12, 17) after clamping = 5 tokens with -1.0 each
+        assert mask[12:17].sum() <= -4.0  # At least 4 penalized tokens
         assert mask[5:12].sum() == 0.0  # Gap between
 
     def test_full_completion_span(self, simple_tokenizer, training_ctx):
@@ -240,13 +243,14 @@ class TestFindExpressionSpans:
         assert len(spans["q_V_correct"]) == 2
 
     def test_format_targets_labeled_sections_not_full_completion(self):
-        """Format spans should target labeled sections, NOT full completion."""
+        """Format spans should target labeled sections, OR full completion for negative signal."""
         from examples.hamiltonian.reward_fn import _find_expression_spans
 
-        # Text with no labels - format should be empty (no signal to unlabeled text)
+        # Text with no labels - full completion span for negative training signal
+        # Without this, garbage output (no labels) would get zero gradient
         text = "some completion text"
         spans = _find_expression_spans(text)
-        assert spans["q_format"] == []  # No labels found, no format signal
+        assert spans["q_format"] == [(0, len(text))]  # Full span for negative signal
 
         # Text with labels - format should target those sections only
         text_with_labels = "COORDINATES: q = x\nHAMILTONIAN: H = p²"
