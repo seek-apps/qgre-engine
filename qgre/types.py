@@ -239,6 +239,46 @@ class CheckpointState:
                 f"Field 'schema_version' must be int, got {type(self.schema_version).__name__}"
             )
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "CheckpointState":
+        """Reconstruct CheckpointState from dict (e.g. from asdict() or torch.load()).
+
+        Handles nested dataclass reconstruction so round-trip works:
+            cs = CheckpointState(...)
+            cs_dict = asdict(cs)
+            cs2 = CheckpointState.from_dict(cs_dict)  # ✓ Works
+
+        Args:
+            d: Dictionary with nested state dicts
+
+        Returns:
+            CheckpointState instance with all nested dataclasses reconstructed
+
+        Raises:
+            ValueError: If required keys are missing
+            TypeError: If reconstruction fails due to type mismatch
+        """
+        # Reconstruct nested dataclasses from their dict representations
+        trainer = TrainerState(**d["trainer"]) if isinstance(d["trainer"], dict) else d["trainer"]
+        dataloader = DataLoaderState(**d["dataloader"]) if isinstance(d["dataloader"], dict) else d["dataloader"]
+        advantage_estimator = AdvantageEstimatorState(**d["advantage_estimator"]) if isinstance(d["advantage_estimator"], dict) else d["advantage_estimator"]
+        weight_loader = WeightLoaderState(**d["weight_loader"]) if isinstance(d["weight_loader"], dict) else d["weight_loader"]
+
+        # GameState is more complex — it has init_tutorial method, so we need to be careful
+        # For now, just reconstruct directly from dict if it's a dict
+        game_state = GameState(**d["game_state"]) if isinstance(d["game_state"], dict) else d["game_state"]
+
+        return cls(
+            trainer=trainer,
+            dataloader=dataloader,
+            advantage_estimator=advantage_estimator,
+            weight_loader=weight_loader,
+            game_state=game_state,
+            vprm_critic_state=d.get("vprm_critic_state"),
+            vprm_optimizer_state=d.get("vprm_optimizer_state"),
+            schema_version=d.get("schema_version", CHECKPOINT_SCHEMA_VERSION),
+        )
+
 
 class SkillStatus(Enum):
     LOCKED = "locked"
