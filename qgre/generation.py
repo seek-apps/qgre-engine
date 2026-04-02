@@ -417,9 +417,10 @@ class UnslothBackend:
         # Guard against None entries (from logprobs length mismatch at line 375)
         has_logprobs = all(lps is not None and len(lps) > 0 for lps in all_logprobs) if all_logprobs else False
         if not has_logprobs and any(lps is not None and len(lps) > 0 for lps in all_logprobs):
-            import warnings
-            warnings.warn(
-                f"Partial logprobs: {sum(1 for lps in all_logprobs if lps is not None and len(lps) > 0)}"
+            import logging
+            # DP-R2-07: Log at WARNING level instead of DEBUG
+            logging.getLogger(__name__).warning(
+                f"DP-R2-07: Partial logprobs: {sum(1 for lps in all_logprobs if lps is not None and len(lps) > 0)}"
                 f"/{len(all_logprobs)} samples have logprobs. LLDS disabled for this batch."
             )
         return GenerationOutput(

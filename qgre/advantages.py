@@ -236,6 +236,8 @@ class QGREStepAdvantageEstimator:
         self._aspiration_beta = 0.0  # Set from config via trainer
         self._aspiration_target = 0.0
         self._advantage_scale = 1.0  # Set from config via trainer
+        # AE-R3-01: Initialize clip_advantage for token-level clipping
+        self._clip_advantage = 10.0  # Default, overridden by config
 
         # Variance-aware baseline: track per-(prompt, quality) reward variance
         self._var_aware = var_aware
@@ -871,6 +873,9 @@ class QGREStepAdvantageEstimator:
             if self._advantage_scale != 1.0:
                 token_advs = token_advs * self._advantage_scale
 
+            # Clip to prevent unbounded repetition penalties
+            token_advs = torch.clamp(token_advs, min=-self._clip_advantage, max=self._clip_advantage)
+
             batch_advantages.append(token_advs)
 
         return batch_advantages, batch_quality_metrics
@@ -932,6 +937,7 @@ def compute_advantages_vprm(
     min_regions: int = 2,
     aspiration_beta: float = 0.0,
     aspiration_target: float = 0.0,
+    clip_advantage: float | None = None,
     ctx: "TrainingContext | None" = None,
 ) -> tuple[torch.Tensor, torch.Tensor, bool]:
     """Compute per-token advantages using VPRM critic for a single sample.
@@ -1042,6 +1048,10 @@ def compute_advantages_vprm(
     token_advantages = broadcast_step_advantages_to_tokens(
         step_advs, regions, region_extra_steps, ctx=ctx,
     ).to(device)
+
+    # Clip VPRM advantages after broadcast
+    if clip_advantage is not None:
+        token_advantages = torch.clamp(token_advantages, min=-clip_advantage, max=clip_advantage)
 
     # Total critic loss
     if critic_losses:

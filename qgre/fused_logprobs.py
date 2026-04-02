@@ -142,6 +142,19 @@ def chunked_logprobs_from_hidden(
         [batch, seq] log probs (float32) — gathered at label positions only
         WITH grad_fn connected to hidden_states → model parameters
     """
+    # Validate device consistency
+    if hidden_states.device != labels.device:
+        raise RuntimeError(
+            f"chunked_logprobs_from_hidden: device mismatch. "
+            f"hidden_states on {hidden_states.device}, labels on {labels.device}. "
+            "All tensors must be on the same device."
+        )
+    if lm_head.weight.device != hidden_states.device:
+        raise RuntimeError(
+            f"chunked_logprobs_from_hidden: device mismatch. "
+            f"lm_head on {lm_head.weight.device}, hidden_states on {hidden_states.device}. "
+            "All tensors must be on the same device."
+        )
     batch, seq_len, hidden = hidden_states.shape
     if seq_len == 0:
         return torch.zeros(batch, 0, dtype=torch.float32, device=hidden_states.device)

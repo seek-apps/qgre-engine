@@ -214,4 +214,11 @@ def triton_logprobs_from_hidden(
             BLOCK_V=BLOCK_V,
         )
 
+        # LP-R2-07: Check for NaN in output (indicates inf/nan in hidden states)
+        if torch.isnan(out).any():
+            raise RuntimeError(
+                f"LP-R2-07: NaN detected in Triton logprob output for batch {b}. "
+                "This indicates inf/nan in hidden states. Check model stability."
+            )
+
     return result

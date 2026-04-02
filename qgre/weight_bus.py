@@ -61,19 +61,32 @@ class WeightBus:
             ctx: TrainingContext for device/dtype validation
             modules_to_save: Expected modules (e.g., ["lm_head"]). Warns if missing.
         """
+        # WS-R3-04: Track if sync actually ran (not skipped by dropout)
+        sync_executed = False
         try:
             if self.strategy == SyncStrategy.MERGE:
                 exporter.merge_lora(model)
                 loader.sync_modules_to_save(exporter.get_modules_to_save(model, expected=modules_to_save), ctx)
                 # MERGE modifies base weights in-place — flush vLLM KV cache to prevent stale keys/values
                 loader.flush_kv_cache()
+                sync_executed = True
             elif self.strategy == SyncStrategy.DIRECT_COPY:
+                # WS-R3-04: Check if dropout is active before sync
+                try:
+                    from qgre.lora_dropout import apply_lora_dropout
+                    dropout_active = getattr(apply_lora_dropout, '_dropout_active', False)
+                except ImportError:
+                    dropout_active = False
+
                 loader.sync_lora_direct(model, ctx, first_call=not self._initialized)
                 # Get fresh state_dict inside sync_modules_to_save to avoid stale tensor references
                 loader.sync_modules_to_save(exporter.get_modules_to_save(model, expected=modules_to_save), ctx)
+                # WS-R3-04: Only mark sync_executed if dropout wasn't active
+                sync_executed = not dropout_active
 
-            # Only set initialized=True after successful sync
-            self._initialized = True
+            # WS-R3-04: Only set initialized=True if sync actually ran
+            if sync_executed:
+                self._initialized = True
         except Exception as e:
             # Don't set initialized=True on failure — next sync will retry first_call path
             raise RuntimeError(f"Weight sync failed: {e}") from e

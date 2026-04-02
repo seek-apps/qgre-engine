@@ -260,7 +260,7 @@ class VPRMCritic(nn.Module):
                         f"(occurred {self._region_warned_count[q_name]} times)"
                     )
                     self._region_warned.add(q_name)
-                advantages[q_name] = 0.0
+                advantages[q_name] = None
                 continue
 
             # C04-NUMERICAL: Cast pooled hidden states to ctx.dtype before MLP
@@ -327,7 +327,8 @@ class VPRMCritic(nn.Module):
 
             advs, losses = self.compute_advantages(hs, regions, rewards, ctx)
             batch_advantages.append(advs)
-            all_losses.extend(losses.values())
+            # AE-R3-02, AE-R3-04: Filter out None values from losses
+            all_losses.extend([l for l in losses.values() if l is not None])
 
         if all_losses:
             total_loss = torch.stack(all_losses).mean()

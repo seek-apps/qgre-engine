@@ -66,13 +66,16 @@ class WeightLoader:
 
         if first_call or not self._direct_ready:
             # Bootstrap: register adapter once, set up GPU→GPU copy mappings
-            # W2: Track whether load_lora was called to prevent double-load on recovery
+            # WS-R3-03: Track whether load_lora was called to prevent double-load on recovery
             if self._lora_request is None:
                 if not getattr(self, "_load_lora_called", False):
                     self._lora_request = model.load_lora(
                         self._get_adapter_config_path(), load_tensors=True
                     )
                     self._load_lora_called = True
+            # WS-R3-03: Reset _load_lora_called on first_call to allow fresh init
+            elif first_call:
+                self._load_lora_called = False
             try:
                 prepare_vllm_lora_loading(model)
                 self._direct_ready = True
@@ -143,34 +146,42 @@ class WeightLoader:
                 if name == "lm_head":
                     try:
                         target = vllm_model.lm_head.weight
-                    except AttributeError:
-                        warnings.warn("lm_head not found in vLLM model — skipping")
-                        continue
+                    except AttributeError as e:
+                        raise RuntimeError(
+                            f"lm_head not found in vLLM model. Cannot sync {expected}. "
+                            f"Check vLLM model structure: {e}"
+                        ) from e
                     if tensor.shape != target.shape:
                         raise RuntimeError(
                             f"Shape mismatch syncing lm_head: training={tensor.shape} vs vLLM={target.shape}"
                         )
-                    # Check dtype match before copy, warn if mismatch
+                    # WS-R3-08: Check dtype match before copy, raise if mismatch (no conversion)
                     if tensor.dtype != target.dtype:
-                        import warnings
-                        warnings.warn(f"lm_head dtype mismatch: training={tensor.dtype} vs vLLM={target.dtype}. Converting.")
-                    target.data.copy_(tensor.to(device=target.device, dtype=target.dtype))
+                        raise RuntimeError(
+                            f"lm_head dtype mismatch: training={tensor.dtype} vs vLLM={target.dtype}. "
+                            "Precision loss on copy. User must explicitly allow dtype conversion if needed."
+                        )
+                    target.data.copy_(tensor.to(device=target.device))
                     synced.append(name)
                 elif name == "embed_tokens":
                     try:
                         target = vllm_model.model.embed_tokens.weight
-                    except AttributeError:
-                        warnings.warn("embed_tokens not found in vLLM model — skipping")
-                        continue
+                    except AttributeError as e:
+                        raise RuntimeError(
+                            f"embed_tokens not found in vLLM model. Cannot sync {expected}. "
+                            f"Check vLLM model structure: {e}"
+                        ) from e
                     if tensor.shape != target.shape:
                         raise RuntimeError(
                             f"Shape mismatch syncing embed_tokens: training={tensor.shape} vs vLLM={target.shape}"
                         )
-                    # Check dtype match before copy, warn if mismatch
+                    # WS-R3-08: Check dtype match before copy, raise if mismatch (no conversion)
                     if tensor.dtype != target.dtype:
-                        import warnings
-                        warnings.warn(f"embed_tokens dtype mismatch: training={tensor.dtype} vs vLLM={target.dtype}. Converting.")
-                    target.data.copy_(tensor.to(device=target.device, dtype=target.dtype))
+                        raise RuntimeError(
+                            f"embed_tokens dtype mismatch: training={tensor.dtype} vs vLLM={target.dtype}. "
+                            "Precision loss on copy. User must explicitly allow dtype conversion if needed."
+                        )
+                    target.data.copy_(tensor.to(device=target.device))
                     synced.append(name)
         except Exception as e:
             # WS3-006: Rollback on failure (log error, don't crash)
@@ -238,7 +249,8 @@ class WeightLoader:
 
         # WS3-010: Log diagnostic info on traversal failure
         import logging
-        logging.getLogger(__name__).error(
+        logger = logging.getLogger(__name__)
+        logger.error(
             "WS3-010: get_vllm_model traversal failed. Diagnostic info: "
             f"model_type={type(self._model).__name__}, "
             f"has_vllm_engine={hasattr(self._model, 'vllm_engine')}, "
@@ -345,31 +357,37 @@ class WeightLoader:
         On first call (lora_request_id==1), Unsloth writes it from peft_config.
         """
         import tempfile
+        import atexit
         path = getattr(self, "_adapter_path", None)
         if path is None:
             path = tempfile.mkdtemp(prefix="qgre_adapter_")
             self._adapter_path = path
+            atexit.register(self.cleanup_adapter_tempdir)
         return path
 
     def reset_state(self):
         """WS3-009: Reset state on engine recreate."""
         self._direct_ready = False
         self._lora_request = None
-        # W2: Reset load_lora tracking on state reset
+        # WS-R3-03: Reset load_lora tracking on state reset
         self._load_lora_called = False
 
     def cleanup_adapter_tempdir(self):
         """Explicitly clean up adapter tempdir. Call at trainer shutdown."""
         import shutil
+        import logging
         path = getattr(self, "_adapter_path", None)
         # WS3-004: Track cleanup state to avoid double-free
         if path is not None and not getattr(self, "_cleaned_up", False):
             try:
-                shutil.rmtree(path, ignore_errors=True)
+                shutil.rmtree(path)
                 self._adapter_path = None
                 self._cleaned_up = True
             except Exception as e:
-                warnings.warn(f"Failed to clean up adapter tempdir {path}: {e}")
+                logging.getLogger(__name__).warning(
+                    f"Failed to clean up adapter tempdir {path}: {e}. "
+                    "Directory may persist on disk."
+                )
 
     def __del__(self):
         """Clean up tempdir on deletion."""

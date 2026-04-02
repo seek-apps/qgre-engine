@@ -46,6 +46,12 @@ class QGREDataLoader:
         metadata_columns: list[str] | None = None,
         system_prompt_column: str | None = None,
     ):
+        # DP-R2-05: Validate n_completions >= 1
+        if n_completions < 1:
+            raise ValueError(
+                f"DP-R2-05: n_completions must be >= 1, got {n_completions}. "
+                "Cannot generate rollouts with n_completions=0."
+            )
         self.tokenizer = tokenizer
         self.max_prompt_length = max_prompt_length
         self.train_batch_size = train_batch_size
@@ -83,11 +89,9 @@ class QGREDataLoader:
 
     def _prepare(self, prompts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Tokenize, filter overlong, store results."""
-        # DP3-002: Sample multiple rows for validation (e.g., first 10)
+        # Validate ALL rows for metadata columns (not just first 10)
         if self.metadata_columns and prompts:
-            sample_size = min(10, len(prompts))
-            for idx in range(sample_size):
-                row = prompts[idx]
+            for idx, row in enumerate(prompts):
                 missing = [col for col in self.metadata_columns if col not in row]
                 if missing:
                     raise ValueError(
@@ -147,6 +151,15 @@ class QGREDataLoader:
             else:
                 token_ids = self.tokenizer.encode(text)
 
+            # DP-R2-02: Filter out empty token_ids
+            if len(token_ids) == 0:
+                import warnings
+                warnings.warn(
+                    f"DP-R2-02: Empty token_ids after encoding, skipping prompt. "
+                    f"Prompt text: {text[:100]}"
+                )
+                continue
+
             if len(token_ids) > self.max_prompt_length:
                 import warnings
                 warnings.warn(
@@ -189,7 +202,7 @@ class QGREDataLoader:
                 "Cannot gate by difficulty without the column. "
                 "Add difficulty_column to metadata_columns in config."
             )
-        # DP3-001: Validate column exists in actual data at set_difficulty_gate time
+        # DP-R2-06: Validate difficulty_column exists in actual metadata keys, not just metadata_columns
         if self.items:
             sample_item = self.items[0]
             if difficulty_column not in sample_item["metadata"]:
@@ -243,12 +256,19 @@ class QGREDataLoader:
                     f"and were filtered. Check difficulty_column '{col}' data."
                 )
 
-        # DP3-004: Warn early if combined filtering zeroes all
+        # DP-R3-03: Log at ERROR level with context about which gate caused zero weights
         if weights.sum() == 0:
-            import warnings
-            warnings.warn(
-                "DP3-004: ALL priority weights are zero after priority/difficulty gate filtering. "
-                "Falling back to uniform sampling. Check: (1) difficulty_gate allowed_difficulties, "
+            import logging
+            logger = logging.getLogger(__name__)
+            gate_context = []
+            if self._priorities is not None:
+                gate_context.append("priority weights")
+            if hasattr(self, "_difficulty_gate") and self._difficulty_gate is not None:
+                gate_context.append(f"difficulty_gate (allowed: {self._difficulty_gate.get('allowed_difficulties', [])})")
+            logger.error(
+                f"DP-R3-03: ALL weights are zero after filtering by {', '.join(gate_context)}. "
+                "Falling back to uniform sampling. This indicates a configuration error: "
+                "no prompts pass the active gates. Check: (1) difficulty_gate allowed_difficulties, "
                 "(2) priority weights, (3) metadata column values."
             )
             weights = torch.ones(len(self.items), dtype=torch.float64)
@@ -318,7 +338,20 @@ class QGREDataLoader:
             batch_items = shuffled[start:end]
 
             # Expand each prompt × n for rollout generation
-            expanded_items = [item for item in batch_items for _ in range(self.n_completions)]
+            expanded_items = []
+            for orig_idx, item in enumerate(batch_items):
+                for _ in range(self.n_completions):
+                    # DP-R2-01: Use deepcopy for nested metadata
+                    import copy
+                    meta = copy.deepcopy(item["metadata"])
+                    # DP-R3-02: Use prefixed name to avoid collision with user metadata
+                    meta["_batch_prompt_idx"] = orig_idx
+                    expanded_items.append({
+                        "token_ids": item["token_ids"],
+                        "text": item["text"],
+                        "prompt_id": item["prompt_id"],
+                        "metadata": meta,
+                    })
 
             token_ids_list = [item["token_ids"] for item in expanded_items]
             input_ids, attention_mask = self._left_pad(token_ids_list)
@@ -346,6 +379,7 @@ class QGREDataLoader:
             "epoch": self.epoch,
             "step_in_epoch": self.step_in_epoch,
             "total_steps": self.total_steps,
+            "priority_weights": self._priorities,
         }
 
     def load_state_dict(self, state: dict):
@@ -353,6 +387,8 @@ class QGREDataLoader:
         self.epoch = state.get("epoch", 0)
         self.step_in_epoch = state.get("step_in_epoch", 0)
         self.total_steps = state.get("total_steps", 0)
+        if state.get("priority_weights"):
+            self._priorities = state["priority_weights"]
 
 
 def load_prompts_from_parquet(path: str | Path) -> list[dict[str, Any]]:

@@ -31,7 +31,7 @@ class WeightExporter:
         model.unmerge_adapter()
 
     def get_modules_to_save(
-        self, model: nn.Module, expected: list[str] | None = None
+        self, model: nn.Module, expected: list[str] | None = None, strict: bool = False
     ) -> dict[str, torch.Tensor]:
         """Extract lm_head/embed_tokens trainable weights from ModulesToSaveWrapper.
 
@@ -39,6 +39,7 @@ class WeightExporter:
             model: PEFT-wrapped model
             expected: Optional list of expected module names (e.g., ["lm_head"]).
                       If provided, warns when expected modules are missing from state_dict.
+            strict: If True and expected modules are missing, raise error instead of warning.
 
         Returns dict mapping module name to weight tensor (views, not copies).
         These are the active adapter weights, not the frozen originals.
@@ -73,10 +74,14 @@ class WeightExporter:
             missing = expected_set - found_set
             unexpected = found_set - expected_set
             if missing:
-                warnings.warn(
+                msg = (
                     f"get_modules_to_save: expected {missing} but not found in state_dict. "
                     f"Check modules_to_save config matches PEFT wrapper. Found: {list(weights.keys())}"
                 )
+                if strict:
+                    raise RuntimeError(msg)
+                else:
+                    warnings.warn(msg)
             if unexpected:
                 warnings.warn(
                     f"get_modules_to_save: found unexpected modules {unexpected}. "

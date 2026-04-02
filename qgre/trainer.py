@@ -75,7 +75,10 @@ class QGRETrainer:
         self._difficulty_column = data_cfg.difficulty_column
         self._tier_advance_phase = data_cfg.tier_advance_quality_phase
         self._tier_advance_threshold = data_cfg.tier_advance_threshold
-        if self._tier_order and data_cfg.initial_tiers:
+        if self._tier_order:
+            # Default initial_tiers to first tier if not set
+            if data_cfg.initial_tiers is None:
+                data_cfg.initial_tiers = [self._tier_order[0]]
             # Type check: ensure lists, not strings
             if not isinstance(data_cfg.initial_tiers, list):
                 raise ValueError(f"initial_tiers must be list[str], got {type(data_cfg.initial_tiers).__name__}")
@@ -202,6 +205,7 @@ class QGRETrainer:
         self.scheduler: Any = None
         self._accumulated_loss = 0.0
         self._accumulation_count = 0  # CP2-004: Track actual accumulation steps
+        self._accumulated_samples = 0  # TL-R2-04: Track samples for accurate loss averaging
 
         # SPO filter monitoring — track drop rate to detect data starvation
         self._spo_filter_stats = {"total": 0, "passed": 0, "dropped": 0, "warned": False}
@@ -571,11 +575,13 @@ class QGRETrainer:
         else:
             kl_region_weights = None
 
-        if not self.config.vprm.enabled:
-            del batch_regions  # No longer needed — regions already mapped to KL weights or skipped
+        # TL-R2-01: Don't delete batch_regions, it's accessed later in VPRM path
+        # if not self.config.vprm.enabled:
+        #     del batch_regions  # No longer needed — regions already mapped to KL weights or skipped
 
         # SPO low-advantage filter: skip sequences with near-zero signal (PLAN.md lines 658-671)
         _spo_filter_idx = None  # Maps filtered indices → original batch indices
+        _spo_filter_applied = False  # Track if filter was applied to reindex kl_region_weights
         if self.config.algorithm.mode == "spo":
             useful = (padded_advs.abs() > self.config.algorithm.spo_filter_threshold).any(dim=-1)
             # Track filter stats for data starvation detection
@@ -631,8 +637,12 @@ class QGRETrainer:
                     kl_region_weights = kl_region_weights[idx]
                 if gen_logprobs_padded is not None:
                     gen_logprobs_padded = gen_logprobs_padded[idx]
+                # TL-R2-07: Reindex batch_token_masks after SPO filter
+                if batch_token_masks:
+                    batch_token_masks = [batch_token_masks[i] for i in idx.tolist()]
                 # Track original indices for VPRM region/reward lookup
                 _spo_filter_idx = idx.tolist()
+                _spo_filter_applied = True
             else:
                 _spo_filter_idx = None
 
@@ -643,6 +653,14 @@ class QGRETrainer:
         if response_mask.sum() == 0:
             raise RuntimeError(
                 f"Step {self.global_step}: no response tokens in any completion — cannot compute loss."
+            )
+
+        # TL-R2-06: Verify alignment between response_mask and advantages
+        if response_mask.shape != padded_advs.shape:
+            raise RuntimeError(
+                f"TL-R2-06: Response mask shape mismatch with advantages. "
+                f"response_mask.shape={response_mask.shape} vs padded_advs.shape={padded_advs.shape}. "
+                "Check LLDS shift logic."
             )
 
         # Micro-batched forward + backward — avoids OOM on logits tensor
@@ -771,29 +789,31 @@ class QGRETrainer:
                         device=device,
                     )
 
-                # Validate hidden_dim matches checkpoint (only on first forward after resume)
-                if hasattr(self, "_vprm_checkpoint_hidden_dim"):
+                # TL-R3-07: Validate hidden_dim matches checkpoint (only on first forward after resume)
+                # Don't delete _vprm_checkpoint_hidden_dim to allow check after resume
+                if hasattr(self, "_vprm_checkpoint_hidden_dim") and not getattr(self, "_vprm_checkpoint_validated", False):
                     actual_hidden_dim = mb_hidden_states.shape[-1]
                     if self._vprm_checkpoint_hidden_dim != actual_hidden_dim:
                         raise RuntimeError(
                             f"VPRM critic hidden_dim mismatch: checkpoint has {self._vprm_checkpoint_hidden_dim} "
                             f"but model produces {actual_hidden_dim}. Model architecture changed between checkpoints."
                         )
-                    del self._vprm_checkpoint_hidden_dim  # Only check once
+                    self._vprm_checkpoint_validated = True  # Only check once per resume
 
                 # Compute VPRM advantages per-sample in this micro-batch
                 for mb_i in range(mb_end - mb_start):
                     filtered_i = mb_start + mb_i
                     # Map filtered index → original batch index
                     orig_i = _spo_filter_idx[filtered_i] if _spo_filter_idx is not None else filtered_i
-                    # Get regions for this sample (original batch index)
+                    # TL-R2-03: Validate orig_i before access
                     if orig_i >= len(batch_regions):
-                        import warnings
-                        warnings.warn(
-                            f"VPRM: orig_i={orig_i} >= len(batch_regions)={len(batch_regions)} "
-                            f"— skipping sample (SPO filter mapping error?)"
+                        import logging
+                        logging.getLogger(__name__).warning(
+                            f"TL-R2-03: VPRM orig_i={orig_i} >= len(batch_regions)={len(batch_regions)} "
+                            f"— skipping sample (SPO filter index mapping corrupted micro-batch)"
                         )
                         continue
+                    # Get regions for this sample (original batch index)
                     sample_regions = batch_regions[orig_i]
                     # Get reward result and active qualities
                     if orig_i >= len(reward_results):
@@ -851,6 +871,7 @@ class QGRETrainer:
             # mb_lp[t] = log P(token t+1 | tokens 0..t), so it needs advantage[t+1]
             # Shift advantages and KL weights by 1 to match logprob indexing
             mb_advs_shifted = mb_advs[:, 1:]  # advantage for token being predicted
+            # kl_region_weights already reindexed by SPO filter if applied
             mb_kl_shifted = kl_region_weights[mb_start:mb_end, 1:] if kl_region_weights is not None else None
             min_len = min(mb_lp.shape[1], mb_old_lp.shape[1], mb_advs_shifted.shape[1], mb_mask.shape[1])
             mb_kl_weights = mb_kl_shifted[:, :min_len] if mb_kl_shifted is not None else None
@@ -951,14 +972,22 @@ class QGRETrainer:
                 mb_metrics["llds_loss"] = llds_loss.item()
                 mb_metrics["llds_mask_ratio"] = llds_mask.sum().item() / max(mb_mask[:, :min_len].sum().item(), 1)
 
-            # VPRM critic loss: normalize by sample count and add to policy loss
+            # VPRM critic loss: weight by sample count and add to policy loss
             # T2-5: Guard div by zero to prevent NaN
             if mb_critic_count > 0:
                 mb_critic_loss = mb_critic_loss / mb_critic_count
+                critic_weight = mb_critic_count / len(mb_advs)
                 if mb_critic_loss.requires_grad:
-                    mb_loss = mb_loss + mb_critic_loss
+                    mb_loss = mb_loss + critic_weight * mb_critic_loss
                     mb_metrics["critic_loss"] = mb_critic_loss.item()
 
+            # Check for NaN BEFORE backward
+            if torch.isnan(mb_loss).any():
+                mb_idx = mb_start // micro_batch_size + 1
+                raise RuntimeError(
+                    f"Step {self.global_step} micro-batch {mb_idx}/{n_micro}: "
+                    f"loss is NaN — aborting before backward() to prevent gradient corruption."
+                )
             # TRN-R1-2: Check loss for NaN/inf BEFORE backward() to prevent optimizer corruption
             if not torch.isfinite(mb_loss):
                 mb_idx = mb_start // micro_batch_size + 1
@@ -978,12 +1007,12 @@ class QGRETrainer:
                 torch.cuda.empty_cache()
 
             # TRN-R1-3: Track metric types for correct aggregation
-            if not all_metrics:
-                all_metrics = {k: v for k, v in mb_metrics.items()}
-            # Track which metrics are per-token (should be averaged), not summed
             # T2-1: Initialize _per_token_metrics unconditionally to prevent AttributeError on early return
             self._per_token_metrics = {"kl", "llds_loss", "llds_mask_ratio", "critic_loss"}
-            if all_metrics:
+            # TL-R2-05: Accumulate per_token_metrics across micro-batches
+            if not all_metrics:
+                all_metrics = {k: v for k, v in mb_metrics.items()}
+            else:
                 for k, v in mb_metrics.items():
                     all_metrics[k] = all_metrics.get(k, 0) + v
 
@@ -1016,6 +1045,8 @@ class QGRETrainer:
         # Track accumulated loss across gradient accumulation steps
         self._accumulated_loss += total_loss
         self._accumulation_count += 1
+        # TL-R2-04: Track actual samples for accurate loss averaging
+        self._accumulated_samples += actual_batch
 
         # Optimizer step (backward already done in micro-batches above)
         if (self.global_step + 1) % self.config.training.gradient_accumulation_steps == 0:
@@ -1128,8 +1159,10 @@ class QGRETrainer:
                             state['exp_avg'].zero_()
                         if 'exp_avg_sq' in state:
                             state['exp_avg_sq'].zero_()
-                self._resumed_mid_accumulation = False
             self.optimizer.zero_grad()
+            # Clear flag AFTER momentum clearing
+            if hasattr(self, '_resumed_mid_accumulation'):
+                self._resumed_mid_accumulation = False
             # VPRM critic optimizer steps at same cadence as policy optimizer
             if self.vprm_critic is not None and self.vprm_optimizer is not None:
                 has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 for p in self.vprm_critic.parameters())
@@ -1159,15 +1192,16 @@ class QGRETrainer:
                         metrics["target_divergence"] = divergence
             if self.scheduler is not None:
                 self.scheduler.step()
-            # CP2-004: Divide by actual accumulation count, not expected
-            actual_count = self._accumulation_count if self._accumulation_count > 0 else 1
-            metrics["accumulated_loss"] = self._accumulated_loss / actual_count
+            # TL-R2-04: Divide by accumulated samples, not accumulation count
+            actual_samples = self._accumulated_samples if self._accumulated_samples > 0 else 1
+            metrics["accumulated_loss"] = self._accumulated_loss / actual_samples
             self._accumulated_loss = 0.0
             self._accumulation_count = 0
+            self._accumulated_samples = 0
         else:
             # Track accumulated loss even for non-optimizer steps
-            actual_count = self._accumulation_count if self._accumulation_count > 0 else 1
-            metrics["accumulated_loss"] = self._accumulated_loss / actual_count
+            actual_samples = self._accumulated_samples if self._accumulated_samples > 0 else 1
+            metrics["accumulated_loss"] = self._accumulated_loss / actual_samples
 
         # KL-adaptive SPO learning rate (SPO paper Algorithm 1)
         spo_cfg = self.config.algorithm.spo
@@ -1234,6 +1268,8 @@ class QGRETrainer:
             vprm_critic_state=self.vprm_critic.state_dict_with_meta() if self.vprm_critic else None,
             vprm_optimizer_state=self.vprm_optimizer.state_dict() if self.vprm_optimizer else None,
             accumulated_loss=self._accumulated_loss,  # TRN-R2-1: Save accumulation state
+            accumulated_samples=self._accumulated_samples,  # TL-R3-04: Save accumulated samples
+            accumulation_count=self._accumulation_count,
             dataloader_state=self._dataloader.state_dict() if self._dataloader else None,
             training_context=self.ctx.to_dict(),
         )
@@ -1385,9 +1421,11 @@ class QGRETrainer:
 
         # TRN-R2-1: Restore accumulated loss
         self._accumulated_loss = checkpoint.get("accumulated_loss", 0.0)
+        # TL-R3-04: Restore _accumulated_samples for accurate averaging
+        self._accumulated_samples = checkpoint.get("accumulated_samples", 0)
         # DI1: Store dataloader state for restore in train() when dataloader is available
         self._pending_dataloader_state = checkpoint.get("dataloader_state")
-        self._accumulation_count = 0  # Reset count on resume (loss already accumulated)
+        self._accumulation_count = checkpoint.get("accumulation_count", 0)
 
         # Restore training context (device, dtype, step)
         if checkpoint.get("training_context"):
@@ -1576,6 +1614,9 @@ class QGRETrainer:
             return
         col = self._difficulty_column
         if not col:
+            # Clear difficulty gate when tier_order is None
+            if hasattr(self._dataloader, "_difficulty_gate"):
+                self._dataloader._difficulty_gate = None
             return  # No difficulty column → no gating (default tier, all prompts)
 
         allowed = set(self.game_state.active_tiers)

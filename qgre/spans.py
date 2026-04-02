@@ -128,12 +128,12 @@ def build_char_to_token_map(
         )
 
     # Fill any remaining gaps with nearest valid token
-    last_valid = 0
+    last_valid = -1
     for c in range(full_len):
         if char_to_token[c] >= 0:
             last_valid = char_to_token[c]
         else:
-            char_to_token[c] = min(last_valid, len(token_ids) - 1)
+            char_to_token[c] = last_valid if last_valid >= 0 else -1
 
     return char_to_token
 
@@ -172,6 +172,14 @@ def scored_spans_to_token_masks(
         # First span gets +1.0, later spans get REPETITION_MARKER penalty
         num_spans = len(spans)
         for span_idx, (char_start, char_end) in enumerate(spans):
+            # AE-R2-03: Skip span if completely outside bounds (don't relocate)
+            if char_start >= max_char:
+                import warnings
+                warnings.warn(
+                    f"Span completely outside bounds for quality '{quality_name}': "
+                    f"char_start={char_start} >= max_char={max_char}. Skipping span."
+                )
+                continue
             # Clamp to valid range
             cs = max(0, min(char_start, max_char - 1))
             ce = max(0, min(char_end, max_char))
@@ -184,6 +192,14 @@ def scored_spans_to_token_masks(
                 )
                 # Track clamped spans for metrics
                 _clamped_count[0] += 1
+            # Warn if clamping caused zero-length span
+            if cs >= ce:
+                import warnings
+                warnings.warn(
+                    f"Span became zero-length after clamping for quality '{quality_name}': "
+                    f"original ({char_start}, {char_end}) → clamped ({cs}, {ce}). "
+                    "Advantage signal lost for this span."
+                )
             # Map char range → token indices and set mask
             # First span: +1.0 (reward original answer), later spans: REPETITION_MARKER (penalize repeats)
             # The marker is detected in advantages.py where sign-aware penalty is applied
@@ -191,6 +207,9 @@ def scored_spans_to_token_masks(
             span_value = 1.0 if is_first_span else REPETITION_MARKER
             for c in range(cs, ce):
                 tok_idx = char_to_token[c]
+                # AE-R2-02: Skip assignment when tok_idx == -1 (invalid mapping)
+                if tok_idx == -1:
+                    continue
                 # DP3-005: Add assertion that tok_idx < seq_len with informative error
                 if tok_idx >= seq_len:
                     raise RuntimeError(
