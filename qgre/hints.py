@@ -117,7 +117,7 @@ class HintRegistry:
                 span_id=span_id,
                 hint_tokens=hint_tokens,
                 mastery_at_flag=current_mastery,
-                flagged_step=current_step,
+                flagged_step=int(current_step),
             )
 
     def get_hint(
@@ -171,7 +171,8 @@ class HintRegistry:
             Dict mapping span_id -> hint_tokens for spans that should get hints.
         """
         result = {}
-        for (pid, span_id), entry in self._hints.items():
+        # Iterate over copy to avoid modification during iteration
+        for (pid, span_id), entry in list(self._hints.items()):
             if pid != prompt_id:
                 continue
             # Look up mastery for this specific span
@@ -283,6 +284,7 @@ class HintRegistry:
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize registry for checkpointing."""
+        import copy
         return {
             "mastery_threshold": self.mastery_threshold,
             "success_streak_to_clear": self.success_streak_to_clear,
@@ -290,7 +292,7 @@ class HintRegistry:
                 {
                     "prompt_id": e.prompt_id,
                     "span_id": e.span_id,
-                    "hint_tokens": e.hint_tokens,
+                    "hint_tokens": copy.deepcopy(e.hint_tokens),
                     "mastery_at_flag": e.mastery_at_flag,
                     "flagged_step": e.flagged_step,
                     "success_count": e.success_count,

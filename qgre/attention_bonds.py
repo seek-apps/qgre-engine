@@ -376,6 +376,10 @@ def compute_normalized_entropy(
     if vocab_size is None:
         vocab_size = logits.shape[-1]
 
+    # Handle empty tensor
+    if logits.numel() == 0:
+        return torch.zeros(logits.shape[:-1], device=logits.device, dtype=torch.float32)
+
     # Compute in float32 for numerical stability
     logits_f32 = logits.float()
 
@@ -421,4 +425,6 @@ def compute_confidence_gate(
     # (entropy - threshold) / temperature:
     # - High entropy → positive → sigmoid → ~1 (uncertain)
     # - Low entropy → negative → sigmoid → ~0 (confident)
-    return torch.sigmoid((entropy - threshold) / temperature)
+    # Guard against division by zero
+    safe_temp = max(temperature, 1e-8)
+    return torch.sigmoid((entropy - threshold) / safe_temp)

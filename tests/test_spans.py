@@ -228,19 +228,22 @@ class TestFindExpressionSpans:
     def test_finds_H_spans(self):
         from examples.hamiltonian.reward_fn import _find_expression_spans
 
+        # _find_expression_spans uses StructuredOutputParser section headers,
+        # not raw "H = " patterns. Only "HAMILTONIAN:" sections are matched.
         text = "derivation: H = p²/6 + 3x²\nmore text\nHAMILTONIAN: H = p²/6 + 3x²"
         spans = _find_expression_spans(text)
 
         assert "q_correct_H" in spans
-        assert len(spans["q_correct_H"]) == 2  # Two H = ... occurrences
+        assert len(spans["q_correct_H"]) == 1  # Only HAMILTONIAN: section matched
 
     def test_finds_V_spans(self):
         from examples.hamiltonian.reward_fn import _find_expression_spans
 
+        # "V = ..." matches POTENTIAL alias "v", and "POTENTIAL:" matches directly
         text = "V = kx² + mgx\nPOTENTIAL: V = 3x²"
         spans = _find_expression_spans(text)
 
-        assert len(spans["q_V_correct"]) == 2
+        assert len(spans["q_V_correct"]) == 2  # Both lines match POTENTIAL
 
     def test_format_targets_labeled_sections_not_full_completion(self):
         """Format spans should target labeled sections, OR full completion for negative signal."""

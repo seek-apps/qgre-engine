@@ -230,6 +230,25 @@ class EGRSConfig:
     hint_extractor: str = "none"
     hint_extractor_mapping: dict = field(default_factory=dict)  # For generic extractor
 
+    def __post_init__(self):
+        """Validate EGRS config after initialization."""
+        if self.gate_temperature <= 0:
+            raise ValueError(
+                f"gate_temperature must be > 0, got {self.gate_temperature}. "
+                "Zero temperature causes division by zero in confidence_gate."
+            )
+        if self.reward_threshold >= 1.0:
+            import warnings
+            warnings.warn(
+                f"reward_threshold={self.reward_threshold} >= 1.0 means no spans are ever 'correct'. "
+                "This makes all EGRS tokens Q3 or Q4. Consider lowering threshold."
+            )
+        if self.hint_enabled and self.hint_token_count < 1:
+            raise ValueError(
+                f"hint_enabled=True but hint_token_count={self.hint_token_count} < 1. "
+                "Must have at least 1 token for hints."
+            )
+
 
 @dataclass
 class AlgorithmConfig:

@@ -259,6 +259,7 @@ class QGRETrainer:
 
         # SPO filter monitoring — track drop rate to detect data starvation
         self._spo_filter_stats = {"total": 0, "passed": 0, "dropped": 0, "warned": False}
+        self._spo_filter_idx: list[int] | None = None
 
         # Gradient probe — measure actual logit changes on physics tokens for advantage_scale calibration
         self._gradient_probe_steps = config.training.gradient_probe_steps
@@ -429,6 +430,9 @@ class QGRETrainer:
         Returns metrics dict.
         """
         assert self.optimizer is not None, "Call setup_optimizer() first"
+
+        # Reset SPO filter index mapping at start of each step
+        self._spo_filter_idx = None
 
         if not self._sq_validated and reward_results:
             if not self.phase_qualities:
@@ -750,6 +754,8 @@ class QGRETrainer:
                 comp_attention_mask = comp_attention_mask[idx]
                 # Single reindex: samples holds all per-sample data including kl_region_weights and gen_logprobs
                 samples = [samples[i] for i in idx.tolist()]
+                # Track filtered → original index mapping for VPRM
+                self._spo_filter_idx = idx.tolist()
 
         # Rebuild batch tensors from samples (after SPO filter if applied)
         max_comp_len = comp_tensor.shape[1]
@@ -758,11 +764,11 @@ class QGRETrainer:
         # Rebuild gen_logprobs_padded from samples
         has_gen_lp = any(s.gen_logprobs is not None for s in samples)
         if has_gen_lp:
-            gen_logprobs_padded = torch.zeros(len(samples), max_comp_len, device=device)
+            gen_logprobs_padded = torch.zeros(len(samples), max_comp_len, device=device, dtype=torch.float32)
             for i, s in enumerate(samples):
                 if s.gen_logprobs is not None:
                     lp_len = min(len(s.gen_logprobs), max_comp_len)
-                    gen_logprobs_padded[i, :lp_len] = s.gen_logprobs[:lp_len]
+                    gen_logprobs_padded[i, :lp_len] = s.gen_logprobs[:lp_len].to(device)
         else:
             gen_logprobs_padded = None
 
@@ -1085,7 +1091,7 @@ class QGRETrainer:
                 for mb_i in range(mb_end - mb_start):
                     filtered_i = mb_start + mb_i
                     # Map filtered index → original batch index
-                    orig_i = _spo_filter_idx[filtered_i] if _spo_filter_idx is not None else filtered_i
+                    orig_i = self._spo_filter_idx[filtered_i] if self._spo_filter_idx is not None else filtered_i
                     # TL-R2-03: Validate orig_i before access
                     if orig_i >= len(batch_regions):
                         logging.getLogger(__name__).warning(
@@ -1178,8 +1184,8 @@ class QGRETrainer:
                 mb_entropy_adjustments = torch.zeros_like(mb_advs)
                 for mb_i in range(mb_advs.shape[0]):
                     filtered_i = mb_start + mb_i
-                    if _spo_filter_idx is not None:
-                        orig_i = _spo_filter_idx[filtered_i]
+                    if self._spo_filter_idx is not None:
+                        orig_i = self._spo_filter_idx[filtered_i]
                     else:
                         orig_i = filtered_i
                     if orig_i >= len(batch_regions):
@@ -1298,8 +1304,8 @@ class QGRETrainer:
                     for mb_i_inner in range(mb_per_token_loss.shape[0]):
                         # Map filtered index → original batch index for SPO filter
                         filtered_i = mb_start + mb_i_inner
-                        if _spo_filter_idx is not None:
-                            orig_i = _spo_filter_idx[filtered_i]
+                        if self._spo_filter_idx is not None:
+                            orig_i = self._spo_filter_idx[filtered_i]
                         else:
                             orig_i = filtered_i
                         if orig_i < len(batch_token_masks) and batch_token_masks[orig_i]:
