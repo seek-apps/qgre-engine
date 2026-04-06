@@ -119,7 +119,17 @@ def apply_egrs_matrix(
     entropy_adjustments = torch.zeros(seq_len, device=device, dtype=dtype)
     hint_flags: set[tuple[int, int]] = set()
 
-    for t, region in enumerate(regions):
+    # A-1: Clamp iteration to min of all tensor lengths to prevent IndexError
+    max_iter = min(len(regions), len(token_entropy), len(token_advantages))
+    if max_iter < seq_len:
+        warnings.warn(
+            f"A-1: Region/entropy/advantage length mismatch. "
+            f"regions={len(regions)}, entropy={len(token_entropy)}, advs={len(token_advantages)}. "
+            f"Processing only first {max_iter} tokens."
+        )
+
+    for t in range(max_iter):
+        region = regions[t]
         # Parse step number from region label
         if region.startswith("STEP_"):
             try:
@@ -253,12 +263,30 @@ def broadcast_step_advantages_to_tokens(
             sn = int(region.split("_")[1])
             if sn in step_advs:
                 val = step_advs[sn]
-                primary = val[sample_idx] if sample_idx is not None else val
+                # A-2: Bounds check before indexing
+                if sample_idx is not None:
+                    if isinstance(val, torch.Tensor) and sample_idx >= val.shape[0]:
+                        warnings.warn(
+                            f"A-2: sample_idx {sample_idx} >= step_advs[{sn}].shape[0] ({val.shape[0]}). Skipping."
+                        )
+                        continue
+                    primary = val[sample_idx]
+                else:
+                    primary = val
                 contribs = [primary]
                 for vs in region_extra_steps.get(sn, []):
                     if vs in step_advs:
                         v = step_advs[vs]
-                        contribs.append(v[sample_idx] if sample_idx is not None else v)
+                        # A-2: Bounds check for virtual steps too
+                        if sample_idx is not None:
+                            if isinstance(v, torch.Tensor) and sample_idx >= v.shape[0]:
+                                warnings.warn(
+                                    f"A-2: sample_idx {sample_idx} >= step_advs[{vs}].shape[0] ({v.shape[0]}). Skipping."
+                                )
+                                continue
+                            contribs.append(v[sample_idx])
+                        else:
+                            contribs.append(v)
                 # Convert all to tensors on consistent device before torch.stack
                 if not contribs:
                     continue
@@ -308,11 +336,9 @@ def broadcast_step_advantages_to_tokens(
 
     # Apply importance constraint if bond_strength (importance) provided
     if bond_strength is not None:
-        # Validate device consistency
+        # A-4: Move to correct device before validation
         if bond_strength.device != device:
-            raise ValueError(
-                f"C05-SHAPE: bond_strength device {bond_strength.device} does not match token_advs device {device}"
-            )
+            bond_strength = bond_strength.to(device)
         # Validate shape consistency
         if bond_strength.shape != token_advs.shape:
             raise ValueError(
@@ -671,17 +697,18 @@ class QGREStepAdvantageEstimator:
 
         for step_num in self._step_nums:
             for i in range(batch_size):
+                # A-6: Bounds check BEFORE any array access
+                if i >= len(batch_prompt_ids):
+                    raise IndexError(
+                        f"A-6: batch index {i} out of range for batch_prompt_ids (len={len(batch_prompt_ids)}). "
+                        f"batch_size={batch_size}, step_num={step_num}"
+                    )
+
                 # Skip inactive qualities — no advantage signal, no baseline update
                 if step_num not in all_step_rewards[i]:
                     step_advs[step_num][i] = 0.0
                     continue
 
-                # ADV-R2-4: Check for None before accessing attributes
-                if i >= len(batch_prompt_ids):
-                    raise IndexError(
-                        f"SPO warm-start: batch index {i} out of range for batch_prompt_ids (len={len(batch_prompt_ids)}). "
-                        f"batch_size={batch_size}, step_num={step_num}"
-                    )
                 ctx = batch_contexts[i] if batch_contexts and i < len(batch_contexts) else None
                 pid = ctx.prompt_id if ctx is not None else batch_prompt_ids[i]
                 r = all_step_rewards[i][step_num]
@@ -1026,10 +1053,15 @@ class QGREStepAdvantageEstimator:
             shape_mismatch_count = 0
             for quality_name in batch_active_qualities[i]:
                 if quality_name not in masks:
-                    # Missing mask — backward compat, not an error
+                    # A-5: Log warning when quality missing from masks
                     if not hasattr(self, '_quality_mask_mismatch_count'):
                         self._quality_mask_mismatch_count = 0
                     self._quality_mask_mismatch_count += 1
+                    if self._quality_mask_mismatch_count <= 5:
+                        _logger.warning(
+                            f"A-5: Quality '{quality_name}' in active_qualities but not in token_masks "
+                            f"for sample {i}. Skipping. Total occurrences: {self._quality_mask_mismatch_count}"
+                        )
                     skipped_count += 1
                     continue
                 q_adv = all_quality_advs[i].get(quality_name, 0.0)

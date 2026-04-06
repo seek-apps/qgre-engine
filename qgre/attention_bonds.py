@@ -401,6 +401,9 @@ def compute_normalized_entropy(
     max_entropy = max(math.log(vocab_size), 1e-8)
     normalized = entropy / max_entropy
 
+    # A-7: Replace NaN values with 0.5 (neutral entropy) before return
+    normalized = torch.where(torch.isnan(normalized), torch.tensor(0.5, device=normalized.device, dtype=normalized.dtype), normalized)
+
     return normalized.clamp(0.0, 1.0)
 
 

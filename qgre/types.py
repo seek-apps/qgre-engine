@@ -585,6 +585,15 @@ class TrainingStep:
                 f"TrainingStep tensor mismatch: padded_advs batch={self.padded_advs.shape[0]} "
                 f"vs list batch={batch_size}"
             )
+        # CT-7: Validate optional tensor shapes if present
+        if self.gen_logprobs_padded is not None and self.gen_logprobs_padded.shape[0] != batch_size:
+            raise ValueError(
+                f"CT-7: gen_logprobs_padded batch={self.gen_logprobs_padded.shape[0]} vs list batch={batch_size}"
+            )
+        if self.kl_region_weights is not None and self.kl_region_weights.shape[0] != batch_size:
+            raise ValueError(
+                f"CT-7: kl_region_weights batch={self.kl_region_weights.shape[0]} vs list batch={batch_size}"
+            )
 
     def __len__(self) -> int:
         """Return batch size."""
@@ -623,6 +632,13 @@ class TrainingStep:
         if self.filter_idx is not None:
             # Compose filters: new_filter[i] = old_filter[idx[i]]
             new_filter_idx = [self.filter_idx[i] for i in idx_list]
+            # CT-4: Validate composition - all new indices must be valid in old filter
+            max_old_idx = len(self.filter_idx) - 1
+            for i, old_i in enumerate(idx_list):
+                if old_i > max_old_idx:
+                    raise IndexError(
+                        f"CT-4: Filter composition error - idx[{i}]={old_i} exceeds old filter length {len(self.filter_idx)}"
+                    )
         else:
             new_filter_idx = idx_list
 

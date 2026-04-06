@@ -1110,82 +1110,86 @@ class QGRETrainer:
                         )
                     self._vprm_checkpoint_validated = True  # Only check once per resume
 
-                # Compute VPRM advantages per-sample in this micro-batch
-                for mb_i in range(mb_end - mb_start):
-                    filtered_i = mb_start + mb_i
-                    # With TrainingStep, all fields are already reindexed after filter.
-                    # Use filtered_i directly — no orig_i mapping needed for step data.
-                    # orig_i is only needed for external state (mastery, etc.)
-                    orig_i = step.get_original_idx(filtered_i)
+                # TL-5: Wrap VPRM computation in try-finally for guaranteed cleanup
+                try:
+                    # Compute VPRM advantages per-sample in this micro-batch
+                    for mb_i in range(mb_end - mb_start):
+                        filtered_i = mb_start + mb_i
+                        # With TrainingStep, all fields are already reindexed after filter.
+                        # Use filtered_i directly — no orig_i mapping needed for step data.
+                        # orig_i is only needed for external state (mastery, etc.)
+                        orig_i = step.get_original_idx(filtered_i)
 
-                    # Get sample data directly from step (already reindexed)
-                    sample_regions = step.batch_regions[filtered_i]
-                    sample_rr = step.reward_results[filtered_i]
-                    sample_aq = step.active_qualities[filtered_i]
-                    # Get hidden states for this sample
-                    sample_hs = mb_hidden_states[mb_i]  # [seq_len, hidden_dim]
-                    # Trim to completion length with bounds validation
-                    comp_len = len(step.completions[filtered_i])
-                    if comp_len > sample_hs.shape[0]:
-                        import warnings
-                        warnings.warn(
-                            f"VPRM: completion length ({comp_len}) > hidden states length ({sample_hs.shape[0]}) "
-                            f"for sample orig_i={orig_i}. Clamping to hidden states length."
-                        )
-                        comp_len = sample_hs.shape[0]
-                    sample_hs_trimmed = sample_hs[:comp_len]
-
-                    # Get span token masks for this sample if available
-                    # Note: batch_token_masks is reindexed by SPO filter (line 714), so use filtered_i not orig_i
-                    sample_token_masks = batch_token_masks[filtered_i] if batch_token_masks and filtered_i < len(batch_token_masks) else None
-
-                    # Extract bond strength for this sample if available
-                    sample_bond_strength = None
-                    if bond_strength is not None:
-                        # bond_strength shape: [micro_batch_size, seq_len]
-                        # Extract for this sample and trim to completion length
-                        sample_bond_strength = bond_strength[mb_i, :comp_len].to(device)
-                        # Log bond strength stats periodically
-                        if self.global_step % 10 == 0 and mb_i == 0 and filtered_i == 0:
-                            bs = sample_bond_strength
-                            logging.getLogger(__name__).warning(
-                                f"Step {self.global_step} bond_strength: "
-                                f"min={bs.min().item():.4f}, max={bs.max().item():.4f}, "
-                                f"mean={bs.mean().item():.4f}, nonzero={(bs > 0).sum().item()}/{len(bs)}"
+                        # Get sample data directly from step (already reindexed)
+                        sample_regions = step.batch_regions[filtered_i]
+                        sample_rr = step.reward_results[filtered_i]
+                        sample_aq = step.active_qualities[filtered_i]
+                        # Get hidden states for this sample
+                        sample_hs = mb_hidden_states[mb_i]  # [seq_len, hidden_dim]
+                        # Trim to completion length with bounds validation
+                        comp_len = len(step.completions[filtered_i])
+                        if comp_len > sample_hs.shape[0]:
+                            import warnings
+                            warnings.warn(
+                                f"VPRM: completion length ({comp_len}) > hidden states length ({sample_hs.shape[0]}) "
+                                f"for sample orig_i={orig_i}. Clamping to hidden states length."
                             )
+                            comp_len = sample_hs.shape[0]
+                        sample_hs_trimmed = sample_hs[:comp_len]
 
-                    vprm_advs, vprm_loss, used_critic = compute_advantages_vprm(
-                        critic=self.vprm_critic,
-                        hidden_states=sample_hs_trimmed,
-                        regions=sample_regions[:comp_len],
-                        reward_result=sample_rr,
-                        step_qualities=self.step_qualities,
-                        active_qualities=sample_aq,
-                        step_region_map=self.config.algorithm.step_region_map,
-                        frontier_steps=frontier_steps,
-                        frontier_amplification=self.config.algorithm.frontier_amplification,
-                        min_regions=self.config.vprm.spo_fallback_min_regions,
-                        # Use step.batch_contexts (already reindexed after filter)
-                        aspiration_beta=self.advantage_estimator._aspiration_beta * step.batch_contexts[filtered_i].aspiration_warmup,
-                        aspiration_target=step.batch_contexts[filtered_i].aspiration_target,
-                        ctx=self.ctx,
-                        token_masks=sample_token_masks,  # Pass span masks for span-aware critic
-                        bond_strength=sample_bond_strength,  # Pass attention bond strength
-                        constraint_strength=self.config.algorithm.attention_constraint_strength,
-                    )
+                        # Get span token masks for this sample if available
+                        # Note: batch_token_masks is reindexed by SPO filter (line 714), so use filtered_i not orig_i
+                        sample_token_masks = batch_token_masks[filtered_i] if batch_token_masks and filtered_i < len(batch_token_masks) else None
 
-                    if used_critic:
-                        # When spans are active, DON'T overwrite span advantages —
-                        # spans provide better token targeting. Only collect critic loss
-                        # (critic still learns the baseline for future use).
-                        # When spans are NOT active, replace SPO advantages with VPRM.
-                        if not use_spans:
-                            adv_len = min(vprm_advs.shape[0], mb_advs.shape[1])
-                            mb_advs[mb_i, :adv_len] = vprm_advs[:adv_len]
-                        mb_critic_loss = mb_critic_loss + vprm_loss
-                        mb_critic_count += 1
+                        # Extract bond strength for this sample if available
+                        sample_bond_strength = None
+                        if bond_strength is not None:
+                            # bond_strength shape: [micro_batch_size, seq_len]
+                            # Extract for this sample and trim to completion length
+                            sample_bond_strength = bond_strength[mb_i, :comp_len].to(device)
+                            # Log bond strength stats periodically
+                            if self.global_step % 10 == 0 and mb_i == 0 and filtered_i == 0:
+                                bs = sample_bond_strength
+                                logging.getLogger(__name__).warning(
+                                    f"Step {self.global_step} bond_strength: "
+                                    f"min={bs.min().item():.4f}, max={bs.max().item():.4f}, "
+                                    f"mean={bs.mean().item():.4f}, nonzero={(bs > 0).sum().item()}/{len(bs)}"
+                                )
 
-                del mb_hidden_states
+                        vprm_advs, vprm_loss, used_critic = compute_advantages_vprm(
+                            critic=self.vprm_critic,
+                            hidden_states=sample_hs_trimmed,
+                            regions=sample_regions[:comp_len],
+                            reward_result=sample_rr,
+                            step_qualities=self.step_qualities,
+                            active_qualities=sample_aq,
+                            step_region_map=self.config.algorithm.step_region_map,
+                            frontier_steps=frontier_steps,
+                            frontier_amplification=self.config.algorithm.frontier_amplification,
+                            min_regions=self.config.vprm.spo_fallback_min_regions,
+                            # Use step.batch_contexts (already reindexed after filter)
+                            aspiration_beta=self.advantage_estimator._aspiration_beta * step.batch_contexts[filtered_i].aspiration_warmup,
+                            aspiration_target=step.batch_contexts[filtered_i].aspiration_target,
+                            ctx=self.ctx,
+                            token_masks=sample_token_masks,  # Pass span masks for span-aware critic
+                            bond_strength=sample_bond_strength,  # Pass attention bond strength
+                            constraint_strength=self.config.algorithm.attention_constraint_strength,
+                        )
+
+                        if used_critic:
+                            # When spans are active, DON'T overwrite span advantages —
+                            # spans provide better token targeting. Only collect critic loss
+                            # (critic still learns the baseline for future use).
+                            # When spans are NOT active, replace SPO advantages with VPRM.
+                            if not use_spans:
+                                adv_len = min(vprm_advs.shape[0], mb_advs.shape[1])
+                                mb_advs[mb_i, :adv_len] = vprm_advs[:adv_len]
+                            mb_critic_loss = mb_critic_loss + vprm_loss
+                            mb_critic_count += 1
+                finally:
+                    # TL-5: Guaranteed cleanup of mb_hidden_states
+                    if 'mb_hidden_states' in locals():
+                        del mb_hidden_states
 
             # EGRS 2x2 matrix: modify advantages based on (correct/wrong) x (confident/uncertain)
             # This replaces the simpler ERIC dampening when EGRS is enabled
@@ -1433,7 +1437,17 @@ class QGRETrainer:
                     f"loss is {mb_loss.item()} — aborting before backward() to prevent gradient corruption."
                 )
 
-            (mb_loss / n_micro).backward()
+            try:
+                (mb_loss / n_micro).backward()
+            except Exception as bwd_exc:
+                # TL-2: Zero gradients on backward failure to prevent corrupted state
+                logging.getLogger(__name__).error(
+                    f"TL-2: backward() raised exception at step {self.global_step}: {bwd_exc}. "
+                    "Zeroing gradients to prevent gradient corruption."
+                )
+                self.optimizer.zero_grad()
+                raise
+            # TL-3: Only add to total_loss AFTER successful backward
             total_loss += mb_loss.item() / n_micro
 
             del mb_lp
@@ -1487,32 +1501,38 @@ class QGRETrainer:
 
         # Optimizer step (backward already done in micro-batches above)
         if (self.global_step + 1) % self.config.training.gradient_accumulation_steps == 0:
-            # Gradient probe: initialize fixed prompt and physics tokens on first step
+            # TL-8: Guard gradient probe initialization with batch size check
             if self._gradient_probe_steps > 0 and self.global_step < self._gradient_probe_steps and self._gradient_probe_prompt_ids is None:
-                # Get model device
-                model_device = next(self.model.parameters()).device
+                if batch.input_ids.shape[0] == 0:
+                    logging.getLogger(__name__).warning("TL-8: Cannot initialize gradient probe with empty batch")
+                else:
+                    # Get model device
+                    model_device = next(self.model.parameters()).device
 
-                # Use first batch prompt as fixed measurement prompt
-                self._gradient_probe_prompt_ids = batch.input_ids[0:1].clone().to(model_device)  # [1, seq_len]
+                    # Use first batch prompt as fixed measurement prompt
+                    self._gradient_probe_prompt_ids = batch.input_ids[0:1].clone().to(model_device)  # [1, seq_len]
 
-                # Physics tokens: p, V, T, H, x, m
-                physics_strs = ["p", "V", "T", "H", "x", "m"]
-                self._gradient_probe_physics_tokens = []
-                for tok_str in physics_strs:
-                    tok_ids = self.tokenizer.encode(tok_str, add_special_tokens=False)
-                    if len(tok_ids) == 1:
-                        self._gradient_probe_physics_tokens.append(tok_ids[0])
+                    # Physics tokens: p, V, T, H, x, m
+                    physics_strs = ["p", "V", "T", "H", "x", "m"]
+                    self._gradient_probe_physics_tokens = []
+                    for tok_str in physics_strs:
+                        tok_ids = self.tokenizer.encode(tok_str, add_special_tokens=False)
+                        if len(tok_ids) == 1:
+                            self._gradient_probe_physics_tokens.append(tok_ids[0])
 
-                if not self._gradient_probe_physics_tokens:
-                    # Fallback: use top-50 most common tokens if physics tokens aren't single-token
-                    self._gradient_probe_physics_tokens = list(range(50, 100))
+                    if not self._gradient_probe_physics_tokens:
+                        # Fallback: use top-50 most common tokens if physics tokens aren't single-token
+                        self._gradient_probe_physics_tokens = list(range(50, 100))
 
             # Gradient probe: capture logits BEFORE optimizer step
             logits_before = None
             if self._gradient_probe_steps > 0 and self.global_step < self._gradient_probe_steps and self._gradient_probe_prompt_ids is not None:
                 with torch.no_grad():
                     self.model.eval()
-                    probe_outputs = self.model(self._gradient_probe_prompt_ids)
+                    # TL-11: Move probe tensor to model device each time
+                    model_device = next(self.model.parameters()).device
+                    probe_ids = self._gradient_probe_prompt_ids.to(model_device)
+                    probe_outputs = self.model(probe_ids)
                     # Get logits for last position, physics tokens only
                     physics_tokens_tensor = torch.tensor(self._gradient_probe_physics_tokens, device=probe_outputs.logits.device)
                     logits_before = probe_outputs.logits[0, -1, physics_tokens_tensor].clone()
@@ -1905,10 +1925,15 @@ class QGRETrainer:
             )
         # CSM-003: Warn if hint_registry_state exists but EGRS disabled
         elif checkpoint.hint_registry_state and not self.config.egrs.enabled:
+            # H-5: Check isinstance before .get() to avoid AttributeError on non-dict
+            if isinstance(checkpoint.hint_registry_state, dict):
+                hint_count = len(checkpoint.hint_registry_state.get('hints', []))
+            else:
+                hint_count = 0
             import warnings
             warnings.warn(
-                "CSM-003: Checkpoint contains hint_registry_state but EGRS is disabled in config. "
-                f"All {len(checkpoint.hint_registry_state.get('hints', []))} flagged hints will be LOST. "
+                f"CT-1: Checkpoint contains {hint_count} hint entries but EGRS is disabled in config. "
+                f"All {hint_count} flagged hints will be LOST. "
                 "Set egrs.enabled=True to restore hint registry."
             )
         # CheckpointState: RNG state is in trainer
@@ -2338,7 +2363,11 @@ class QGRETrainer:
                                     try:
                                         step_num = int(span_id.split("_")[1])
                                         # Read current state each time, don't capture tier_mastery values
-                                        return self.game_state.get_tier_step_mastery(tier, step_num)
+                                        mastery = self.game_state.get_tier_step_mastery(tier, step_num)
+                                        # H-1: If step not in tier_mastery (new tier/phase), return high mastery to force hint decay
+                                        if mastery == 0.0 and step_num not in self.game_state.tier_mastery.get(tier, {}):
+                                            return 1.0
+                                        return mastery
                                     except (IndexError, ValueError):
                                         if span_id not in malformed_set:
                                             malformed_set.add(span_id)
@@ -2350,7 +2379,7 @@ class QGRETrainer:
                                 elif span_id == "THINK":
                                     # Read current state each time, don't capture tier_mastery values
                                     return self.game_state.get_tier_step_mastery(tier, 0)
-                                return 0.0
+                                return 1.0  # H-1: Unknown spans get high mastery (no hints)
                             return mastery_fn
 
                         # Query hints with per-span mastery lookup
@@ -2396,6 +2425,11 @@ class QGRETrainer:
                         prompt_hints=prompt_hints,
                     )
                     generation_succeeded = True
+                except Exception as gen_exc:
+                    # TL-1: Clear CUDA cache on generate failure to prevent tensor leaks
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    raise gen_exc
                 finally:
                     # Always restore clean weights — even if generate crashes
                     # Don't sync to vLLM here — step-end sync (after training) handles it
@@ -2482,11 +2516,19 @@ class QGRETrainer:
                 # 3. Train step (training mode)
                 if hasattr(backend, "set_training_mode"):
                     backend.set_training_mode()
-                metrics = self.step(
-                    batch, output.token_ids, reward_results,
-                    generation_logprobs=output.logprobs,
-                    completion_texts=output.texts,  # Pass for span validation
-                )
+                try:
+                    metrics = self.step(
+                        batch, output.token_ids, reward_results,
+                        generation_logprobs=output.logprobs,
+                        completion_texts=output.texts,  # Pass for span validation
+                    )
+                except Exception as e:
+                    logging.getLogger(__name__).error(
+                        f"TL-6: step() raised exception: {e}. "
+                        "Advancing global_step to maintain dataloader consistency."
+                    )
+                    self.global_step += 1
+                    raise
 
                 # 3b. Update prioritized sampling weights (SPO paper Section 3.2)
                 if hasattr(dataloader, "set_priorities"):
@@ -2670,6 +2712,10 @@ class QGRETrainer:
             print(f"Gradient coherence log saved to {output_dir / 'coherence_log.json'}")
             print(f"{'='*70}")
 
-        # Final checkpoint
-        self.save()
-        self.completion_logger.close()
+        # TL-10: Ensure completion_logger is closed even on exception
+        try:
+            # Final checkpoint
+            self.save()
+        finally:
+            if hasattr(self, 'completion_logger'):
+                self.completion_logger.close()

@@ -171,7 +171,7 @@ class HintRegistry:
             Dict mapping span_id -> hint_tokens for spans that should get hints.
         """
         result = {}
-        # Iterate over copy to avoid modification during iteration
+        # H-7: Use list() copy to avoid mutation during iteration
         for (pid, span_id), entry in list(self._hints.items()):
             if pid != prompt_id:
                 continue
@@ -215,6 +215,7 @@ class HintRegistry:
         entry.success_count += 1
         if entry.success_count >= self.success_streak_to_clear:
             # Model can do it alone - clear the hint
+            # H-7: Safe to delete here - callers should iterate over list() copies
             del self._hints[key]
             return True
 
@@ -315,6 +316,7 @@ class HintRegistry:
             )
             return registry
         skipped_entries = 0
+        skipped_empty_tokens = 0
         first_error_msg = ""  # Initialize before loop to avoid UnboundLocalError
         for hint_data in hints_data:
             try:
@@ -322,6 +324,7 @@ class HintRegistry:
                 hint_tokens = hint_data["hint_tokens"]
                 if not hint_tokens or (isinstance(hint_tokens, list) and len(hint_tokens) == 0):
                     skipped_entries += 1
+                    skipped_empty_tokens += 1
                     prompt_id = hint_data.get("prompt_id", "unknown")
                     span_id = hint_data.get("span_id", "unknown")
                     if skipped_entries == 1:
@@ -353,13 +356,17 @@ class HintRegistry:
             total_entries = len(data.get("hints", []))
             all_corrupted = " ALL entries corrupted — hint registry is empty!" if skipped_entries == total_entries else ""
             first_err = f" First error: {first_error_msg}" if skipped_entries > 1 else ""
+            # CT-6: Include empty token count in final restoration message
+            empty_msg = f" ({skipped_empty_tokens} with empty tokens)" if skipped_empty_tokens > 0 else ""
             warnings.warn(
-                f"HintRegistry.from_dict: skipped {skipped_entries}/{total_entries} corrupted entries.{first_err}{all_corrupted}"
+                f"HintRegistry.from_dict: skipped {skipped_entries}/{total_entries} corrupted entries{empty_msg}.{first_err}{all_corrupted}"
             )
-            if skipped_entries == total_entries:
-                raise ValueError(
-                    f"HintRegistry.from_dict: ALL {total_entries} entries corrupted. "
-                    "Checkpoint may be incompatible or corrupt. Cannot restore empty hint registry."
+            # H-3: Return empty registry with warning instead of raising
+            if skipped_entries == total_entries and total_entries > 0:
+                warnings.warn(
+                    f"H-3: ALL {total_entries} hint entries corrupted. "
+                    "Returning empty registry (training will continue without hints). "
+                    "Checkpoint may be incompatible or corrupt."
                 )
         return registry
 

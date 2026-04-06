@@ -108,9 +108,12 @@ def gamestate_from_dict(d: dict) -> GameState:
             ckpt_maxlen = window_data.get("maxlen")
             if ckpt_maxlen is not None and ckpt_maxlen != maxlen:
                 import warnings
+                # CT-5: Compute data loss amount for clearer user feedback
+                values_len = len(values)
+                data_loss = max(0, values_len - maxlen) if values_len > maxlen else 0
                 warnings.warn(
-                    f"CSM-006: Checkpoint maxlen={ckpt_maxlen} differs from config quality_window_size={maxlen} "
-                    f"for tier '{tier}' step {step_num}. Using config value (checkpoint ignored)."
+                    f"CT-5: Checkpoint maxlen={ckpt_maxlen} differs from config quality_window_size={maxlen} "
+                    f"for tier '{tier}' step {step_num}. Data loss: {data_loss} entries (keeping {min(values_len, maxlen)}/{values_len})."
                 )
             # C2-3: Filter out NaN/Inf values when restoring
             import math
@@ -229,6 +232,7 @@ def save_checkpoint(
     checkpoint = asdict(checkpoint_state)
 
     # Special handling for GameState: convert deques to serializable format
+    # CT-3: Always use gamestate_to_dict() - asdict() doesn't handle deques correctly
     if game_state is not None:
         checkpoint["game_state"] = gamestate_to_dict(game_state)
 

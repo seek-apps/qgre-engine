@@ -445,7 +445,7 @@ class UnslothBackend:
                             hint_str = str(hint).strip()
                             if hint_str:
                                 hint_lines.append(f"[{hint_str}]")
-                                hints_used_dict[span_id] = True
+                                # H-2: Don't mark as used yet - wait until after overflow check
                             else:
                                 import logging
                                 logging.getLogger(__name__).warning(
@@ -465,8 +465,14 @@ class UnslothBackend:
                                 f"Hint injection would exceed max_tokens ({len(combined_tokens)} > {self.generation_config.max_tokens}). "
                                 "Skipping hint injection for this sample."
                             )
+                            # H-2: Mark all hints as NOT used since injection was skipped
+                            for span_id in sample_hints.keys():
+                                hints_used_dict[span_id] = False
                         else:
                             text = combined_text
+                            # H-2: NOW mark hints as successfully used (AFTER successful injection)
+                            for span_id in sample_hints.keys():
+                                hints_used_dict[span_id] = True
 
             prompts.append(text)
             hints_used.append(hints_used_dict if hints_used_dict else {})
