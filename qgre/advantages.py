@@ -162,7 +162,8 @@ def apply_egrs_matrix(
                 scaled_adv = token_advantages[t] * gate_val
                 # Apply ERIC dampening if importance provided (prevents cascade destabilization)
                 if importance is not None:
-                    dampening = 1.0 + eric_strength * importance[t].item()
+                    clamped_strength = min(eric_strength, 10.0)
+                    dampening = 1.0 + clamped_strength * importance[t].item()
                     scaled_adv = scaled_adv / dampening
                 modified_advs[t] = scaled_adv
         else:
@@ -561,7 +562,7 @@ class QGREStepAdvantageEstimator:
                 active = [k for k in quality_keys if k in batch_active_qualities[i]]
                 if active:
                     vals = [batch_reward_results[i].scores.get(k, 0.0) for k in active]
-                    step_rews[step_num] = sum(vals) / len(vals)
+                    step_rews[step_num] = sum(vals) / max(len(vals), 1)
                 # else: skip — inactive qualities produce NO advantage signal,
                 # not 0.0 vs old baseline which generates catastrophic negatives
             all_step_rewards.append(step_rews)
@@ -738,7 +739,7 @@ class QGREStepAdvantageEstimator:
                     if is_first_observation:
                         effective_lr = self.lr
                     elif new_var < self._var_threshold:
-                        effective_lr = self.lr * max(new_var / self._var_threshold, self._min_var_ratio)
+                        effective_lr = self.lr * max(new_var / max(self._var_threshold, 1e-8), self._min_var_ratio)
 
                 self.V[pid][step_num] = v + effective_lr * (r - v)
 
@@ -1265,7 +1266,7 @@ def compute_advantages_vprm(
             continue  # Virtual step, no qualities to check
         qualities = [q for q in step_qualities[step_num] if q in active_qualities]
         if qualities:
-            step_reward = sum(reward_result.scores.get(q, 0.0) for q in qualities) / len(qualities)
+            step_reward = sum(reward_result.scores.get(q, 0.0) for q in qualities) / max(len(qualities), 1)
             if step_reward >= 1.0:
                 step_advs[step_num] = 0.0
             elif aspiration_beta > 0:

@@ -28,6 +28,7 @@ def compute_bond_strength(
     seq_len: int,
     mode: str = "max_received",
     batch_size: int = 1,
+    device: torch.device | str | None = None,
 ) -> torch.Tensor:
     """Compute bond strength for each token in completion from a single attention layer.
 
@@ -45,6 +46,7 @@ def compute_bond_strength(
             - "sum_received": sum of attention from all later tokens
             - "mean_received": mean of attention from all later tokens
         batch_size: Batch size for fallback when attention=None.
+        device: Device for fallback tensor when attention=None. If None, uses cuda if available.
 
     Returns:
         Tensor of shape [batch, seq_len] with bond strength values.
@@ -60,7 +62,8 @@ def compute_bond_strength(
         >>> bond = compute_bond_strength(attention, seq_len=100)
     """
     if attention is None:
-        return torch.zeros(batch_size, seq_len, device="cuda" if torch.cuda.is_available() else "cpu")
+        fallback_device = device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.zeros(batch_size, seq_len, device=fallback_device)
 
     # Validate input shape
     if attention.dim() != 4:
@@ -276,9 +279,13 @@ def compute_entropy_importance(
 
     # Compute position-based causal weight
     # Earlier tokens have more downstream dependencies
-    positions = torch.arange(actual_len, device=device, dtype=torch.float32)
-    position_weight = (1.0 - positions / max(actual_len - 1, 1)) ** position_decay
-    position_weight = position_weight.unsqueeze(0).expand(batch_size, -1)
+    # Handle single-token case: when actual_len=1, set uniform weight
+    if actual_len == 1:
+        position_weight = torch.ones(batch_size, 1, device=device, dtype=torch.float32)
+    else:
+        positions = torch.arange(actual_len, device=device, dtype=torch.float32)
+        position_weight = (1.0 - positions / (actual_len - 1)) ** position_decay
+        position_weight = position_weight.unsqueeze(0).expand(batch_size, -1)
 
     # Combine based on mode
     if mode == "entropy":
@@ -391,7 +398,7 @@ def compute_normalized_entropy(
     entropy = -(probs * log_probs).sum(dim=-1)  # [batch, seq_len]
 
     # Normalize by max possible entropy: log(vocab_size)
-    max_entropy = math.log(vocab_size)
+    max_entropy = max(math.log(vocab_size), 1e-8)
     normalized = entropy / max_entropy
 
     return normalized.clamp(0.0, 1.0)
@@ -408,12 +415,12 @@ def compute_confidence_gate(
     This enables soft gating in the 2x2 matrix rather than hard thresholds.
 
     Args:
-        entropy: Normalized entropy tensor [batch, seq_len] in [0, 1].
+        entropy: Normalized entropy tensor, any shape, in [0, 1].
         threshold: Entropy threshold for confident/uncertain boundary.
         temperature: Sigmoid temperature (lower = sharper transition).
 
     Returns:
-        Gate tensor [batch, seq_len] in [0, 1]:
+        Gate tensor with same shape as input, values in [0, 1]:
         - ~1 when entropy >> threshold (uncertain, should reinforce correct)
         - ~0 when entropy << threshold (confident, don't reinforce correct)
 

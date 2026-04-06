@@ -456,7 +456,17 @@ class UnslothBackend:
                             hints_used_dict[span_id] = False
                     if hint_lines:
                         hint_text = "\n".join(hint_lines)
-                        text = text.rstrip() + f"\n\n{hint_text}\n\n"
+                        combined_text = text.rstrip() + f"\n\n{hint_text}\n\n"
+                        # Check if combined length would exceed max_tokens
+                        combined_tokens = self.tokenizer.encode(combined_text, add_special_tokens=False)
+                        if len(combined_tokens) > self.generation_config.max_tokens:
+                            import logging
+                            logging.getLogger(__name__).warning(
+                                f"Hint injection would exceed max_tokens ({len(combined_tokens)} > {self.generation_config.max_tokens}). "
+                                "Skipping hint injection for this sample."
+                            )
+                        else:
+                            text = combined_text
 
             prompts.append(text)
             hints_used.append(hints_used_dict if hints_used_dict else {})
@@ -546,12 +556,12 @@ class UnslothBackend:
                 "MIO-006: hint_registry exists but hint_enabled is False. "
                 "Failures will clear hints that are never injected."
             )
-        # R2-MIO-001: Return empty dict {} instead of None for hints_used when no hints injected
+        # R2-MIO-001: Return empty list [] instead of None for hints_used when no hints injected
         return GenerationOutput(
             token_ids=token_ids,
             texts=texts,
             logprobs=all_logprobs if has_logprobs else None,
-            hints_used=hints_used if hints_used else {},
+            hints_used=hints_used if hints_used else [],
         )
 
     # Weight sync methods moved to Weight Sync Bus:

@@ -437,6 +437,7 @@ class CheckpointState:
             vprm_critic_state=d.get("vprm_critic_state"),
             vprm_optimizer_state=d.get("vprm_optimizer_state"),
             training_context=d.get("training_context"),
+            hint_registry_state=d.get("hint_registry_state"),
             schema_version=d.get("schema_version", CHECKPOINT_SCHEMA_VERSION),
         )
 

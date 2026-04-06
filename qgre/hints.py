@@ -244,16 +244,11 @@ class HintRegistry:
         - mastery=threshold/2 → 50% hint
         - mastery>=threshold → 0% hint
         """
+        # Clamp mastery to [0, 1] to handle NaN/negative/overflow cases
+        mastery = max(0.0, min(1.0, mastery))
         if mastery >= self.mastery_threshold:
             return 0.0
         prob = 1.0 - mastery / self.mastery_threshold
-        # R3-MIO-001: Clamp probability to [0.0, 1.0] and warn if mastery is negative
-        if mastery < 0.0:
-            import warnings
-            warnings.warn(
-                f"R3-MIO-001: Negative mastery {mastery} detected in hint probability calculation. "
-                f"Clamping probability from {prob} to [0.0, 1.0]."
-            )
         return max(0.0, min(1.0, prob))
 
     def clear_all(self) -> int:
@@ -327,9 +322,12 @@ class HintRegistry:
                 hint_tokens = hint_data["hint_tokens"]
                 if not hint_tokens or (isinstance(hint_tokens, list) and len(hint_tokens) == 0):
                     skipped_entries += 1
+                    prompt_id = hint_data.get("prompt_id", "unknown")
+                    span_id = hint_data.get("span_id", "unknown")
                     if skipped_entries == 1:
                         warnings.warn(
-                            "R2-MIO-002: Skipping hint entry with empty hint_tokens. "
+                            f"R2-MIO-002: Skipping hint entry with empty hint_tokens. "
+                            f"Prompt ID: {prompt_id}, Span ID: {span_id}. "
                             "This creates zombie entries. Checkpoint may be corrupted."
                         )
                     continue

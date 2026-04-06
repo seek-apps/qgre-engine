@@ -754,6 +754,12 @@ class QGRETrainer:
                 comp_attention_mask = comp_attention_mask[idx]
                 # Single reindex: samples holds all per-sample data including kl_region_weights and gen_logprobs
                 samples = [samples[i] for i in idx.tolist()]
+                # Also reindex auxiliary lists to maintain alignment
+                reward_results = [reward_results[i] for i in idx.tolist()]
+                active_qualities = [active_qualities[i] for i in idx.tolist()]
+                batch_regions = [batch_regions[i] for i in idx.tolist()]
+                batch_contexts = [batch_contexts[i] for i in idx.tolist()]
+                completions = [completions[i] for i in idx.tolist()]
                 # Track filtered → original index mapping for VPRM
                 self._spo_filter_idx = idx.tolist()
 
@@ -925,6 +931,8 @@ class QGRETrainer:
                             attention_single,
                             seq_len=mb_ids.shape[1],
                             mode=self.config.algorithm.attention_constraint_mode,
+                            batch_size=mb_ids.shape[0],
+                            device=mb_ids.device,
                         )
                         mb_token_entropy = None  # EGRS not supported with attention mode
                         del attentions
@@ -1009,6 +1017,12 @@ class QGRETrainer:
                         f"Delete unsloth_compiled_cache/ and restart."
                     )
                 mb_logits = lm_head_nf(hs[:, :-1, :]).float()
+                # Compute token entropy for EGRS
+                if self.config.egrs.enabled:
+                    vocab_size = mb_logits.shape[-1]
+                    mb_token_entropy = compute_normalized_entropy(mb_logits, vocab_size)
+                else:
+                    mb_token_entropy = None
                 # Compute importance for advantage constraint
                 if attentions is not None:
                     layer_idx = self.config.algorithm.attention_sample_layer
@@ -1025,6 +1039,8 @@ class QGRETrainer:
                         attention_single,
                         seq_len=mb_ids.shape[1],
                         mode=self.config.algorithm.attention_constraint_mode,
+                        batch_size=mb_ids.shape[0],
+                        device=mb_ids.device,
                     )
                     del attentions
                 elif getattr(self, '_use_importance_proxy', False) and self.config.algorithm.attention_constrained_advantage:
@@ -2318,11 +2334,11 @@ class QGRETrainer:
                             self._egrs_malformed_span_ids = set()
 
                         def make_mastery_fn(t: str, malformed_set: set):
-                            def mastery_fn(span_id: str) -> float:
+                            def mastery_fn(span_id: str, tier=t) -> float:
                                 if span_id.startswith("STEP_"):
                                     try:
                                         step_num = int(span_id.split("_")[1])
-                                        return self.game_state.get_tier_step_mastery(t, step_num)
+                                        return self.game_state.get_tier_step_mastery(tier, step_num)
                                     except (IndexError, ValueError):
                                         if span_id not in malformed_set:
                                             malformed_set.add(span_id)
@@ -2332,7 +2348,7 @@ class QGRETrainer:
                                             )
                                         return 0.0
                                 elif span_id == "THINK":
-                                    return self.game_state.get_tier_step_mastery(t, 0)
+                                    return self.game_state.get_tier_step_mastery(tier, 0)
                                 return 0.0
                             return mastery_fn
 
