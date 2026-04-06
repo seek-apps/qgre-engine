@@ -1693,9 +1693,10 @@ class QGRETrainer:
 
         self._record_mastery_and_advance(step.reward_results, step.active_qualities, batch, metrics, batch_contexts=step.batch_contexts)
 
-        # Log completions
+        # Log completions — use get_original_idx to map filtered→original for batch.raw_prompts
         completions_text = []
         for i, rr in enumerate(step.reward_results):
+            orig_i = step.get_original_idx(i)  # Map filtered index to original batch index
             # Decode token IDs to text for readable logs
             comp_tokens = step.completions[i]
             if self.tokenizer is not None:
@@ -1705,7 +1706,7 @@ class QGRETrainer:
             completions_text.append(comp_text)
             self.completion_logger.log_completion(
                 step=self.global_step,
-                prompt=batch.raw_prompts[i] if i < len(batch.raw_prompts) else "",
+                prompt=batch.raw_prompts[orig_i] if orig_i < len(batch.raw_prompts) else "",
                 completion=comp_text,
                 reward=rr.reward,
                 reward_components=rr.scores,
@@ -2047,10 +2048,11 @@ class QGRETrainer:
         max_phase = max(self.step_qualities.keys())
 
         # Group reward results by tier
+        # Note: reward_results and batch_contexts are FILTERED (post-SPO), batch.metadata is UNFILTERED
+        # Use batch_contexts[i].tier which is already computed and aligned with filtered indices
         tier_groups = defaultdict(list)
         for i, rr in enumerate(reward_results):
-            meta = batch.metadata[i] if i < len(batch.metadata) else {}
-            tier = self._get_prompt_tier(meta)
+            tier = batch_contexts[i].tier
             tier_groups[tier].append((rr, active_qualities[i]))
 
         # Record mastery per tier, check per-tier quality phase advance

@@ -613,6 +613,15 @@ class TrainingStep:
         """
         idx_list = idx.tolist()
 
+        # Validate indices at source — catch invalid indices here, not at read sites
+        if idx_list:
+            max_idx = max(idx_list)
+            if max_idx >= len(self.samples):
+                raise IndexError(
+                    f"TrainingStep.filter() received index {max_idx} "
+                    f"but len(samples)={len(self.samples)}. SPO filter produced invalid indices."
+                )
+
         # Reindex all list fields
         new_samples = [self.samples[i] for i in idx_list]
         new_reward_results = [self.reward_results[i] for i in idx_list]
