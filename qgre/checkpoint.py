@@ -49,121 +49,129 @@ def gamestate_to_dict(gs: GameState) -> dict:
 def gamestate_from_dict(d: dict) -> GameState:
     """Reconstruct GameState from a plain dict.
 
-    Restores: list → deque (with maxlen). Handles both old 1D and new 2D format.
+    Uses schema validation to replace scattered isinstance checks with a single
+    validation pass. Restores: list → deque (with maxlen). Handles both old 1D
+    and new 2D format.
     """
-    # CP3-001: Add type checking before accessing dict methods
-    if not isinstance(d, dict):
-        raise TypeError(
-            f"CP3-001: gamestate_from_dict expects dict, got {type(d).__name__}. "
-            "Checkpoint may be corrupted."
-        )
-    gs = GameState()
-    gs.step_count = d.get("step_count", 0)
-    gs.mastery_threshold = d.get("mastery_threshold", 0.8)
-    gs.phase_history = list(d.get("phase_history", []))
-    gs.stagnation_timeout = d.get("stagnation_timeout", 200)
-    gs.plateau_window = d.get("plateau_window", 50)
-    gs.plateau_threshold = d.get("plateau_threshold", 0.02)
-    gs.quality_window_size = d.get("quality_window_size", QUALITY_WINDOW_SIZE)
+    from qgre.schema import validate_schema, GAME_STATE_SCHEMA
+    import math
 
-    # 2D tier fields
-    # CP3-007: Validate tier_phases is dict before using
-    tier_phases_raw = d.get("tier_phases", {"default": d.get("phase", 1)})
-    if not isinstance(tier_phases_raw, dict):
-        raise TypeError(
-            f"CP3-007: tier_phases expected dict, got {type(tier_phases_raw).__name__}. "
-            "Checkpoint may be corrupted."
-        )
-    # C2: Cast tier_phases values to int to prevent float corruption
+    # Schema validation: one pass, all type checks
+    validated = validate_schema(d, GAME_STATE_SCHEMA, "game_state")
+
+    gs = GameState()
+    gs.step_count = validated["step_count"]
+    gs.mastery_threshold = validated["mastery_threshold"]
+    gs.phase_history = list(validated["phase_history"])
+    gs.stagnation_timeout = validated["stagnation_timeout"]
+    gs.plateau_window = validated["plateau_window"]
+    gs.plateau_threshold = validated["plateau_threshold"]
+    gs.quality_window_size = validated["quality_window_size"]
+
+    # tier_phases with int coercion (schema validates dict, we coerce values)
+    tier_phases_raw = validated["tier_phases"] or {"default": validated.get("phase", 1)}
     gs.tier_phases = {k: int(v) for k, v in tier_phases_raw.items()}
-    gs.active_tiers = d.get("active_tiers", ["default"])
-    # C3: Cast tier_steps_at_phase_start values to int
-    tier_steps_raw = d.get("tier_steps_at_phase_start", {})
+    gs.active_tiers = validated["active_tiers"]
+    tier_steps_raw = validated["tier_steps_at_phase_start"] or {}
     gs.tier_steps_at_phase_start = {k: int(v) for k, v in tier_steps_raw.items()}
 
-    # DP-R3-01: Initialize missing tier_steps_at_phase_start entries for active_tiers
+    # Initialize missing tier_steps_at_phase_start entries for active_tiers
     for tier in gs.active_tiers:
         if tier not in gs.tier_steps_at_phase_start:
             gs.tier_steps_at_phase_start[tier] = gs.step_count
 
-    # Restore tier_mastery from serialized format
-    tm = d.get("tier_mastery", {})
-    for tier, step_windows in tm.items():
-        if tier not in gs.tier_mastery:
-            gs.tier_mastery[tier] = {}
-        for step_num, window_data in step_windows.items():
-            # CP3-001: Add isinstance check on window_data before .get()
-            if not isinstance(window_data, dict):
-                raise TypeError(
-                    f"CP3-001: window_data for tier '{tier}' step {step_num} expected dict, "
-                    f"got {type(window_data).__name__}. Checkpoint may be corrupted."
-                )
-            # C2-1: Use current quality_window_size when restoring deques
-            maxlen = gs.quality_window_size
-            values = window_data.get("values", [])
-            # CSM-006: Warn when checkpoint maxlen differs from config quality_window_size
-            ckpt_maxlen = window_data.get("maxlen")
-            if ckpt_maxlen is not None and ckpt_maxlen != maxlen:
-                import warnings
-                # CT-5: Compute data loss amount for clearer user feedback
-                values_len = len(values)
-                data_loss = max(0, values_len - maxlen) if values_len > maxlen else 0
-                warnings.warn(
-                    f"CT-5: Checkpoint maxlen={ckpt_maxlen} differs from config quality_window_size={maxlen} "
-                    f"for tier '{tier}' step {step_num}. Data loss: {data_loss} entries (keeping {min(values_len, maxlen)}/{values_len})."
-                )
-            # C2-3: Filter out NaN/Inf values when restoring
-            import math
-            filtered_values = [v for v in values if math.isfinite(v)]
-            if len(filtered_values) < len(values):
-                import warnings
-                warnings.warn(
-                    f"C2-3: Filtered {len(values) - len(filtered_values)} NaN/Inf values "
-                    f"from deque for tier '{tier}' step {step_num}"
-                )
-            # CP3-006: Wrap int() in try-except with informative error
-            try:
-                step_key = int(step_num)
-            except (ValueError, TypeError) as e:
-                raise ValueError(
-                    f"CP3-006: Cannot convert step_num '{step_num}' to int for tier '{tier}'. "
-                    f"Checkpoint may be corrupted. Error: {e}"
-                ) from e
-            gs.tier_mastery[tier][step_key] = deque(filtered_values, maxlen=maxlen)
+    # Restore tier_mastery from serialized format with NaN filtering
+    tm = validated["tier_mastery"] or {}
+    gs.tier_mastery = _restore_tier_mastery(tm, gs.quality_window_size)
 
     # Backward compat: migrate old 1D step_mastery to "default" tier
-    if "step_mastery" in d and "tier_mastery" not in d:
-        gs.tier_mastery["default"] = {}
-        step_mastery_raw = d["step_mastery"]
-        if not isinstance(step_mastery_raw, dict):
-            raise TypeError(
-                f"CP3-001: step_mastery expected dict, got {type(step_mastery_raw).__name__}. "
-                "Checkpoint may be corrupted."
-            )
-        for step_num, window_data in step_mastery_raw.items():
-            maxlen = window_data.get("maxlen", QUALITY_WINDOW_SIZE)
-            values = window_data.get("values", [])
-            # C2-3: Filter out NaN/Inf values when restoring (old format)
-            import math
-            filtered_values = [v for v in values if math.isfinite(v)]
-            if len(filtered_values) < len(values):
-                import warnings
-                warnings.warn(
-                    f"C2-3: Filtered {len(values) - len(filtered_values)} NaN/Inf values "
-                    f"from deque for old format step_mastery step {step_num}"
-                )
-            gs.tier_mastery["default"][int(step_num)] = deque(filtered_values, maxlen=maxlen)
+    step_mastery_raw = validated["step_mastery"]
+    if step_mastery_raw is not None and not tm:
+        gs.tier_mastery["default"] = _restore_step_mastery(
+            step_mastery_raw, gs.quality_window_size
+        )
 
-    # Initialize missing tier_mastery entries for active_tiers (after restoration)
-    # This handles tiers that were unlocked but have no checkpoint data yet
+    # Initialize missing tier_mastery entries for active_tiers
     for tier in gs.active_tiers:
         if tier not in gs.tier_mastery:
             gs.tier_mastery[tier] = {}
-        # Initialize tier_phases for new tiers (not in checkpoint)
         if tier not in gs.tier_phases:
             gs.tier_phases[tier] = 1
 
     return gs
+
+
+def _restore_tier_mastery(tm: dict, quality_window_size: int) -> dict:
+    """Restore tier_mastery dict with deques, filtering NaN values."""
+    import math
+
+    result = {}
+    for tier, step_windows in tm.items():
+        if not isinstance(step_windows, dict):
+            raise TypeError(
+                f"SCHEMA: tier_mastery['{tier}'] expected dict, "
+                f"got {type(step_windows).__name__}"
+            )
+        result[tier] = {}
+        for step_num, window_data in step_windows.items():
+            if not isinstance(window_data, dict):
+                raise TypeError(
+                    f"SCHEMA: tier_mastery['{tier}'][{step_num}] expected dict, "
+                    f"got {type(window_data).__name__}"
+                )
+            maxlen = quality_window_size
+            values = window_data.get("values", [])
+            ckpt_maxlen = window_data.get("maxlen")
+            if ckpt_maxlen is not None and ckpt_maxlen != maxlen:
+                values_len = len(values)
+                data_loss = max(0, values_len - maxlen) if values_len > maxlen else 0
+                warnings.warn(
+                    f"SCHEMA: Checkpoint maxlen={ckpt_maxlen} differs from config "
+                    f"quality_window_size={maxlen} for tier '{tier}' step {step_num}. "
+                    f"Data loss: {data_loss} entries."
+                )
+            # Filter NaN/Inf
+            filtered = [v for v in values if math.isfinite(v)]
+            if len(filtered) < len(values):
+                warnings.warn(
+                    f"SCHEMA: Filtered {len(values) - len(filtered)} NaN/Inf values "
+                    f"from tier_mastery['{tier}'][{step_num}]"
+                )
+            try:
+                step_key = int(step_num)
+            except (ValueError, TypeError) as e:
+                raise ValueError(
+                    f"SCHEMA: Cannot convert step_num '{step_num}' to int for tier '{tier}': {e}"
+                ) from e
+            result[tier][step_key] = deque(filtered, maxlen=maxlen)
+    return result
+
+
+def _restore_step_mastery(step_mastery: dict, quality_window_size: int) -> dict:
+    """Restore old format step_mastery to deques."""
+    import math
+
+    if not isinstance(step_mastery, dict):
+        raise TypeError(
+            f"SCHEMA: step_mastery expected dict, got {type(step_mastery).__name__}"
+        )
+    result = {}
+    for step_num, window_data in step_mastery.items():
+        if not isinstance(window_data, dict):
+            raise TypeError(
+                f"SCHEMA: step_mastery[{step_num}] expected dict, "
+                f"got {type(window_data).__name__}"
+            )
+        maxlen = window_data.get("maxlen", quality_window_size)
+        values = window_data.get("values", [])
+        filtered = [v for v in values if math.isfinite(v)]
+        if len(filtered) < len(values):
+            warnings.warn(
+                f"SCHEMA: Filtered {len(values) - len(filtered)} NaN/Inf values "
+                f"from step_mastery[{step_num}]"
+            )
+        result[int(step_num)] = deque(filtered, maxlen=maxlen)
+    return result
 
 
 def save_checkpoint(
