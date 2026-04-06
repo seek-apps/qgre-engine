@@ -37,6 +37,7 @@ from qgre.types import (
     SampleData,
     TrainerState,
     TrainingContext,
+    TrainingStep,
 )
 
 
@@ -699,13 +700,27 @@ class QGRETrainer:
         for i, c in enumerate(completions):
             comp_attention_mask[i, :len(c)] = 1
 
+        # Bundle all step-level state into TrainingStep — eliminates reindexing bugs.
+        # SPO filter becomes step.filter(idx) which atomically reindexes ALL fields.
+        step = TrainingStep(
+            samples=samples,
+            reward_results=reward_results,
+            active_qualities=active_qualities,
+            batch_regions=batch_regions,
+            batch_contexts=batch_contexts,
+            completions=completions,
+            padded_advs=padded_advs,
+            comp_tensor=comp_tensor,
+            comp_attention_mask=comp_attention_mask,
+        )
+
         # SPO low-advantage filter: skip sequences with near-zero signal (PLAN.md lines 658-671)
         # R2-MTO-005: Track original batch size separately from filtered batch size
-        original_batch_size = len(completions)
+        original_batch_size = len(step)
         if self.config.algorithm.mode == "spo":
-            useful = (padded_advs.abs() > self.config.algorithm.spo_filter_threshold).any(dim=-1)
+            useful = (step.padded_advs.abs() > self.config.algorithm.spo_filter_threshold).any(dim=-1)
             # Track filter stats for data starvation detection
-            batch_total = len(completions)
+            batch_total = len(step)
             batch_passed = useful.sum().item()
             self._spo_filter_stats["total"] += batch_total
             self._spo_filter_stats["passed"] += batch_passed
@@ -727,11 +742,11 @@ class QGRETrainer:
                     self._spo_filter_stats["warned"] = True
             if useful.sum() == 0:
                 # All advantages near-zero — skip backward pass but still record mastery + log completions
-                metrics = {"loss": 0.0, "reward/mean": sum(rr.reward for rr in reward_results) / len(reward_results),
+                metrics = {"loss": 0.0, "reward/mean": sum(rr.reward for rr in step.reward_results) / len(step),
                            "global_step": self.global_step, "phase": self.game_state.phase, "skipped": True}
-                self._record_mastery_and_advance(reward_results, active_qualities, batch, metrics, batch_contexts=batch_contexts)
+                self._record_mastery_and_advance(step.reward_results, step.active_qualities, batch, metrics, batch_contexts=step.batch_contexts)
                 # Log completions even on skipped steps
-                for i, sample in enumerate(samples):
+                for i, sample in enumerate(step.samples):
                     if self.tokenizer is not None:
                         comp_text = self.tokenizer.decode(sample.completion, skip_special_tokens=True)
                     else:
@@ -747,31 +762,23 @@ class QGRETrainer:
                 self.global_step += 1
                 self.ctx.step = self.global_step
                 return metrics
-            if useful.sum() >= 2 and useful.sum() < len(completions):
+            if useful.sum() >= 2 and useful.sum() < len(step):
                 idx = useful.nonzero(as_tuple=True)[0]
-                padded_advs = padded_advs[idx]
-                comp_tensor = comp_tensor[idx]
-                comp_attention_mask = comp_attention_mask[idx]
-                # Single reindex: samples holds all per-sample data including kl_region_weights and gen_logprobs
-                samples = [samples[i] for i in idx.tolist()]
-                # Also reindex auxiliary lists to maintain alignment
-                reward_results = [reward_results[i] for i in idx.tolist()]
-                active_qualities = [active_qualities[i] for i in idx.tolist()]
-                batch_regions = [batch_regions[i] for i in idx.tolist()]
-                batch_contexts = [batch_contexts[i] for i in idx.tolist()]
-                completions = [completions[i] for i in idx.tolist()]
-                # Track filtered → original index mapping for VPRM
-                self._spo_filter_idx = idx.tolist()
+                # ATOMIC FILTER: TrainingStep.filter() reindexes ALL fields in one call.
+                # This prevents the bug class where a field is forgotten during manual reindexing.
+                step = step.filter(idx)
+                # Track that filtering was applied (for VPRM/EGRS index mapping)
+                self._spo_filter_idx = step.filter_idx
 
         # Rebuild batch tensors from samples (after SPO filter if applied)
-        max_comp_len = comp_tensor.shape[1]
-        device = comp_tensor.device
+        max_comp_len = step.comp_tensor.shape[1]
+        device = step.comp_tensor.device
 
         # Rebuild gen_logprobs_padded from samples
-        has_gen_lp = any(s.gen_logprobs is not None for s in samples)
+        has_gen_lp = any(s.gen_logprobs is not None for s in step.samples)
         if has_gen_lp:
-            gen_logprobs_padded = torch.zeros(len(samples), max_comp_len, device=device, dtype=torch.float32)
-            for i, s in enumerate(samples):
+            gen_logprobs_padded = torch.zeros(len(step), max_comp_len, device=device, dtype=torch.float32)
+            for i, s in enumerate(step.samples):
                 if s.gen_logprobs is not None:
                     lp_len = min(len(s.gen_logprobs), max_comp_len)
                     gen_logprobs_padded[i, :lp_len] = s.gen_logprobs[:lp_len].to(device)
@@ -779,10 +786,10 @@ class QGRETrainer:
             gen_logprobs_padded = None
 
         # Rebuild kl_region_weights from samples
-        has_kl_weights = any(s.kl_region_weights is not None for s in samples)
+        has_kl_weights = any(s.kl_region_weights is not None for s in step.samples)
         if has_kl_weights:
-            kl_region_weights = torch.ones(len(samples), max_comp_len, device=device)
-            for i, s in enumerate(samples):
+            kl_region_weights = torch.ones(len(step), max_comp_len, device=device)
+            for i, s in enumerate(step.samples):
                 if s.kl_region_weights is not None:
                     kl_len = min(len(s.kl_region_weights), max_comp_len)
                     kl_region_weights[i, :kl_len] = s.kl_region_weights[:kl_len]
@@ -790,10 +797,10 @@ class QGRETrainer:
             kl_region_weights = None
 
         # Response mask
-        prompt_lengths = [0] * comp_tensor.shape[0]
-        response_mask = self.compute_response_mask(comp_tensor, prompt_lengths)[:, 1:]
+        prompt_lengths = [0] * step.comp_tensor.shape[0]
+        response_mask = self.compute_response_mask(step.comp_tensor, prompt_lengths)[:, 1:]
         # LLDS shift: Align advantages and logprobs with response mask (all skip first position)
-        padded_advs = padded_advs[:, 1:]
+        padded_advs = step.padded_advs[:, 1:]
         if gen_logprobs_padded is not None:
             gen_logprobs_padded = gen_logprobs_padded[:, 1:]
 
@@ -815,7 +822,7 @@ class QGRETrainer:
         # Micro-batch size adapts to sequence length to avoid OOM on long completions.
         # At 4096 tokens, Unsloth MLP activation = 2 × 4096 × 8960 × 2B = 140MB per seq.
         # micro_batch_size=1 for seq ≥ 2048, micro_batch_size=2 for shorter.
-        actual_batch = comp_tensor.shape[0]  # May differ from len(completions) after SPO filter
+        actual_batch = step.comp_tensor.shape[0]  # May differ after SPO filter
         micro_batch_size = 1 if max_comp_len >= self.config.training.micro_batch_seq_threshold else max(1, min(2, actual_batch))
         n_micro = (actual_batch + micro_batch_size - 1) // micro_batch_size
         total_loss = 0.0
@@ -823,8 +830,8 @@ class QGRETrainer:
 
         for mb_start in range(0, actual_batch, micro_batch_size):
             mb_end = min(mb_start + micro_batch_size, actual_batch)
-            mb_ids = comp_tensor[mb_start:mb_end]
-            mb_attn_mask = comp_attention_mask[mb_start:mb_end]
+            mb_ids = step.comp_tensor[mb_start:mb_end]
+            mb_attn_mask = step.comp_attention_mask[mb_start:mb_end]
             mb_advs = padded_advs[mb_start:mb_end]
             mb_mask = response_mask[mb_start:mb_end]
             mb_hidden_states = None  # Set by fused/non-fused path when VPRM enabled
@@ -1106,31 +1113,19 @@ class QGRETrainer:
                 # Compute VPRM advantages per-sample in this micro-batch
                 for mb_i in range(mb_end - mb_start):
                     filtered_i = mb_start + mb_i
-                    # Map filtered index → original batch index
-                    orig_i = self._spo_filter_idx[filtered_i] if self._spo_filter_idx is not None else filtered_i
-                    # TL-R2-03: Validate orig_i before access
-                    if orig_i >= len(batch_regions):
-                        logging.getLogger(__name__).warning(
-                            f"TL-R2-03: VPRM orig_i={orig_i} >= len(batch_regions)={len(batch_regions)} "
-                            f"— skipping sample (SPO filter index mapping corrupted micro-batch)"
-                        )
-                        continue
-                    # Get regions for this sample (original batch index)
-                    sample_regions = batch_regions[orig_i]
-                    # Get reward result and active qualities
-                    if orig_i >= len(reward_results):
-                        import warnings
-                        warnings.warn(
-                            f"VPRM: orig_i={orig_i} >= len(reward_results)={len(reward_results)} "
-                            f"— skipping sample"
-                        )
-                        continue
-                    sample_rr = reward_results[orig_i]
-                    sample_aq = active_qualities[orig_i] if orig_i < len(active_qualities) else []
+                    # With TrainingStep, all fields are already reindexed after filter.
+                    # Use filtered_i directly — no orig_i mapping needed for step data.
+                    # orig_i is only needed for external state (mastery, etc.)
+                    orig_i = step.get_original_idx(filtered_i)
+
+                    # Get sample data directly from step (already reindexed)
+                    sample_regions = step.batch_regions[filtered_i]
+                    sample_rr = step.reward_results[filtered_i]
+                    sample_aq = step.active_qualities[filtered_i]
                     # Get hidden states for this sample
                     sample_hs = mb_hidden_states[mb_i]  # [seq_len, hidden_dim]
                     # Trim to completion length with bounds validation
-                    comp_len = len(completions[orig_i]) if orig_i < len(completions) else sample_hs.shape[0]
+                    comp_len = len(step.completions[filtered_i])
                     if comp_len > sample_hs.shape[0]:
                         import warnings
                         warnings.warn(
@@ -1170,9 +1165,9 @@ class QGRETrainer:
                         frontier_steps=frontier_steps,
                         frontier_amplification=self.config.algorithm.frontier_amplification,
                         min_regions=self.config.vprm.spo_fallback_min_regions,
-                        # R3-MTO-005: Use filtered_i to index batch_contexts (reindexed after SPO filter)
-                        aspiration_beta=self.advantage_estimator._aspiration_beta * batch_contexts[filtered_i].aspiration_warmup if filtered_i < len(batch_contexts) else 0.0,
-                        aspiration_target=batch_contexts[filtered_i].aspiration_target if filtered_i < len(batch_contexts) else 0.8,
+                        # Use step.batch_contexts (already reindexed after filter)
+                        aspiration_beta=self.advantage_estimator._aspiration_beta * step.batch_contexts[filtered_i].aspiration_warmup,
+                        aspiration_target=step.batch_contexts[filtered_i].aspiration_target,
                         ctx=self.ctx,
                         token_masks=sample_token_masks,  # Pass span masks for span-aware critic
                         bond_strength=sample_bond_strength,  # Pass attention bond strength
@@ -1200,18 +1195,12 @@ class QGRETrainer:
                 mb_entropy_adjustments = torch.zeros_like(mb_advs)
                 for mb_i in range(mb_advs.shape[0]):
                     filtered_i = mb_start + mb_i
-                    if self._spo_filter_idx is not None:
-                        orig_i = self._spo_filter_idx[filtered_i]
-                    else:
-                        orig_i = filtered_i
-                    if orig_i >= len(batch_regions):
-                        logging.getLogger(__name__).warning(
-                            f"EGRS: orig_i={orig_i} >= len(batch_regions)={len(batch_regions)} — "
-                            "skipping sample (SPO filter index mapping corrupted)"
-                        )
-                        continue
-                    sample_regions = batch_regions[orig_i]
-                    sample_rr = reward_results[orig_i] if orig_i < len(reward_results) else None
+                    # With TrainingStep, use filtered_i for step data, orig_i for external state
+                    orig_i = step.get_original_idx(filtered_i)
+
+                    # Get sample data directly from step (already reindexed)
+                    sample_regions = step.batch_regions[filtered_i]
+                    sample_rr = step.reward_results[filtered_i]
                     if sample_rr is None:
                         logging.getLogger(__name__).warning(
                             f"EGRS: reward_results[{orig_i}] is None — sample skipped. "
@@ -1361,8 +1350,8 @@ class QGRETrainer:
             lp_coef = self.config.algorithm.length_penalty_coef
             if lp_coef > 0:
                 lp_thresh = self.config.algorithm.length_penalty_threshold
-                # R2-MTO-003: Compute group_correctness AFTER filtering, using filtered reward_results
-                mb_reward_results = reward_results[mb_start:mb_end]
+                # Compute group_correctness using step.reward_results (already reindexed after filter)
+                mb_reward_results = step.reward_results[mb_start:mb_end]
                 group_correctness = sum(rr.reward for rr in mb_reward_results) / len(mb_reward_results)
                 if group_correctness > lp_thresh:
                     # High correctness → add length penalty to encourage efficiency
@@ -1666,14 +1655,13 @@ class QGRETrainer:
                 max_lr=spo_cfg.max_lr,
             )
 
-        # Log metrics
-        reward_mean = sum(rr.reward for rr in reward_results) / len(reward_results)
+        # Log metrics (use step.X for all step-level data)
+        reward_mean = sum(rr.reward for rr in step.reward_results) / len(step)
         metrics["reward/mean"] = reward_mean
         metrics["global_step"] = self.global_step
 
-        # R3-MTO-004: Track completion lengths for verbosity drift detection (after SPO filter)
-        # completions was already reindexed by SPO filter at line ~750, so these metrics reflect filtered batch
-        comp_lengths = [len(c) for c in completions]
+        # Track completion lengths for verbosity drift detection (uses filtered step data)
+        comp_lengths = [len(c) for c in step.completions]
         if comp_lengths:
             metrics["completion_length/mean"] = float(sum(comp_lengths) / len(comp_lengths))
             metrics["completion_length/max"] = float(max(comp_lengths))
@@ -1683,13 +1671,13 @@ class QGRETrainer:
             metrics["completion_length/max"] = 0.0
             metrics["completion_length/min"] = 0.0
 
-        self._record_mastery_and_advance(reward_results, active_qualities, batch, metrics, batch_contexts=batch_contexts)
+        self._record_mastery_and_advance(step.reward_results, step.active_qualities, batch, metrics, batch_contexts=step.batch_contexts)
 
         # Log completions
         completions_text = []
-        for i, rr in enumerate(reward_results):
+        for i, rr in enumerate(step.reward_results):
             # Decode token IDs to text for readable logs
-            comp_tokens = completions[i]
+            comp_tokens = step.completions[i]
             if self.tokenizer is not None:
                 comp_text = self.tokenizer.decode(comp_tokens, skip_special_tokens=True)
             else:

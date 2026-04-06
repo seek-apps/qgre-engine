@@ -8,6 +8,7 @@ import warnings
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import ClassVar
 
 import torch
 
@@ -170,7 +171,15 @@ class CheckpointState:
     The single source of truth for checkpoint serialization.
     Provides validation on construction and forward compatibility
     for schema evolution.
+
+    STATE REGISTRY PATTERN:
+    To add a new optional checkpoint field:
+    1. Add the field to this dataclass with default None
+    2. Add the field name to OPTIONAL_FIELDS below
+    That's it — from_dict will automatically handle serialization/deserialization.
+    This prevents the bug class where new fields are saved but not restored.
     """
+
     # Component states (required)
     trainer: TrainerState
     dataloader: DataLoaderState
@@ -190,6 +199,19 @@ class CheckpointState:
     training_context: dict | None = None
     # Schema version for migration
     schema_version: int = CHECKPOINT_SCHEMA_VERSION
+
+    # Registry of optional fields — from_dict iterates over this instead of hardcoding.
+    # Adding a field here ensures it's restored on checkpoint load.
+    # Use ClassVar so it's not a dataclass field.
+    OPTIONAL_FIELDS: ClassVar[tuple[str, ...]] = (
+        "model_state_dict",
+        "optimizer_state_dict",
+        "scheduler_state_dict",
+        "vprm_critic_state",
+        "vprm_optimizer_state",
+        "hint_registry_state",
+        "training_context",
+    )
 
     def __post_init__(self):
         """Validate field presence, types, and schema compatibility.
@@ -243,13 +265,8 @@ class CheckpointState:
                 f"got {type(self.vprm_optimizer_state).__name__}"
             )
 
-        # Validate optional dict fields
-        optional_dict_fields = [
-            "model_state_dict", "optimizer_state_dict", "scheduler_state_dict",
-            "vprm_critic_state", "vprm_optimizer_state", "hint_registry_state",
-            "training_context"
-        ]
-        for field_name in optional_dict_fields:
+        # Validate optional dict fields using registry
+        for field_name in self.OPTIONAL_FIELDS:
             value = getattr(self, field_name, None)
             if value is not None and not isinstance(value, dict):
                 raise TypeError(
@@ -257,19 +274,17 @@ class CheckpointState:
                     f"got {type(value).__name__}"
                 )
 
-        # Check for extra fields (forward compatibility warning)
-        expected_fields = {
-            "trainer", "dataloader", "advantage_estimator", "weight_loader",
-            "game_state", "model_state_dict", "optimizer_state_dict",
-            "scheduler_state_dict", "vprm_critic_state", "vprm_optimizer_state",
-            "hint_registry_state", "training_context", "schema_version"
-        }
-        actual_fields = set(self.__dict__.keys())
-        extra_fields = actual_fields - expected_fields
-        if extra_fields:
-            logger.warning(
-                f"CheckpointState contains unexpected fields (forward compatibility): "
-                f"{sorted(extra_fields)}"
+        # STATE REGISTRY VALIDATION: Ensure OPTIONAL_FIELDS is complete
+        # This catches the bug where a field is added to the dataclass but not to OPTIONAL_FIELDS
+        required_fields_set = {"trainer", "dataloader", "advantage_estimator", "weight_loader", "game_state"}
+        expected_fields = required_fields_set | set(self.OPTIONAL_FIELDS) | {"schema_version"}
+        actual_fields = {f.name for f in self.__dataclass_fields__.values() if f.name != "OPTIONAL_FIELDS"}
+        missing_from_registry = actual_fields - expected_fields
+        if missing_from_registry:
+            raise RuntimeError(
+                f"STATE REGISTRY ERROR: Fields {sorted(missing_from_registry)} exist in CheckpointState "
+                f"but are not in OPTIONAL_FIELDS. Add them to OPTIONAL_FIELDS to ensure "
+                f"they are restored on checkpoint load."
             )
 
         # Validate schema version
@@ -425,20 +440,17 @@ class CheckpointState:
             else:
                 game_state = game_state_raw
 
+        # Build optional fields from registry — no hardcoding field names
+        optional_kwargs = {field: d.get(field) for field in cls.OPTIONAL_FIELDS}
+
         return cls(
             trainer=trainer,
             dataloader=dataloader,
             advantage_estimator=advantage_estimator,
             weight_loader=weight_loader,
             game_state=game_state,
-            model_state_dict=d.get("model_state_dict"),
-            optimizer_state_dict=d.get("optimizer_state_dict"),
-            scheduler_state_dict=d.get("scheduler_state_dict"),
-            vprm_critic_state=d.get("vprm_critic_state"),
-            vprm_optimizer_state=d.get("vprm_optimizer_state"),
-            training_context=d.get("training_context"),
-            hint_registry_state=d.get("hint_registry_state"),
             schema_version=d.get("schema_version", CHECKPOINT_SCHEMA_VERSION),
+            **optional_kwargs,
         )
 
 
@@ -514,6 +526,130 @@ class SampleData:
     token_masks: dict[str, torch.Tensor] | None = None
     kl_region_weights: torch.Tensor | None = None
     gen_logprobs: torch.Tensor | None = None
+
+
+@dataclass
+class TrainingStep:
+    """Step-level data bundle — eliminates cross-list reindexing bugs.
+
+    All mutable step state is stored in a single object. SPO filter reindexing
+    becomes `step.filter(idx)` which atomically reindexes ALL fields.
+
+    This is the step-level analog of SampleData. SampleData bundles per-sample
+    fields; TrainingStep bundles the lists/tensors that span samples.
+
+    Invariant: All list fields have the same length (batch_size).
+    Invariant: All tensor fields have batch dimension matching list lengths.
+    """
+
+    # List-based state (indexed by sample)
+    samples: list[SampleData]
+    reward_results: list  # list[RewardResult] - avoiding circular import
+    active_qualities: list[list[str]]
+    batch_regions: list[list[str] | None]
+    batch_contexts: list  # list[PromptContext] - avoiding circular import
+    completions: list[list[int]]
+
+    # Tensor state (batch dimension matches list length)
+    padded_advs: torch.Tensor
+    comp_tensor: torch.Tensor
+    comp_attention_mask: torch.Tensor
+    gen_logprobs_padded: torch.Tensor | None = None
+    kl_region_weights: torch.Tensor | None = None
+
+    # Filter tracking
+    filter_idx: list[int] | None = None  # Maps filtered → original indices
+
+    def __post_init__(self) -> None:
+        """Validate all lists have same length and tensors match."""
+        list_lens = [
+            len(self.samples),
+            len(self.reward_results),
+            len(self.active_qualities),
+            len(self.batch_regions),
+            len(self.batch_contexts),
+            len(self.completions),
+        ]
+        if len(set(list_lens)) != 1:
+            raise ValueError(
+                f"TrainingStep list length mismatch: samples={len(self.samples)}, "
+                f"reward_results={len(self.reward_results)}, "
+                f"active_qualities={len(self.active_qualities)}, "
+                f"batch_regions={len(self.batch_regions)}, "
+                f"batch_contexts={len(self.batch_contexts)}, "
+                f"completions={len(self.completions)}"
+            )
+        batch_size = list_lens[0]
+        if self.padded_advs.shape[0] != batch_size:
+            raise ValueError(
+                f"TrainingStep tensor mismatch: padded_advs batch={self.padded_advs.shape[0]} "
+                f"vs list batch={batch_size}"
+            )
+
+    def __len__(self) -> int:
+        """Return batch size."""
+        return len(self.samples)
+
+    def filter(self, idx: torch.Tensor) -> "TrainingStep":
+        """Atomically reindex ALL fields by idx. Returns new TrainingStep.
+
+        Args:
+            idx: 1D tensor of indices to keep (e.g., from SPO filter)
+
+        Returns:
+            New TrainingStep with all fields reindexed
+
+        This is the key method that prevents reindexing bugs — there is no way
+        to forget a field because ALL fields are filtered in one place.
+        """
+        idx_list = idx.tolist()
+
+        # Reindex all list fields
+        new_samples = [self.samples[i] for i in idx_list]
+        new_reward_results = [self.reward_results[i] for i in idx_list]
+        new_active_qualities = [self.active_qualities[i] for i in idx_list]
+        new_batch_regions = [self.batch_regions[i] for i in idx_list]
+        new_batch_contexts = [self.batch_contexts[i] for i in idx_list]
+        new_completions = [self.completions[i] for i in idx_list]
+
+        # Reindex all tensor fields
+        new_padded_advs = self.padded_advs[idx]
+        new_comp_tensor = self.comp_tensor[idx]
+        new_comp_attention_mask = self.comp_attention_mask[idx]
+        new_gen_logprobs = self.gen_logprobs_padded[idx] if self.gen_logprobs_padded is not None else None
+        new_kl_weights = self.kl_region_weights[idx] if self.kl_region_weights is not None else None
+
+        # Track original indices for downstream mapping (VPRM, EGRS)
+        if self.filter_idx is not None:
+            # Compose filters: new_filter[i] = old_filter[idx[i]]
+            new_filter_idx = [self.filter_idx[i] for i in idx_list]
+        else:
+            new_filter_idx = idx_list
+
+        return TrainingStep(
+            samples=new_samples,
+            reward_results=new_reward_results,
+            active_qualities=new_active_qualities,
+            batch_regions=new_batch_regions,
+            batch_contexts=new_batch_contexts,
+            completions=new_completions,
+            padded_advs=new_padded_advs,
+            comp_tensor=new_comp_tensor,
+            comp_attention_mask=new_comp_attention_mask,
+            gen_logprobs_padded=new_gen_logprobs,
+            kl_region_weights=new_kl_weights,
+            filter_idx=new_filter_idx,
+        )
+
+    def get_original_idx(self, filtered_idx: int) -> int:
+        """Map filtered batch index to original batch index.
+
+        Used by VPRM and EGRS which need to access per-prompt state
+        (mastery, baselines) using the original prompt index.
+        """
+        if self.filter_idx is not None:
+            return self.filter_idx[filtered_idx]
+        return filtered_idx
 
 
 @dataclass
