@@ -109,20 +109,33 @@ class WeightLoader:
                 "Engine must be initialized before weight sync. Check generation_backend setup."
             )
 
-        # W3: Validate all modules exist before any copy (atomic sync)
+        # W15: Validate all modules exist AND shapes/dtypes match before any copy (atomic sync)
         expected = list(weights.keys())
         for name in expected:
+            tensor = weights[name]
             if name == "lm_head":
                 if not hasattr(vllm_model, "lm_head"):
                     raise RuntimeError(
-                        f"W3: modules_to_save sync validation: lm_head not found in vLLM model. "
+                        f"W15: modules_to_save sync validation: lm_head not found in vLLM model. "
                         f"Cannot sync {expected}. Check vLLM model structure."
+                    )
+                target = vllm_model.lm_head.weight
+                if tensor.shape != target.shape:
+                    raise RuntimeError(
+                        f"W15: Shape mismatch in lm_head (validation): training={tensor.shape} vs vLLM={target.shape}. "
+                        "Aborting before any copy."
                     )
             elif name == "embed_tokens":
                 if not hasattr(vllm_model, "model") or not hasattr(vllm_model.model, "embed_tokens"):
                     raise RuntimeError(
-                        f"W3: modules_to_save sync validation: embed_tokens not found in vLLM model. "
+                        f"W15: modules_to_save sync validation: embed_tokens not found in vLLM model. "
                         f"Cannot sync {expected}. Check vLLM model structure."
+                    )
+                target = vllm_model.model.embed_tokens.weight
+                if tensor.shape != target.shape:
+                    raise RuntimeError(
+                        f"W15: Shape mismatch in embed_tokens (validation): training={tensor.shape} vs vLLM={target.shape}. "
+                        "Aborting before any copy."
                     )
 
         synced = []
@@ -154,12 +167,13 @@ class WeightLoader:
                         raise RuntimeError(
                             f"Shape mismatch syncing lm_head: training={tensor.shape} vs vLLM={target.shape}"
                         )
-                    # WS-R3-08: Check dtype match before copy, raise if mismatch (no conversion)
+                    # WS-R3-08: Check dtype match before copy, convert if mismatch
                     if tensor.dtype != target.dtype:
-                        raise RuntimeError(
-                            f"lm_head dtype mismatch: training={tensor.dtype} vs vLLM={target.dtype}. "
-                            "Precision loss on copy. User must explicitly allow dtype conversion if needed."
+                        warnings.warn(
+                            f"W12: lm_head dtype mismatch: training={tensor.dtype} vs vLLM={target.dtype}. "
+                            f"Converting to target dtype {target.dtype}."
                         )
+                        tensor = tensor.to(dtype=target.dtype)
                     target.data.copy_(tensor.to(device=target.device))
                     synced.append(name)
                 elif name == "embed_tokens":
@@ -174,12 +188,13 @@ class WeightLoader:
                         raise RuntimeError(
                             f"Shape mismatch syncing embed_tokens: training={tensor.shape} vs vLLM={target.shape}"
                         )
-                    # WS-R3-08: Check dtype match before copy, raise if mismatch (no conversion)
+                    # WS-R3-08: Check dtype match before copy, convert if mismatch
                     if tensor.dtype != target.dtype:
-                        raise RuntimeError(
-                            f"embed_tokens dtype mismatch: training={tensor.dtype} vs vLLM={target.dtype}. "
-                            "Precision loss on copy. User must explicitly allow dtype conversion if needed."
+                        warnings.warn(
+                            f"W12: embed_tokens dtype mismatch: training={tensor.dtype} vs vLLM={target.dtype}. "
+                            f"Converting to target dtype {target.dtype}."
                         )
+                        tensor = tensor.to(dtype=target.dtype)
                     target.data.copy_(tensor.to(device=target.device))
                     synced.append(name)
         except Exception as e:
@@ -315,11 +330,12 @@ class WeightLoader:
                 )
                 self._kv_scheduler_warned = True
         except Exception as e:
-            # W4: Raise error instead of warning when flush fails
-            raise RuntimeError(
-                f"W4: KV cache scheduler flush failed: {e}. Stale cache may cause hallucinations. "
+            # W13: Re-raise after warning when flush fails
+            warnings.warn(
+                f"W13: KV cache scheduler flush failed: {e}. Stale cache may cause hallucinations. "
                 "Check vLLM scheduler state."
-            ) from e
+            )
+            raise
 
         # Zero GPU cache tensors directly — pre-check each attribute in chain
         model_executor = getattr(llm_engine, "model_executor", None)
@@ -369,6 +385,8 @@ class WeightLoader:
         self._lora_request = None
         # WS-R3-03: Reset load_lora tracking on state reset
         self._load_lora_called = False
+        # W14: Signal WeightBus to reset _initialized flag
+        # (caller must handle this by setting weight_bus._initialized = False)
 
     def cleanup_adapter_tempdir(self):
         """Explicitly clean up adapter tempdir. Call at trainer shutdown."""

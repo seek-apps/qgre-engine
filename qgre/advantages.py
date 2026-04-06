@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import warnings
 from collections import defaultdict
 from typing import Callable
@@ -1152,7 +1153,15 @@ class QGREStepAdvantageEstimator:
         for pid, qualities in state.get("V", {}).items():
             for key, val in qualities.items():
                 # Preserve original key type (int or str)
-                self.V[int(pid)][key] = float(val)
+                # Check for NaN and warn/skip
+                val_float = float(val)
+                if math.isnan(val_float):
+                    import warnings
+                    warnings.warn(
+                        f"NaN detected in advantage baseline V[{pid}][{key}]. Skipping entry."
+                    )
+                    continue
+                self.V[int(pid)][key] = val_float
 
         self.V_last_seen = defaultdict(lambda: defaultdict(int))
         for pid, qualities in state.get("V_last_seen", {}).items():

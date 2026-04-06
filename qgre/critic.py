@@ -335,7 +335,7 @@ class VPRMCritic(nn.Module):
             total_loss = torch.stack(all_losses).mean()
         else:
             # C01-DEVICE: Use ctx.device for tensor creation
-            total_loss = torch.tensor(0.0, device=ctx.device)
+            total_loss = torch.tensor(0.0, device=ctx.device, requires_grad=True)
 
         return batch_advantages, total_loss
 
@@ -478,7 +478,7 @@ class VPRMCritic(nn.Module):
         if all_losses:
             total_loss = torch.stack(all_losses).mean()
         else:
-            total_loss = torch.tensor(0.0, device=ctx.device)
+            total_loss = torch.tensor(0.0, device=ctx.device, requires_grad=True)
 
         return batch_advantages, total_loss
 

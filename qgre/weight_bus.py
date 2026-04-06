@@ -84,9 +84,9 @@ class WeightBus:
                 # WS-R3-04: Only mark sync_executed if dropout wasn't active
                 sync_executed = not dropout_active
 
-            # WS-R3-04: Only set initialized=True if sync actually ran
-            if sync_executed:
-                self._initialized = True
+            # W16: Always set initialized=True after first sync attempt, even if dropout active
+            # (prevents re-registration on every sync when dropout is active on step 0)
+            self._initialized = True
         except Exception as e:
             # Don't set initialized=True on failure — next sync will retry first_call path
             raise RuntimeError(f"Weight sync failed: {e}") from e

@@ -77,7 +77,9 @@ def gamestate_from_dict(d: dict) -> GameState:
     # C2: Cast tier_phases values to int to prevent float corruption
     gs.tier_phases = {k: int(v) for k, v in tier_phases_raw.items()}
     gs.active_tiers = d.get("active_tiers", ["default"])
-    gs.tier_steps_at_phase_start = d.get("tier_steps_at_phase_start", {})
+    # C3: Cast tier_steps_at_phase_start values to int
+    tier_steps_raw = d.get("tier_steps_at_phase_start", {})
+    gs.tier_steps_at_phase_start = {k: int(v) for k, v in tier_steps_raw.items()}
 
     # DP-R3-01: Initialize missing tier_steps_at_phase_start entries for active_tiers
     for tier in gs.active_tiers:
@@ -132,16 +134,34 @@ def gamestate_from_dict(d: dict) -> GameState:
     # Backward compat: migrate old 1D step_mastery to "default" tier
     if "step_mastery" in d and "tier_mastery" not in d:
         gs.tier_mastery["default"] = {}
-        for step_num, window_data in d["step_mastery"].items():
+        step_mastery_raw = d["step_mastery"]
+        if not isinstance(step_mastery_raw, dict):
+            raise TypeError(
+                f"CP3-001: step_mastery expected dict, got {type(step_mastery_raw).__name__}. "
+                "Checkpoint may be corrupted."
+            )
+        for step_num, window_data in step_mastery_raw.items():
             maxlen = window_data.get("maxlen", QUALITY_WINDOW_SIZE)
             values = window_data.get("values", [])
-            gs.tier_mastery["default"][int(step_num)] = deque(values, maxlen=maxlen)
+            # C2-3: Filter out NaN/Inf values when restoring (old format)
+            import math
+            filtered_values = [v for v in values if math.isfinite(v)]
+            if len(filtered_values) < len(values):
+                import warnings
+                warnings.warn(
+                    f"C2-3: Filtered {len(values) - len(filtered_values)} NaN/Inf values "
+                    f"from deque for old format step_mastery step {step_num}"
+                )
+            gs.tier_mastery["default"][int(step_num)] = deque(filtered_values, maxlen=maxlen)
 
     # Initialize missing tier_mastery entries for active_tiers (after restoration)
     # This handles tiers that were unlocked but have no checkpoint data yet
     for tier in gs.active_tiers:
         if tier not in gs.tier_mastery:
             gs.tier_mastery[tier] = {}
+        # Initialize tier_phases for new tiers (not in checkpoint)
+        if tier not in gs.tier_phases:
+            gs.tier_phases[tier] = 1
 
     return gs
 
@@ -166,6 +186,7 @@ def save_checkpoint(
     hint_registry_state: dict | None = None,
     # New: accept TrainerState directly (preferred)
     trainer_state: TrainerState | None = None,
+    weight_loader_state: WeightLoaderState | None = None,
 ):
     """Save full training state to a checkpoint file.
 
@@ -205,8 +226,8 @@ def save_checkpoint(
     # Build AdvantageEstimatorState — wraps the full state_dict
     advantage_estimator = AdvantageEstimatorState(state_dict=advantage_estimator_state)
 
-    # Build WeightLoaderState (VPRM states go here)
-    weight_loader = WeightLoaderState(
+    # Build WeightLoaderState — use provided state if available, otherwise default
+    weight_loader = weight_loader_state if weight_loader_state is not None else WeightLoaderState(
         load_lora_called=False,
         initialized=False,
         cleaned_up=False,
@@ -342,7 +363,8 @@ def load_checkpoint(path: str | Path) -> CheckpointState:
         # Catch checkpoint-specific errors only — let system errors (MemoryError,
         # KeyboardInterrupt, SystemExit, ImportError) propagate
         warnings.warn(
-            f"Failed to load checkpoint from {path}: {e}. "
+            f"CHECKPOINT CORRUPTION DETECTED: Failed to load checkpoint from {path}: {e}. "
+            "Falling back to previous checkpoint. This may result in data loss (lost training progress). "
             "Attempting to load previous checkpoint..."
         )
         # Try to find previous checkpoint
@@ -361,7 +383,10 @@ def load_checkpoint(path: str | Path) -> CheckpointState:
                         candidates.append((int(m.group(1)), entry))
             if candidates:
                 prev_path = max(candidates, key=lambda x: x[0])[1]
-                warnings.warn(f"Loading previous checkpoint: {prev_path}")
+                warnings.warn(
+                    f"FALLBACK CHECKPOINT LOADED: {prev_path}. "
+                    f"Original checkpoint {path} was corrupted. Training progress may be lost."
+                )
                 raw_checkpoint = torch.load(prev_path, map_location="cpu", weights_only=False)
 
                 # C06-SCHEMA: Handle missing schema_version (old format)

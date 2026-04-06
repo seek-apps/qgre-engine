@@ -187,6 +187,13 @@ class QGREDataLoader:
         Args:
             priorities: dict mapping prompt_id → priority weight (higher = sample more)
         """
+        import math
+        for prompt_id, weight in priorities.items():
+            if not math.isfinite(weight) or weight < 0:
+                raise ValueError(
+                    f"Invalid priority weight for prompt_id {prompt_id}: {weight}. "
+                    "Weights must be non-negative and finite."
+                )
         self._priorities = priorities
 
     def set_difficulty_gate(self, allowed_difficulties: set[str], difficulty_column: str = "difficulty"):
@@ -218,6 +225,8 @@ class QGREDataLoader:
                 "DP3-003: metadata_columns is empty but difficulty_column is set. "
                 "Difficulty gating will not work. Add difficulty_column to metadata_columns."
             )
+            # Prevent gate from being set if metadata_columns is empty
+            return
         self._difficulty_gate = (allowed_difficulties, difficulty_column)
 
     def _shuffle(self, epoch: int) -> list[dict[str, Any]]:
@@ -233,7 +242,7 @@ class QGREDataLoader:
         )
 
         # Apply difficulty gate: zero out prompts above the current phase
-        if hasattr(self, "_difficulty_gate") and self._difficulty_gate is not None:
+        if self._difficulty_gate is not None:
             allowed, col = self._difficulty_gate
             filtered_count = 0
             none_count = 0

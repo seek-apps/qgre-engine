@@ -81,6 +81,11 @@ def compute_bond_strength(
 
     # Handle edge case: seq_len exceeds full_seq
     if seq_len > full_seq:
+        import warnings
+        warnings.warn(
+            f"Bond strength validation: seq_len={seq_len} > full_seq={full_seq}. "
+            f"Attention shape may be malformed. Clamping to full_seq."
+        )
         seq_len = full_seq
 
     # Initialize bond strength tensor
@@ -340,17 +345,9 @@ def apply_importance_constraint(
     # Compute dampening factor
     dampening = 1.0 + strength * importance
 
-    # Gate by advantage sign: only dampen positive advantages
-    # For negative advantages (needs correction), use no dampening
-    positive_mask = (raw_advantage >= 0).float()
-
-    # Positive: divide by dampening (protect good anchors)
-    # Negative: keep as-is (full correction signal)
-    constrained = torch.where(
-        raw_advantage >= 0,
-        raw_advantage / dampening,
-        raw_advantage,  # No dampening for negative advantages
-    )
+    # Gate by advantage sign: apply dampening to both positive and negative
+    # but symmetrically (same dampening factor for both directions)
+    constrained = raw_advantage / dampening
 
     return constrained
 
@@ -401,7 +398,13 @@ def compute_normalized_entropy(
     max_entropy = max(math.log(vocab_size), 1e-8)
     normalized = entropy / max_entropy
 
-    # A-7: Replace NaN values with 0.5 (neutral entropy) before return
+    # A-7: Warn when NaN detected, then replace with 0.5 (neutral entropy)
+    if torch.isnan(normalized).any():
+        import warnings
+        warnings.warn(
+            f"NaN detected in normalized entropy ({torch.isnan(normalized).sum().item()} values). "
+            "Replacing with 0.5 (neutral). Check for malformed logits or extreme values."
+        )
     normalized = torch.where(torch.isnan(normalized), torch.tensor(0.5, device=normalized.device, dtype=normalized.dtype), normalized)
 
     return normalized.clamp(0.0, 1.0)

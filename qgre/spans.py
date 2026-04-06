@@ -128,6 +128,13 @@ def build_char_to_token_map(
             "High gap percentage may indicate tokenizer decode mismatch."
         )
 
+    # Check if all tokens decode to -1 (complete mapping failure)
+    if gap_count == full_len:
+        warnings.warn(
+            f"CRITICAL: All {full_len} characters map to -1. Complete token mapping failure. "
+            "Entire batch will lose advantage signal. Check tokenizer decode behavior."
+        )
+
     # Fill any remaining gaps with nearest valid token
     last_valid = -1
     for c in range(full_len):

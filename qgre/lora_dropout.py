@@ -71,16 +71,17 @@ def apply_lora_dropout(model: nn.Module, dropout_rate: float) -> Callable[[], No
             )
     except Exception as e:
         # W6/W7: Exception during dropout — restore saved weights before re-raising
-        for param, original in saved:
-            param.data.copy_(original)
-        saved.clear()
-        apply_lora_dropout._dropout_active = False
+        try:
+            for param, original in saved:
+                param.data.copy_(original)
+            saved.clear()
+        finally:
+            apply_lora_dropout._dropout_active = False
         raise RuntimeError(
             f"W7: LoRA dropout application failed: {e}. Weights restored to original state."
         ) from e
 
     def restore():
-        # WS3-007: Clear flag in finally block
         try:
             for param, original in saved:
                 param.data.copy_(original)
@@ -97,7 +98,7 @@ def apply_lora_dropout(model: nn.Module, dropout_rate: float) -> Callable[[], No
                 "Training cannot continue safely — restart from checkpoint."
             ) from e
         finally:
-            # WS3-007: Always clear dropout state flag
+            # WS3-007: Always clear dropout state flag (after restoration)
             apply_lora_dropout._dropout_active = False
 
     return restore

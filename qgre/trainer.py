@@ -1092,7 +1092,7 @@ class QGRETrainer:
                 mb_old_lp = mb_lp.detach()
 
             # VPRM critic: replace SPO advantages with critic-based advantages
-            mb_critic_loss = torch.tensor(0.0, device=device)
+            mb_critic_loss = torch.tensor(0.0, device=device, requires_grad=True)
             mb_critic_count = 0
             if self.config.vprm.enabled and mb_hidden_states is not None:
                 from qgre.advantages import compute_advantages_vprm
@@ -1265,11 +1265,13 @@ class QGRETrainer:
                                     hint_tokens = self.tokenizer.encode(
                                         hint_text, add_special_tokens=False
                                     )[:self.config.egrs.hint_token_count * 10]  # Allow more tokens for math
-                            self.hint_registry.flag_for_hint(
-                                prompt_id, span_id, hint_tokens,
-                                current_mastery=self.game_state.get_skill_mastery(f"prompt_{prompt_id}") if hasattr(self.game_state, 'get_skill_mastery') else 0.0,
-                                current_step=self.global_step,
-                            )
+                            # Skip flagging if hint_tokens is empty
+                            if hint_tokens:
+                                self.hint_registry.flag_for_hint(
+                                    prompt_id, span_id, hint_tokens,
+                                    current_mastery=0.0,
+                                    current_step=self.global_step,
+                                )
 
             # Align advantages + KL weights with logprob positions:
             # mb_lp[t] = log P(token t+1 | tokens 0..t), so it needs advantage[t+1]
@@ -1408,8 +1410,9 @@ class QGRETrainer:
                 egrs_mask = mb_mask[:, :adj_min_len].float()
                 egrs_adj = adj_shifted[:, :adj_min_len]
                 egrs_ent = ent_shifted[:, :adj_min_len]
-                # Sum over tokens with positive adjustment (Q3 only)
-                egrs_loss = -(egrs_adj * egrs_ent * egrs_mask).sum()
+                # Sum over tokens with positive adjustment (Q3 only), normalized by token count
+                egrs_token_count = egrs_mask.sum().clamp(min=1.0)
+                egrs_loss = -(egrs_adj * egrs_ent * egrs_mask).sum() / egrs_token_count
                 if egrs_loss.abs() > 0:
                     mb_loss = mb_loss + egrs_loss
                     mb_metrics["egrs_entropy_loss"] = egrs_loss.item()
@@ -1446,6 +1449,9 @@ class QGRETrainer:
                     "Zeroing gradients to prevent gradient corruption."
                 )
                 self.optimizer.zero_grad()
+                # Clear accumulated loss from successful micro-batches to prevent corrupt update
+                self._accumulated_loss = 0.0
+                self._accumulation_count = 0
                 raise
             # TL-3: Only add to total_loss AFTER successful backward
             total_loss += mb_loss.item() / n_micro
@@ -1991,6 +1997,15 @@ class QGRETrainer:
 
         # Restore fused_validated from checkpoint — same weights, same validation status
         self._fused_validated = checkpoint.trainer.fused_validated
+
+        # W11: Restore WeightLoaderState to backend.weight_loader
+        if checkpoint.weight_loader and hasattr(self, 'backend') and hasattr(self.backend, 'weight_loader'):
+            wl_state = checkpoint.weight_loader
+            self.backend.weight_loader._direct_ready = wl_state.initialized
+            self.backend.weight_loader._load_lora_called = wl_state.load_lora_called
+            # Don't restore cleaned_up=True (would prevent future use)
+            if not wl_state.cleaned_up:
+                self.backend.weight_loader._cleaned_up = False
 
         # Zero gradients AFTER resume to avoid clearing loaded optimizer state
         if self.optimizer is not None:
