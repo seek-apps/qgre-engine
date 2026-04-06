@@ -439,6 +439,8 @@ class QGREStepAdvantageEstimator:
         self._divergence_window: dict[int, dict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
         self._divergence_threshold = 0.3  # Absolute divergence threshold (0.85→0.2 = 0.65)
         self._divergence_window_size = 3  # Consecutive observations before reset
+        self._divergence_cleanup_interval = 100  # Steps between cleanup
+        self._divergence_last_cleanup = 0
 
         # step_region_map: virtual steps (no segmenter region) → region step whose tokens carry their advantage
         # e.g., {7: 2} means step 7's advantage is added to STEP_2 tokens
@@ -505,6 +507,22 @@ class QGREStepAdvantageEstimator:
     def set_current_step(self, step: int) -> None:
         """Called by trainer at start of each step."""
         self._current_step = step
+        # Periodic cleanup of stale divergence_window entries
+        if step - self._divergence_last_cleanup >= self._divergence_cleanup_interval:
+            self._cleanup_divergence_window()
+            self._divergence_last_cleanup = step
+
+    def _cleanup_divergence_window(self) -> None:
+        """Remove stale entries from divergence_window to prevent memory leak."""
+        stale_pids = []
+        for pid, steps in self._divergence_window.items():
+            # Remove prompt if it hasn't been seen in staleness_window steps
+            if pid not in self.V or not self.V[pid]:
+                stale_pids.append(pid)
+        for pid in stale_pids:
+            del self._divergence_window[pid]
+        if stale_pids:
+            _logger.info(f"Cleaned {len(stale_pids)} stale prompts from divergence_window")
 
     def compute_advantages(
         self,
@@ -881,6 +899,7 @@ class QGREStepAdvantageEstimator:
             "lr": self.lr,
             "mode": self.mode,
             "current_step": self._current_step,
+            "divergence_last_cleanup": self._divergence_last_cleanup,
         }
 
     def compute_advantages_with_spans(
@@ -1092,6 +1111,8 @@ class QGREStepAdvantageEstimator:
         self.lr = state.get("lr", self.lr)
         self.mode = state.get("mode", self.mode)
         self._current_step = state.get("current_step", 0)
+        # Restore cleanup tracking
+        self._divergence_last_cleanup = state.get("divergence_last_cleanup", 0)
 
         # Per-quality baselines — preserve original key type (int for legacy step-based,
         # string for new per-quality span-based). torch.save/load preserves Python types.

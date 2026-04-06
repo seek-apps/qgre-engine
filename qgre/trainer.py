@@ -1648,8 +1648,10 @@ class QGRETrainer:
             self._accumulated_samples = 0
         else:
             # Track accumulated loss even for non-optimizer steps
-            actual_samples = self._accumulated_samples if self._accumulated_samples > 0 else 1
-            metrics["accumulated_loss"] = self._accumulated_loss / actual_samples
+            # Only log if we have accumulated samples (avoid fake 0.0 at accumulation boundaries)
+            if self._accumulated_samples > 0:
+                actual_samples = self._accumulated_samples
+                metrics["accumulated_loss"] = self._accumulated_loss / actual_samples
 
         # KL-adaptive SPO learning rate (SPO paper Algorithm 1)
         spo_cfg = self.config.algorithm.spo
@@ -1936,14 +1938,23 @@ class QGRETrainer:
             torch.cuda.set_rng_state(checkpoint.trainer.cuda_rng_state)
 
         # TRN-R2-1: Restore accumulated loss from TrainerState
-        self._accumulated_loss = checkpoint.trainer.accumulated_loss
-        # TL-R3-04: Restore _accumulated_samples for accurate averaging
-        self._accumulated_samples = checkpoint.trainer.accumulated_samples
+        # Reset partial accumulation to avoid mixing batch sizes
+        if checkpoint.trainer.accumulation_count > 0 and checkpoint.trainer.accumulation_count < self.config.training.gradient_accumulation_steps:
+            logging.getLogger(__name__).warning(
+                f"Checkpoint saved mid-accumulation (count={checkpoint.trainer.accumulation_count}). "
+                "Resetting accumulated loss to avoid batch size inconsistency."
+            )
+            self._accumulated_loss = 0.0
+            self._accumulated_samples = 0
+            self._accumulation_count = 0
+        else:
+            self._accumulated_loss = checkpoint.trainer.accumulated_loss
+            self._accumulated_samples = checkpoint.trainer.accumulated_samples
+            self._accumulation_count = checkpoint.trainer.accumulation_count
         # DI1: Store dataloader state for restore in train() when dataloader is available
         # CheckpointState: dataloader is now DataLoaderState dataclass
         from dataclasses import asdict
         self._pending_dataloader_state = asdict(checkpoint.dataloader) if checkpoint.dataloader else None
-        self._accumulation_count = checkpoint.trainer.accumulation_count
 
         # Restore training context (device, dtype, step)
         if checkpoint.training_context:
@@ -2338,6 +2349,7 @@ class QGRETrainer:
                                 if span_id.startswith("STEP_"):
                                     try:
                                         step_num = int(span_id.split("_")[1])
+                                        # Read current state each time, don't capture tier_mastery values
                                         return self.game_state.get_tier_step_mastery(tier, step_num)
                                     except (IndexError, ValueError):
                                         if span_id not in malformed_set:
@@ -2348,6 +2360,7 @@ class QGRETrainer:
                                             )
                                         return 0.0
                                 elif span_id == "THINK":
+                                    # Read current state each time, don't capture tier_mastery values
                                     return self.game_state.get_tier_step_mastery(tier, 0)
                                 return 0.0
                             return mastery_fn
@@ -2422,12 +2435,24 @@ class QGRETrainer:
                 # - ALL succeeded WITHOUT hint → can graduate
                 # - ALL succeeded but some WITH hint → don't graduate yet
                 if self.hint_registry is not None and self.config.egrs.hint_enabled:
+                    # Validate hints_used length matches batch size
+                    if output.hints_used is not None and len(output.hints_used) != len(batch.prompt_ids):
+                        logging.getLogger(__name__).warning(
+                            f"hints_used length mismatch: got {len(output.hints_used)}, expected {len(batch.prompt_ids)}. "
+                            "Skipping hint success/failure tracking for this batch."
+                        )
+                    # Validate batch.prompt_ids and reward_results have same length
+                    if len(batch.prompt_ids) != len(reward_results):
+                        logging.getLogger(__name__).warning(
+                            f"Length mismatch: batch.prompt_ids={len(batch.prompt_ids)}, reward_results={len(reward_results)}. "
+                            "Truncating to shorter length for hint tracking."
+                        )
                     # Aggregate: (prompt_id, span_id) -> {successes_without_hint, successes_with_hint, failures}
                     span_outcomes: dict[tuple[int, str], dict[str, int]] = {}
                     for i, (pid, rr) in enumerate(zip(batch.prompt_ids, reward_results)):
                         # MIO-001: hints_used is now dict[str, bool] mapping span_id → was_injected
                         hints_dict = {}
-                        if output.hints_used is not None and i < len(output.hints_used):
+                        if output.hints_used is not None and len(output.hints_used) == len(batch.prompt_ids) and i < len(output.hints_used):
                             hints_dict = output.hints_used[i]
                         span_correct = compute_span_correctness(
                             rr, self.step_qualities, self.config.egrs.reward_threshold
