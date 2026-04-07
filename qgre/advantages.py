@@ -57,9 +57,9 @@ def compute_span_correctness(
             # No qualities defined = assume correct (no signal)
             # Warn once per step to surface configuration issues
             if not hasattr(compute_span_correctness, "_empty_warned"):
-                compute_span_correctness._empty_warned = set()
-            if step_num not in compute_span_correctness._empty_warned:
-                compute_span_correctness._empty_warned.add(step_num)
+                compute_span_correctness._empty_warned = set()  # type: ignore[attr-defined]
+            if step_num not in compute_span_correctness._empty_warned:  # type: ignore[attr-defined]
+                compute_span_correctness._empty_warned.add(step_num)  # type: ignore[attr-defined]
                 warnings.warn(
                     f"EGRS: step {step_num} has empty qualities list in step_qualities. "
                     "Step will always be treated as 'correct' (Q2 or Q1). Check config.",
@@ -145,9 +145,9 @@ def apply_egrs_matrix(
             except (IndexError, ValueError):
                 # Track malformed regions - surface issue without spamming
                 if not hasattr(apply_egrs_matrix, "_malformed_warned"):
-                    apply_egrs_matrix._malformed_warned = set()
-                if region not in apply_egrs_matrix._malformed_warned:
-                    apply_egrs_matrix._malformed_warned.add(region)
+                    apply_egrs_matrix._malformed_warned = set()  # type: ignore[attr-defined]
+                if region not in apply_egrs_matrix._malformed_warned:  # type: ignore[attr-defined]
+                    apply_egrs_matrix._malformed_warned.add(region)  # type: ignore[attr-defined]
                     warnings.warn(
                         f"EGRS: Malformed region label '{region}' at token {t}. "
                         "Token will receive no EGRS treatment. Check segmenter output.",
@@ -1057,7 +1057,7 @@ class QGREStepAdvantageEstimator:
                     old_var = self._reward_var[pid][quality_name]
                     new_var = old_var + self._var_lr * ((r - new_mean) ** 2 - old_var)
                     if new_var < 0:
-                        warnings.warn(
+                        warnings.warn(  # type: ignore[possibly-undefined]
                             f"Negative variance {new_var:.6f} for prompt {pid} quality {quality_name}. "
                             f"old_var={old_var:.6f}, r={r:.4f}, r_mean={r_mean:.4f}. Clamping to 0.",
                             stacklevel=2,
@@ -1137,7 +1137,7 @@ class QGREStepAdvantageEstimator:
                 q_mask = masks[quality_name]
                 # Graceful handling instead of assert — don't crash on data-dependent mismatch
                 if q_mask.shape[0] != seq_len:
-                    warnings.warn(
+                    warnings.warn(  # type: ignore[possibly-undefined]
                         f"Mask shape mismatch for quality '{quality_name}': "
                         f"mask has {q_mask.shape[0]} tokens but sequence has {seq_len}. "
                         f"Skipping — check reward_fn scored_spans and tokenizer consistency.",
@@ -1222,7 +1222,7 @@ class QGREStepAdvantageEstimator:
 
         # Per-quality baselines — preserve original key type (int for legacy step-based,
         # string for new per-quality span-based). torch.save/load preserves Python types.
-        self.V = defaultdict(lambda: defaultdict(float))
+        self.V = defaultdict(lambda: defaultdict(float))  # type: ignore[misc]
         for pid, qualities in state.get("V", {}).items():
             for key, val in qualities.items():
                 # Preserve original key type (int or str)
@@ -1308,7 +1308,7 @@ def compute_advantages_vprm(
 
     # C05-SHAPE: Validate hidden_states device matches ctx.device when ctx provided
     if ctx is not None and hidden_states.device != ctx.device:
-        warnings.warn(
+        warnings.warn(  # type: ignore[possibly-undefined]
             f"C05-SHAPE: hidden_states on {hidden_states.device} but ctx.device={ctx.device}. "
             "Moving to ctx.device. Check upstream tensor placement.",
             stacklevel=2,
@@ -1322,14 +1322,14 @@ def compute_advantages_vprm(
         if n_regions < min_regions:
             # RL3-010: Return flag + log metric for SPO fallback
             if not hasattr(compute_advantages_vprm, "_spo_fallback_count"):
-                compute_advantages_vprm._spo_fallback_count = 0
-            compute_advantages_vprm._spo_fallback_count += 1
-            if compute_advantages_vprm._spo_fallback_count <= 3:
+                compute_advantages_vprm._spo_fallback_count = 0  # type: ignore[attr-defined]
+            compute_advantages_vprm._spo_fallback_count += 1  # type: ignore[attr-defined]
+            if compute_advantages_vprm._spo_fallback_count <= 3:  # type: ignore[attr-defined]
                 import logging
 
                 logging.getLogger(__name__).info(
                     f"RL3-010: SPO fallback (regions={n_regions} < min_regions={min_regions}). "
-                    f"Total fallbacks: {compute_advantages_vprm._spo_fallback_count}",
+                    f"Total fallbacks: {compute_advantages_vprm._spo_fallback_count}",  # type: ignore[attr-defined]
                 )
             return (
                 torch.zeros(seq_len, device=device),
@@ -1379,7 +1379,7 @@ def compute_advantages_vprm(
             # RSP-001: Warn when quality returns None from critic (silent advantage erasure)
             quality_advs = [(q, advs_dict.get(q, 0.0)) for q in qualities]
             dropped = [q for q, v in quality_advs if v is None]
-            vals = [v for q, v in quality_advs if v is not None]
+            vals = [v for _q, v in quality_advs if v is not None]
             if dropped:
                 import logging
 
@@ -1403,7 +1403,7 @@ def compute_advantages_vprm(
                 f"RL3-007: Virtual steps initialized: {virtual_steps_used}. "
                 "These are frontier amplification targets that don't have direct quality assignments.",
             )
-            compute_advantages_vprm._virtual_logged = True
+            compute_advantages_vprm._virtual_logged = True  # type: ignore[attr-defined]
 
     # Perfect score = zero advantage. Imperfect = push toward 1.0.
     # Include virtual steps (generated by frontier amplification) in aspiration bonus loop

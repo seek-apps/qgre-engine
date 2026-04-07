@@ -411,18 +411,18 @@ def compute_normalized_entropy(
         import warnings
 
         if not hasattr(compute_normalized_entropy, "_nan_count"):
-            compute_normalized_entropy._nan_count = 0
+            compute_normalized_entropy._nan_count = 0  # type: ignore[attr-defined]
         nan_count_batch = torch.isnan(normalized).sum().item()
-        compute_normalized_entropy._nan_count += nan_count_batch
+        compute_normalized_entropy._nan_count += nan_count_batch  # type: ignore[attr-defined]
         # Log on first occurrence and every 100th
         if (
-            compute_normalized_entropy._nan_count == nan_count_batch
-            or compute_normalized_entropy._nan_count % 100 < nan_count_batch
+            compute_normalized_entropy._nan_count == nan_count_batch  # type: ignore[attr-defined]
+            or compute_normalized_entropy._nan_count % 100 < nan_count_batch  # type: ignore[attr-defined]
         ):
             nan_positions = torch.nonzero(torch.isnan(normalized))
             sample_positions = nan_positions[:5].tolist() if len(nan_positions) > 0 else []
             warnings.warn(
-                f"CR-002: NaN in normalized entropy (batch: {nan_count_batch}, total: {compute_normalized_entropy._nan_count}). "
+                f"CR-002: NaN in normalized entropy (batch: {nan_count_batch}, total: {compute_normalized_entropy._nan_count}). "  # type: ignore[attr-defined]
                 f"Sample positions: {sample_positions}. Replacing with 0.5. "
                 "Investigate logit computation — check for -inf/+inf in input logits.",
                 stacklevel=2,

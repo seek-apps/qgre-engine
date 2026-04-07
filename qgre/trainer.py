@@ -51,11 +51,32 @@ if TYPE_CHECKING:
 class GenerationBackend(Protocol):
     """Abstract generation interface — shields trainer from Unsloth internals."""
 
+    # Core generation
     def generate(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs) -> Any: ...
 
+    # Weight persistence
     def save_weights(self, path: str | Path) -> None: ...
-
     def load_weights(self, path: str | Path) -> None: ...
+
+    # Mode switching for training/inference
+    def set_training_mode(self) -> None: ...
+    def set_inference_mode(self) -> None: ...
+
+    # Weight synchronization components
+    @property
+    def weight_exporter(self) -> Any: ...
+    @property
+    def weight_loader(self) -> Any: ...
+
+    # Internal model access (for fused logprobs, etc.)
+    @property
+    def model(self) -> Any: ...
+    @property
+    def tokenizer(self) -> Any: ...
+
+    # Unsloth-specific (optional - may not exist on all backends)
+    @property
+    def _FastLanguageModel(self) -> Any: ...
 
 
 class QGRETrainer:

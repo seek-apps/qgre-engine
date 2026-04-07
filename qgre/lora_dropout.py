@@ -42,14 +42,14 @@ def apply_lora_dropout(model: nn.Module, dropout_rate: float) -> Callable[[], No
 
     # Track dropout state to detect inference without restore
     if not hasattr(apply_lora_dropout, "_dropout_active"):
-        apply_lora_dropout._dropout_active = False
-    if apply_lora_dropout._dropout_active:
+        apply_lora_dropout._dropout_active = False  # type: ignore[attr-defined]
+    if apply_lora_dropout._dropout_active:  # type: ignore[attr-defined]
         warnings.warn(
             "LoRA dropout applied twice without restore() call between. "
             "Previous dropout state may be stale. Call restore() after each generation.",
             stacklevel=2,
         )
-    apply_lora_dropout._dropout_active = True
+    apply_lora_dropout._dropout_active = True  # type: ignore[attr-defined]
 
     # W6: Use list instead of closure to allow cleanup on exception
     saved: list[tuple[torch.nn.Parameter, torch.Tensor]] = []
@@ -82,7 +82,7 @@ def apply_lora_dropout(model: nn.Module, dropout_rate: float) -> Callable[[], No
                 param.data.copy_(original)
             saved.clear()
         finally:
-            apply_lora_dropout._dropout_active = False
+            apply_lora_dropout._dropout_active = False  # type: ignore[attr-defined]
         raise RuntimeError(
             f"W7: LoRA dropout application failed: {e}. Weights restored to original state.",
         ) from e
@@ -107,7 +107,7 @@ def apply_lora_dropout(model: nn.Module, dropout_rate: float) -> Callable[[], No
             ) from e
         finally:
             # WS3-007: Always clear dropout state flag (after restoration)
-            apply_lora_dropout._dropout_active = False
+            apply_lora_dropout._dropout_active = False  # type: ignore[attr-defined]
 
     return restore
 
