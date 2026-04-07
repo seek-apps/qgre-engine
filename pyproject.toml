@@ -375,6 +375,9 @@ exclude = [
     ".venv",
     "build",
     "dist",
+    # triton_logprobs.py uses optional triton import with conditional code
+    # that pyright cannot analyze correctly (HAS_TRITON guard pattern)
+    "qgre/triton_logprobs.py",
 ]
 
 # STRICT mode - catches silent ML bugs
