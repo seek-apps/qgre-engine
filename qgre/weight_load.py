@@ -21,6 +21,8 @@ from torch import nn
 if TYPE_CHECKING:
     from qgre.types import TrainingContext
 
+from qgre.types import WeightLoaderLifecycle
+
 
 try:
     from qgre.lora_dropout import apply_lora_dropout
@@ -29,7 +31,11 @@ except ImportError:
 
 
 class WeightLoader:
-    """Inject weights into vLLM engine."""
+    """Inject weights into vLLM engine.
+
+    Uses WeightLoaderLifecycle state machine to prevent impossible states.
+    State transitions are explicit methods that validate preconditions.
+    """
 
     def __init__(self, model: nn.Module):
         """Initialize with the PeftModel that has vllm_engine attached.
@@ -38,8 +44,82 @@ class WeightLoader:
             model: The PeftModel (Unsloth wraps vllm_engine onto it via patch_peft_fast_inference)
         """
         self._model = model
-        self._lora_request = None  # Set on first sync_lora_direct call
-        self._direct_ready = False  # True after prepare_vllm_lora_loading succeeds
+        self._lora_request = None  # Set during LOADING -> READY transition
+        self._lifecycle = WeightLoaderLifecycle.UNINITIALIZED
+
+    # --- Lifecycle state machine ---
+
+    @property
+    def lifecycle(self) -> WeightLoaderLifecycle:
+        """Current lifecycle state."""
+        return self._lifecycle
+
+    def _transition_to(
+        self, target: WeightLoaderLifecycle, valid_from: tuple[WeightLoaderLifecycle, ...]
+    ) -> None:
+        """Transition to target state, validating preconditions."""
+        if self._lifecycle not in valid_from:
+            raise RuntimeError(
+                f"WeightLoader: Invalid state transition {self._lifecycle.value} -> {target.value}. "
+                f"Valid source states: {[s.value for s in valid_from]}",
+            )
+        self._lifecycle = target
+
+    def _transition_to_loading(self) -> None:
+        """Transition to LOADING state (first sync_lora_direct call)."""
+        self._transition_to(
+            WeightLoaderLifecycle.LOADING,
+            (WeightLoaderLifecycle.UNINITIALIZED, WeightLoaderLifecycle.ERROR),
+        )
+
+    def _transition_to_ready(self) -> None:
+        """Transition to READY state (prepare_vllm_lora_loading succeeded)."""
+        self._transition_to(
+            WeightLoaderLifecycle.READY,
+            (WeightLoaderLifecycle.LOADING, WeightLoaderLifecycle.DROPOUT_ACTIVE),
+        )
+
+    def _transition_to_dropout(self) -> None:
+        """Transition to DROPOUT_ACTIVE state (apply_lora_dropout called)."""
+        self._transition_to(
+            WeightLoaderLifecycle.DROPOUT_ACTIVE,
+            (WeightLoaderLifecycle.READY,),
+        )
+
+    def _transition_to_error(self) -> None:
+        """Transition to ERROR state (exception during operation)."""
+        # Can transition to ERROR from any state
+        self._lifecycle = WeightLoaderLifecycle.ERROR
+        self._lora_request = None
+
+    def _transition_to_uninitialized(self) -> None:
+        """Transition to UNINITIALIZED state (reset for engine recreate)."""
+        self._transition_to(
+            WeightLoaderLifecycle.UNINITIALIZED,
+            (
+                WeightLoaderLifecycle.UNINITIALIZED,
+                WeightLoaderLifecycle.LOADING,
+                WeightLoaderLifecycle.READY,
+                WeightLoaderLifecycle.DROPOUT_ACTIVE,
+                WeightLoaderLifecycle.ERROR,
+            ),
+        )
+        self._lora_request = None
+
+    # --- Legacy compatibility properties ---
+
+    @property
+    def _direct_ready(self) -> bool:
+        """Legacy: True when in READY or DROPOUT_ACTIVE state."""
+        return self._lifecycle in (
+            WeightLoaderLifecycle.READY,
+            WeightLoaderLifecycle.DROPOUT_ACTIVE,
+        )
+
+    @property
+    def _load_lora_called(self) -> bool:
+        """Legacy: True when past UNINITIALIZED state."""
+        return self._lifecycle != WeightLoaderLifecycle.UNINITIALIZED
 
     @property
     def lora_request(self):
@@ -72,48 +152,41 @@ class WeightLoader:
 
         if first_call or not self._direct_ready:
             # Bootstrap: register adapter once, set up GPU→GPU copy mappings
-            # WS-R3-03: Track whether load_lora was called to prevent double-load on recovery
-            if self._lora_request is None:
-                if not getattr(self, "_load_lora_called", False):
-                    adapter_path = self._get_adapter_config_path()
-                    # WS2: Validate adapter_config.json rank matches model's rank
-                    import json
-                    from pathlib import Path
+            # State machine: UNINITIALIZED -> LOADING -> READY
+            if self._lifecycle == WeightLoaderLifecycle.UNINITIALIZED:
+                self._transition_to_loading()
 
-                    adapter_config_file = Path(adapter_path) / "adapter_config.json"
-                    if adapter_config_file.exists():
-                        with open(adapter_config_file) as f:
-                            adapter_cfg = json.load(f)
-                        disk_rank = adapter_cfg.get("r")
-                        model_rank = getattr(model.peft_config.get("default"), "r", None)  # type: ignore[attr-defined]
-                        if (
-                            disk_rank is not None
-                            and model_rank is not None
-                            and disk_rank != model_rank
-                        ):
-                            raise RuntimeError(
-                                f"WS2: adapter_config.json rank mismatch. "
-                                f"Disk: {disk_rank}, training model: {model_rank}. "
-                                f"Delete {adapter_path} or update config to match.",
-                            )
-                    self._lora_request = model.load_lora(  # type: ignore[attr-defined]
-                        adapter_path,
-                        load_tensors=True,
-                    )
-                    self._load_lora_called = True
-            # WS-R3-03: Reset _load_lora_called on first_call to allow fresh init
-            elif first_call:
-                self._load_lora_called = False
+            if self._lora_request is None:
+                adapter_path = self._get_adapter_config_path()
+                # WS2: Validate adapter_config.json rank matches model's rank
+                import json
+                from pathlib import Path
+
+                adapter_config_file = Path(adapter_path) / "adapter_config.json"
+                if adapter_config_file.exists():
+                    with open(adapter_config_file) as f:
+                        adapter_cfg = json.load(f)
+                    disk_rank = adapter_cfg.get("r")
+                    model_rank = getattr(model.peft_config.get("default"), "r", None)  # type: ignore[attr-defined]
+                    if disk_rank is not None and model_rank is not None and disk_rank != model_rank:
+                        raise RuntimeError(
+                            f"WS2: adapter_config.json rank mismatch. "
+                            f"Disk: {disk_rank}, training model: {model_rank}. "
+                            f"Delete {adapter_path} or update config to match.",
+                        )
+                self._lora_request = model.load_lora(  # type: ignore[attr-defined]
+                    adapter_path,
+                    load_tensors=True,
+                )
+
             try:
                 prepare_vllm_lora_loading(model)
-                self._direct_ready = True
+                self._transition_to_ready()
             except Exception as e:
                 import traceback
 
-                # WS3-002 + W10: Reset all state on exception to allow clean retry
-                self._direct_ready = False
-                self._lora_request = None
-                self._load_lora_called = False
+                # WS3-002 + W10: Transition to ERROR state to allow clean retry
+                self._transition_to_error()
                 raise RuntimeError(
                     f"prepare_vllm_lora_loading failed — direct LoRA sync unavailable. "
                     f"Check vLLM engine initialization.\nOriginal error: {e}\n{traceback.format_exc()}",
@@ -432,12 +505,11 @@ class WeightLoader:
         return path
 
     def reset_state(self):
-        """WS3-009: Reset state on engine recreate."""
-        self._direct_ready = False
-        # G5: Reset _lora_request to avoid stale request after reset
-        self._lora_request = None
-        # WS-R3-03: Reset load_lora tracking on state reset
-        self._load_lora_called = False
+        """WS3-009: Reset state on engine recreate.
+
+        Transitions to UNINITIALIZED state, clearing _lora_request.
+        """
+        self._transition_to_uninitialized()
         # W14: Signal WeightBus to reset _initialized flag
         # (caller must handle this by setting weight_bus._initialized = False)
 

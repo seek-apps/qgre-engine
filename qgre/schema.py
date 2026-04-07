@@ -313,6 +313,8 @@ WEIGHT_LOADER_STATE_SCHEMA: dict[str, FieldSpec] = {
     "load_lora_called": FieldSpec(bool, Required.NO, default=False),
     "initialized": FieldSpec(bool, Required.NO, default=False),
     "cleaned_up": FieldSpec(bool, Required.NO, default=False),
+    "lora_request_id": FieldSpec(int, Required.NO, default=None),
+    "lifecycle": FieldSpec(str, Required.NO, default="uninitialized"),
 }
 
 

@@ -156,19 +156,76 @@ class AdvantageEstimatorState:
     state_dict: dict | None = None
 
 
+class WeightLoaderLifecycle(Enum):
+    """State machine for WeightLoader lifecycle.
+
+    Consolidates 4 boolean flags into a single enum to prevent impossible states.
+    Valid transitions:
+        UNINITIALIZED -> LOADING       (first sync_lora_direct call)
+        LOADING -> READY               (prepare_vllm_lora_loading succeeds)
+        LOADING -> ERROR               (prepare fails)
+        READY -> DROPOUT_ACTIVE        (apply_lora_dropout)
+        DROPOUT_ACTIVE -> READY        (restore)
+        READY -> UNINITIALIZED         (reset_state for engine recreate)
+        ERROR -> UNINITIALIZED         (explicit recovery)
+        any -> ERROR                   (exception during operation)
+    """
+
+    UNINITIALIZED = "uninitialized"
+    LOADING = "loading"
+    READY = "ready"
+    DROPOUT_ACTIVE = "dropout_active"
+    ERROR = "error"
+
+
 @dataclass
 class WeightLoaderState:
     """LoRA initialization flags and cleanup tracking.
 
     Prevents double-initialization and tracks resource lifecycle.
     Serializable checkpoint component.
+
+    Note: lifecycle field is the source of truth. Boolean fields are kept
+    for backward compatibility with existing checkpoints and computed from lifecycle.
     """
 
+    # Legacy boolean fields (for checkpoint backward compatibility)
     load_lora_called: bool = False
     initialized: bool = False
     cleaned_up: bool = False
     # W1: Store lora_request_id to detect re-registration on resume
     lora_request_id: int | None = None
+    # New: lifecycle enum as string (source of truth)
+    lifecycle: str = "uninitialized"
+
+    def __post_init__(self):
+        """Sync legacy fields from lifecycle if lifecycle is explicitly set."""
+        # If lifecycle was explicitly set to non-default, update legacy fields
+        if self.lifecycle != "uninitialized":
+            lc = WeightLoaderLifecycle(self.lifecycle)
+            self.initialized = lc in (
+                WeightLoaderLifecycle.READY,
+                WeightLoaderLifecycle.DROPOUT_ACTIVE,
+            )
+            self.load_lora_called = lc in (
+                WeightLoaderLifecycle.LOADING,
+                WeightLoaderLifecycle.READY,
+                WeightLoaderLifecycle.DROPOUT_ACTIVE,
+            )
+        # If legacy fields set but lifecycle is default, infer lifecycle
+        elif self.initialized:
+            self.lifecycle = WeightLoaderLifecycle.READY.value
+        elif self.load_lora_called:
+            self.lifecycle = WeightLoaderLifecycle.LOADING.value
+
+    def get_lifecycle(self) -> WeightLoaderLifecycle:
+        """Get current lifecycle state as enum."""
+        return WeightLoaderLifecycle(self.lifecycle)
+
+    @classmethod
+    def from_lifecycle(cls, lifecycle: WeightLoaderLifecycle) -> WeightLoaderState:
+        """Create state from enum value."""
+        return cls(lifecycle=lifecycle.value)
 
 
 @dataclass
