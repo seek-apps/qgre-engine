@@ -16,9 +16,10 @@
 # Stripped: Ray, Megatron, DTensor, vocab-parallel, context-parallel, sequence-packing.
 # Kept: ClippedPGLossFn core math (single-GPU, single-process).
 
-from typing import NotRequired, TypedDict
+from typing import TypedDict
 
 import torch
+from typing_extensions import NotRequired
 
 from qgre.nemo_extracted.kl import calculate_kl, masked_mean
 

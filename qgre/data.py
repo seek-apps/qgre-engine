@@ -322,9 +322,7 @@ class QGREDataLoader:
             if self._priorities is not None:
                 gate_context.append("priority weights")
             if hasattr(self, "_difficulty_gate") and self._difficulty_gate is not None:
-                gate_context.append(
-                    f"difficulty_gate (allowed: {self._difficulty_gate.get('allowed_difficulties', [])})"
-                )
+                gate_context.append(f"difficulty_gate (allowed: {self._difficulty_gate[0]})")
             logger.error(
                 f"DP-R3-03: ALL weights are zero after filtering by {', '.join(gate_context)}. "
                 "Falling back to uniform sampling. This indicates a configuration error: "

@@ -75,7 +75,7 @@ class WeightLoader:
             # WS-R3-03: Track whether load_lora was called to prevent double-load on recovery
             if self._lora_request is None:
                 if not getattr(self, "_load_lora_called", False):
-                    self._lora_request = model.load_lora(
+                    self._lora_request = model.load_lora(  # type: ignore[attr-defined]
                         self._get_adapter_config_path(),
                         load_tensors=True,
                     )

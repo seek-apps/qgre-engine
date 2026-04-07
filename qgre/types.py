@@ -475,7 +475,7 @@ class CheckpointState:
             dataloader=dataloader,
             advantage_estimator=advantage_estimator,
             weight_loader=weight_loader,
-            game_state=game_state,
+            game_state=game_state,  # type: ignore[arg-type]
             schema_version=d.get("schema_version", CHECKPOINT_SCHEMA_VERSION),
             **optional_kwargs,
         )

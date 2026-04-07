@@ -203,7 +203,7 @@ class VPRMCritic(nn.Module):
                     f"RL3-003: Region {region_key} not found for quality '{q_name}'. "
                     f"Skipping advantage for this quality. Total skipped: {self._region_not_found_count}",
                 )
-                predictions[q_name] = None
+                predictions[q_name] = None  # type: ignore[assignment]
 
         return predictions
 
@@ -284,7 +284,7 @@ class VPRMCritic(nn.Module):
                         f"(occurred {self._region_warned_count[q_name]} times)",
                     )
                     self._region_warned.add(q_name)
-                advantages[q_name] = None
+                advantages[q_name] = None  # type: ignore[assignment]
                 continue
 
             # C04-NUMERICAL: Cast pooled hidden states to ctx.dtype before MLP
@@ -403,7 +403,7 @@ class VPRMCritic(nn.Module):
             # Get this quality's token mask
             if q_name not in token_masks:
                 # Quality not in spans — skip (no gradient)
-                advantages[q_name] = None
+                advantages[q_name] = None  # type: ignore[assignment]
                 continue
 
             mask = token_masks[q_name]
@@ -429,7 +429,7 @@ class VPRMCritic(nn.Module):
 
             if count == 0:
                 # Empty mask — skip
-                advantages[q_name] = None
+                advantages[q_name] = None  # type: ignore[assignment]
                 continue
 
             # Mean-pool hidden states over this quality's span
@@ -509,7 +509,7 @@ class VPRMCritic(nn.Module):
         ):
             if not masks:
                 # No masks for this sample — skip critic
-                batch_advantages.append(dict.fromkeys(self.quality_names))
+                batch_advantages.append(dict.fromkeys(self.quality_names))  # type: ignore[arg-type]
                 continue
 
             advs, losses = self.compute_advantages_from_spans(hs, masks, rewards, ctx)

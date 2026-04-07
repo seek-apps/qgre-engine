@@ -121,7 +121,6 @@ select = [
     "FLY",    # flynt
     "NPY",    # NumPy-specific rules
     "PERF",   # Perflint - performance anti-patterns
-    "FURB",   # refurb - modern Python
     "RUF",    # Ruff-specific rules
 ]
 
@@ -149,7 +148,7 @@ ignore = [
     # Too many branches/statements - complex training loops are expected
     "PLR0912",
     "PLR0915",
-    # Missing type annotation for **kwargs
+    # Missing type annotation for **kwargs (redundant)
     "ANN003",
     # Mutable class attributes - dataclasses use field(default_factory=)
     "RUF012",
@@ -237,16 +236,12 @@ ignore = [
     "F841",    # Unused variables ok in test setup
     "F821",    # Undefined names (torch in annotations)
     "PT018",   # Compound assertions ok in tests
-    "PT030",   # pytest.warns too broad ok in tests
     "PERF102", # dict.values() optimization not critical in tests
     "PERF403", # Manual dict comprehension ok in tests
     "SIM108",  # Ternary not required in tests
     "SIM222",  # Boolean simplification not required in tests
     "PIE810",  # startswith tuple not required in tests
     "B028",    # stacklevel not required in test warnings
-    "RUF043",  # pytest.raises ambiguous pattern ok in tests
-    "RUF059",  # Unused unpacked variable ok (model, tokenizer = backend.load())
-    "FURB171", # Single-item membership ok in tests
     "S110",    # try-except-pass ok in test error handling verification
 ]
 "examples/**/*.py" = [
@@ -266,7 +261,6 @@ ignore = [
     "RET504",  # Unnecessary assignment before return ok for clarity
     "RET505",  # Unnecessary else after return ok for clarity
     "RUF001",  # Ambiguous Unicode ok (Greek letters in physics: γ, ×)
-    "FURB171", # Single-item membership ok
     "PERF403", # Manual dict comprehension ok
 ]
 "scripts/**/*.py" = [

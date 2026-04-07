@@ -62,7 +62,7 @@ def get_hidden_states_and_lm_head(
     if lm_head is None:
         # Fallback: try direct access without unwrapping
         try:
-            lm_head = model.get_output_embeddings()
+            lm_head = model.get_output_embeddings()  # type: ignore[attr-defined]
             if not isinstance(lm_head, nn.Linear):
                 lm_head = None
         except AttributeError:

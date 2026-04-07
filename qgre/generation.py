@@ -462,7 +462,7 @@ class UnslothBackend:
         for i in range(input_ids.shape[0]):
             mask = attention_mask[i].bool()
             tokens = input_ids[i][mask].tolist()
-            text = self.tokenizer.decode(tokens, skip_special_tokens=False)
+            text = self.tokenizer.decode(tokens, skip_special_tokens=False)  # type: ignore[union-attr]
             # Force disable thinking mode: append </think> if not already present
             # This ensures model generates direct answers, not <think> blocks
             if "</think>" not in text:
@@ -495,7 +495,7 @@ class UnslothBackend:
                         hint_text = "\n".join(hint_lines)
                         combined_text = text.rstrip() + f"\n\n{hint_text}\n\n"
                         # Check if combined length would exceed max_tokens
-                        combined_tokens = self.tokenizer.encode(
+                        combined_tokens = self.tokenizer.encode(  # type: ignore[union-attr]
                             combined_text, add_special_tokens=False
                         )
                         if len(combined_tokens) > self.generation_config.max_tokens:
@@ -518,7 +518,7 @@ class UnslothBackend:
             hints_used.append(hints_used_dict or {})
 
         lora_req = self.weight_loader.lora_request if self.weight_loader else None
-        outputs = self.model.fast_generate(
+        outputs = self.model.fast_generate(  # type: ignore[union-attr]
             prompts,
             sampling_params=sampling_params,
             lora_request=lora_req,
@@ -607,7 +607,7 @@ class UnslothBackend:
                 f"/{len(all_logprobs)} samples have logprobs. LLDS disabled for this batch.",
             )
         # MIO-006: Warn if hint_registry exists but hint_enabled is False
-        if not prompt_hints and hasattr(self, "hint_registry") and self.hint_registry is not None:
+        if not prompt_hints and hasattr(self, "hint_registry") and self.hint_registry is not None:  # type: ignore[attr-defined]
             import logging
 
             logging.getLogger(__name__).warning(

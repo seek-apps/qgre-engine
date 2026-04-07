@@ -282,7 +282,7 @@ def broadcast_step_advantages_to_tokens(
                             stacklevel=2,
                         )
                         continue
-                    primary = val[sample_idx]
+                    primary = val[sample_idx]  # type: ignore[index]
                 else:
                     primary = val
                 contribs = [primary]
@@ -297,7 +297,7 @@ def broadcast_step_advantages_to_tokens(
                                     stacklevel=2,
                                 )
                                 continue
-                            contribs.append(v[sample_idx])
+                            contribs.append(v[sample_idx])  # type: ignore[index]
                         else:
                             contribs.append(v)
                 # Convert all to tensors on consistent device before torch.stack
@@ -321,7 +321,7 @@ def broadcast_step_advantages_to_tokens(
                     label_to_adv[region] = torch.stack(contribs_tensors).sum()
         elif region == "THINK" and 0 in step_advs:
             val = step_advs[0]
-            label_to_adv[region] = val[sample_idx] if sample_idx is not None else val
+            label_to_adv[region] = val[sample_idx] if sample_idx is not None else val  # type: ignore[index]
 
     seq_len = len(regions)
     # Use ctx.device if available, otherwise infer from step_advs tensors
@@ -449,7 +449,7 @@ class QGREStepAdvantageEstimator:
         self.segmenter = segmenter or uniform_segmenter
         self._step_nums = sorted(self.step_qualities.keys())
         # Per-quality SPO baselines (keyed by quality name, not step number)
-        self.V: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        self.V: dict[int, dict[int | str, float]] = defaultdict(lambda: defaultdict(float))
         self.V_last_seen: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
         self._quality_seen: dict[int, set[str]] = defaultdict(set)
         # Legacy step-seen for backward compat (deprecated)
@@ -466,10 +466,12 @@ class QGREStepAdvantageEstimator:
         self._var_threshold = var_threshold
         self._var_lr = var_lr
         self._min_var_ratio = min_var_ratio
-        self._reward_var: dict[int, dict[str, float]] = defaultdict(
+        self._reward_var: dict[int, dict[int | str, float]] = defaultdict(
             lambda: defaultdict(lambda: self._var_threshold)
         )
-        self._reward_mean: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        self._reward_mean: dict[int, dict[int | str, float]] = defaultdict(
+            lambda: defaultdict(float)
+        )
         # Staleness decay for sparse qualities
         self._staleness_window = staleness_window
         self._baseline_prior = baseline_prior
@@ -676,7 +678,7 @@ class QGREStepAdvantageEstimator:
         batch_advantages: list[torch.Tensor] = []
         for i in range(batch_size):
             token_advs = broadcast_step_advantages_to_tokens(
-                step_advs,
+                step_advs,  # type: ignore[arg-type]
                 all_regions[i],
                 self._region_extra_steps,
                 sample_idx=i,
@@ -1425,7 +1427,7 @@ def compute_advantages_vprm(
 
     # Broadcast to tokens
     token_advantages = broadcast_step_advantages_to_tokens(
-        step_advs,
+        step_advs,  # type: ignore[arg-type]
         regions,
         region_extra_steps,
         ctx=ctx,

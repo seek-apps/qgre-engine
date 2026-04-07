@@ -22,11 +22,11 @@ class WeightExporter:
         WARNING: On 4-bit quantized models, merge creates NEW tensors (dequant→add→requant).
         This breaks shared memory with vLLM. Only use for full-precision models or deployment.
         """
-        model.merge_adapter()
+        model.merge_adapter()  # type: ignore[attr-defined]
 
     def unmerge_lora(self, model: nn.Module) -> None:
         """Restore LoRA A/B as separate adapters (reverse of merge)."""
-        model.unmerge_adapter()
+        model.unmerge_adapter()  # type: ignore[attr-defined]
 
     def get_modules_to_save(
         self,
@@ -109,7 +109,7 @@ class WeightExporter:
         This returns the inner nn.Linear from the active adapter.
         """
         try:
-            lm_head = model.get_output_embeddings()
+            lm_head = model.get_output_embeddings()  # type: ignore[attr-defined]
             # Unwrap PEFT ModulesToSaveWrapper → get active adapter's nn.Linear
             if hasattr(lm_head, "modules_to_save"):
                 lm_head = lm_head.modules_to_save["default"]

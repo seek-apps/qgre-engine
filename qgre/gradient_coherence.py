@@ -14,11 +14,13 @@ This approach measures what actually happens during Phase 7 collapse:
 layers start pulling in different directions, energy dissipates into noise.
 """
 
+from typing import Any
+
 import numpy as np
 import torch
 
 
-def compute_gradient_coherence(model: torch.nn.Module) -> dict[str, float]:
+def compute_gradient_coherence(model: torch.nn.Module) -> dict[str, Any]:
     """Compute gradient coherence metrics across model layers.
 
     Args:
