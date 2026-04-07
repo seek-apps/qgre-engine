@@ -10,6 +10,7 @@ file changes. WeightExporter and WeightBus are untouched.
 from __future__ import annotations
 
 import gc
+import threading
 import warnings
 from typing import TYPE_CHECKING
 
@@ -51,6 +52,10 @@ class WeightLoader:
         self._model = model
         self._lora_request = None  # Set during LOADING -> READY transition
         self._lifecycle = WeightLoaderLifecycle.UNINITIALIZED
+        # CR-001: Thread lock for state machine transitions
+        self._lock = threading.Lock()
+        # CR-002: Track if KV cache may be stale (zeroing failed)
+        self._cache_potentially_stale = False
 
     # --- Lifecycle state machine ---
 
@@ -155,69 +160,74 @@ class WeightLoader:
             )
             return
 
-        if first_call or not self._direct_ready:
-            # Bootstrap: register adapter once, set up GPU→GPU copy mappings
-            # State machine: UNINITIALIZED -> LOADING -> READY
-            if self._lifecycle == WeightLoaderLifecycle.UNINITIALIZED:
-                self._transition_to_loading()
+        # CR-001: Lock protects state check + transition (prevents race where two threads
+        # both see _direct_ready=False and both try to initialize)
+        with self._lock:
+            if first_call or not self._direct_ready:
+                # Bootstrap: register adapter once, set up GPU→GPU copy mappings
+                # State machine: UNINITIALIZED -> LOADING -> READY
+                if self._lifecycle == WeightLoaderLifecycle.UNINITIALIZED:
+                    self._transition_to_loading()
 
-            if self._lora_request is None:
-                # SFH-003: Wrap adapter loading in try/catch to prevent stuck LOADING state
+                if self._lora_request is None:
+                    # SFH-003: Wrap adapter loading in try/catch to prevent stuck LOADING state
+                    try:
+                        adapter_path = self._get_adapter_config_path()
+                        # WS2: Validate adapter_config.json rank matches model's rank
+                        import json
+                        from pathlib import Path
+
+                        adapter_config_file = Path(adapter_path) / "adapter_config.json"
+                        if adapter_config_file.exists():
+                            with open(adapter_config_file) as f:
+                                adapter_cfg = json.load(f)
+                            disk_rank = adapter_cfg.get("r")
+                            model_rank = getattr(model.peft_config.get("default"), "r", None)  # type: ignore[attr-defined]
+                            if (
+                                disk_rank is not None
+                                and model_rank is not None
+                                and disk_rank != model_rank
+                            ):
+                                raise RuntimeError(
+                                    f"WS2: adapter_config.json rank mismatch. "
+                                    f"Disk: {disk_rank}, training model: {model_rank}. "
+                                    f"Delete {adapter_path} or update config to match.",
+                                )
+                        self._lora_request = model.load_lora(  # type: ignore[attr-defined]
+                            adapter_path,
+                            load_tensors=True,
+                        )
+                    except Exception as e:
+                        self._transition_to_error()
+                        raise RuntimeError(
+                            f"Adapter loading failed during LOADING state: {e}",
+                        ) from e
+
                 try:
-                    adapter_path = self._get_adapter_config_path()
-                    # WS2: Validate adapter_config.json rank matches model's rank
-                    import json
-                    from pathlib import Path
-
-                    adapter_config_file = Path(adapter_path) / "adapter_config.json"
-                    if adapter_config_file.exists():
-                        with open(adapter_config_file) as f:
-                            adapter_cfg = json.load(f)
-                        disk_rank = adapter_cfg.get("r")
-                        model_rank = getattr(model.peft_config.get("default"), "r", None)  # type: ignore[attr-defined]
-                        if (
-                            disk_rank is not None
-                            and model_rank is not None
-                            and disk_rank != model_rank
-                        ):
-                            raise RuntimeError(
-                                f"WS2: adapter_config.json rank mismatch. "
-                                f"Disk: {disk_rank}, training model: {model_rank}. "
-                                f"Delete {adapter_path} or update config to match.",
-                            )
-                    self._lora_request = model.load_lora(  # type: ignore[attr-defined]
-                        adapter_path,
-                        load_tensors=True,
-                    )
+                    prepare_vllm_lora_loading(model)
+                    self._transition_to_ready()
                 except Exception as e:
+                    import traceback
+
+                    # WS3-002 + W10: Transition to ERROR state to allow clean retry
                     self._transition_to_error()
                     raise RuntimeError(
-                        f"Adapter loading failed during LOADING state: {e}",
+                        f"prepare_vllm_lora_loading failed — direct LoRA sync unavailable. "
+                        f"Check vLLM engine initialization.\nOriginal error: {e}\n{traceback.format_exc()}",
                     ) from e
+                return  # Done with bootstrap, exit early
 
-            try:
-                prepare_vllm_lora_loading(model)
-                self._transition_to_ready()
-            except Exception as e:
-                import traceback
-
-                # WS3-002 + W10: Transition to ERROR state to allow clean retry
+        # Fast path (outside lock - tensor copy is thread-safe)
+        try:
+            load_lora_directly(model)
+        except Exception as e:
+            # SFH-001: Fast path failures must transition to ERROR state
+            with self._lock:
                 self._transition_to_error()
-                raise RuntimeError(
-                    f"prepare_vllm_lora_loading failed — direct LoRA sync unavailable. "
-                    f"Check vLLM engine initialization.\nOriginal error: {e}\n{traceback.format_exc()}",
-                ) from e
-        else:
-            # Fast path: direct GPU-to-GPU tensor copy
-            try:
-                load_lora_directly(model)
-            except Exception as e:
-                # SFH-001: Fast path failures must transition to ERROR state
-                self._transition_to_error()
-                raise RuntimeError(
-                    f"load_lora_directly fast path failed — weights may be inconsistent. "
-                    f"State was {WeightLoaderLifecycle.READY.value}, now ERROR. Error: {e}",
-                ) from e
+            raise RuntimeError(
+                f"load_lora_directly fast path failed — weights may be inconsistent. "
+                f"State was {WeightLoaderLifecycle.READY.value}, now ERROR. Error: {e}",
+            ) from e
 
     def sync_modules_to_save(self, weights: dict[str, torch.Tensor], ctx: TrainingContext) -> None:
         """Copy lm_head/embed_tokens into vLLM's base model.
@@ -396,11 +406,11 @@ class WeightLoader:
                     continue
                 return model
 
-        # WS3-010: Log diagnostic info on traversal failure
+        # WS3-010: Log diagnostic info on traversal failure (DEBUG level to avoid spam in retry loops)
         import logging
 
         logger = logging.getLogger(__name__)
-        logger.error(
+        logger.debug(
             "WS3-010: get_vllm_model traversal failed. Diagnostic info: "
             f"model_type={type(self._model).__name__}, "
             f"has_vllm_engine={hasattr(self._model, 'vllm_engine')}, "
@@ -514,8 +524,19 @@ class WeightLoader:
                         for t in layer_cache:
                             if isinstance(t, torch.Tensor):
                                 t.zero_()
+                # CR-002: Clear stale flag on successful zeroing
+                self._cache_potentially_stale = False
             except (RuntimeError, AttributeError, TypeError) as e:
-                warnings.warn(f"KV cache tensor zeroing failed: {e}", stacklevel=2)
+                # CR-002: Track that cache may be stale - generations could use old KV pairs
+                self._cache_potentially_stale = True
+                warnings.warn(
+                    f"CRITICAL: KV cache tensor zeroing failed: {e}. "
+                    "Model may generate with stale cache. Consider recreating vLLM engine.",
+                    stacklevel=2,
+                )
+                raise RuntimeError(
+                    f"KV cache zeroing failed — inference may be corrupted: {e}",
+                ) from e
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -541,7 +562,8 @@ class WeightLoader:
 
         Transitions to UNINITIALIZED state, clearing _lora_request.
         """
-        self._transition_to_uninitialized()
+        with self._lock:
+            self._transition_to_uninitialized()
         # W14: Signal WeightBus to reset _initialized flag
         # (caller must handle this by setting weight_bus._initialized = False)
 

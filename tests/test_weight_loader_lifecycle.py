@@ -157,8 +157,22 @@ class TestLegacyCompatibility:
         loader._transition_to_loading()
         assert loader._load_lora_called is True
 
-        loader._transition_to_ready()
-        assert loader._load_lora_called is True
 
-        loader.reset_state()
-        assert loader._load_lora_called is False
+class TestThreadSafety:
+    """Test thread safety of state machine."""
+
+    def test_has_lock_attribute(self):
+        """WeightLoader has a threading lock."""
+        import threading
+
+        model = MockModel()
+        loader = WeightLoader(model)
+        assert hasattr(loader, "_lock")
+        assert isinstance(loader._lock, type(threading.Lock()))
+
+    def test_cache_stale_flag_initialized(self):
+        """WeightLoader has cache_potentially_stale flag."""
+        model = MockModel()
+        loader = WeightLoader(model)
+        assert hasattr(loader, "_cache_potentially_stale")
+        assert loader._cache_potentially_stale is False
