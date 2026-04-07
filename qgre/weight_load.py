@@ -9,7 +9,6 @@ file changes. WeightExporter and WeightBus are untouched.
 
 from __future__ import annotations
 
-import contextlib
 import gc
 import warnings
 from typing import TYPE_CHECKING
@@ -27,6 +26,12 @@ from qgre.types import WeightLoaderLifecycle
 try:
     from qgre.lora_dropout import apply_lora_dropout
 except ImportError:
+    # SFH-006: Log when lora_dropout module is unavailable
+    warnings.warn(
+        "lora_dropout module not available. LoRA dropout will be disabled "
+        "even if lora_dropout_rate is configured.",
+        stacklevel=2,
+    )
     apply_lora_dropout = None
 
 
@@ -157,27 +162,38 @@ class WeightLoader:
                 self._transition_to_loading()
 
             if self._lora_request is None:
-                adapter_path = self._get_adapter_config_path()
-                # WS2: Validate adapter_config.json rank matches model's rank
-                import json
-                from pathlib import Path
+                # SFH-003: Wrap adapter loading in try/catch to prevent stuck LOADING state
+                try:
+                    adapter_path = self._get_adapter_config_path()
+                    # WS2: Validate adapter_config.json rank matches model's rank
+                    import json
+                    from pathlib import Path
 
-                adapter_config_file = Path(adapter_path) / "adapter_config.json"
-                if adapter_config_file.exists():
-                    with open(adapter_config_file) as f:
-                        adapter_cfg = json.load(f)
-                    disk_rank = adapter_cfg.get("r")
-                    model_rank = getattr(model.peft_config.get("default"), "r", None)  # type: ignore[attr-defined]
-                    if disk_rank is not None and model_rank is not None and disk_rank != model_rank:
-                        raise RuntimeError(
-                            f"WS2: adapter_config.json rank mismatch. "
-                            f"Disk: {disk_rank}, training model: {model_rank}. "
-                            f"Delete {adapter_path} or update config to match.",
-                        )
-                self._lora_request = model.load_lora(  # type: ignore[attr-defined]
-                    adapter_path,
-                    load_tensors=True,
-                )
+                    adapter_config_file = Path(adapter_path) / "adapter_config.json"
+                    if adapter_config_file.exists():
+                        with open(adapter_config_file) as f:
+                            adapter_cfg = json.load(f)
+                        disk_rank = adapter_cfg.get("r")
+                        model_rank = getattr(model.peft_config.get("default"), "r", None)  # type: ignore[attr-defined]
+                        if (
+                            disk_rank is not None
+                            and model_rank is not None
+                            and disk_rank != model_rank
+                        ):
+                            raise RuntimeError(
+                                f"WS2: adapter_config.json rank mismatch. "
+                                f"Disk: {disk_rank}, training model: {model_rank}. "
+                                f"Delete {adapter_path} or update config to match.",
+                            )
+                    self._lora_request = model.load_lora(  # type: ignore[attr-defined]
+                        adapter_path,
+                        load_tensors=True,
+                    )
+                except Exception as e:
+                    self._transition_to_error()
+                    raise RuntimeError(
+                        f"Adapter loading failed during LOADING state: {e}",
+                    ) from e
 
             try:
                 prepare_vllm_lora_loading(model)
@@ -193,7 +209,15 @@ class WeightLoader:
                 ) from e
         else:
             # Fast path: direct GPU-to-GPU tensor copy
-            load_lora_directly(model)
+            try:
+                load_lora_directly(model)
+            except Exception as e:
+                # SFH-001: Fast path failures must transition to ERROR state
+                self._transition_to_error()
+                raise RuntimeError(
+                    f"load_lora_directly fast path failed — weights may be inconsistent. "
+                    f"State was {WeightLoaderLifecycle.READY.value}, now ERROR. Error: {e}",
+                ) from e
 
     def sync_modules_to_save(self, weights: dict[str, torch.Tensor], ctx: TrainingContext) -> None:
         """Copy lm_head/embed_tokens into vLLM's base model.
@@ -403,6 +427,14 @@ class WeightLoader:
             if base_model is not None:
                 engine = getattr(base_model, "vllm_engine", None)
         if engine is None:
+            # SFH-005: Warn when engine not found instead of silent return
+            if not getattr(self, "_engine_not_found_warned", False):
+                warnings.warn(
+                    "flush_kv_cache: No vLLM engine found (engine not attached to model). "
+                    "KV cache flush skipped. This may indicate generation_backend configuration issue.",
+                    stacklevel=2,
+                )
+                self._engine_not_found_warned = True
             return
 
         # Pre-check: verify llm_engine exists before attempting scheduler access
@@ -533,10 +565,17 @@ class WeightLoader:
 
     def __del__(self):
         """Clean up tempdir on deletion."""
+        import logging
         import shutil
 
         path = getattr(self, "_adapter_path", None)
         # WS3-004: Only cleanup if not already cleaned
         if path is not None and not getattr(self, "_cleaned_up", False):
-            with contextlib.suppress(Exception):
-                shutil.rmtree(path, ignore_errors=True)
+            try:
+                shutil.rmtree(path, ignore_errors=False)
+            except OSError as e:
+                # SFH-002: Log cleanup failures instead of silently suppressing
+                # Can't raise in __del__, but must not hide resource leaks
+                logging.getLogger(__name__).warning(
+                    f"__del__ cleanup failed for {path}: {e}. Directory may persist on disk.",
+                )

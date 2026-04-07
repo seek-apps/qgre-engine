@@ -202,7 +202,16 @@ class WeightLoaderState:
         """Sync legacy fields from lifecycle if lifecycle is explicitly set."""
         # If lifecycle was explicitly set to non-default, update legacy fields
         if self.lifecycle != "uninitialized":
-            lc = WeightLoaderLifecycle(self.lifecycle)
+            # SFH-004: Validate lifecycle value with actionable error message
+            try:
+                lc = WeightLoaderLifecycle(self.lifecycle)
+            except ValueError as e:
+                valid_values = [v.value for v in WeightLoaderLifecycle]
+                raise ValueError(
+                    f"Invalid lifecycle value '{self.lifecycle}' in WeightLoaderState. "
+                    f"Valid values: {valid_values}. "
+                    "This may indicate checkpoint corruption or schema mismatch.",
+                ) from e
             self.initialized = lc in (
                 WeightLoaderLifecycle.READY,
                 WeightLoaderLifecycle.DROPOUT_ACTIVE,
