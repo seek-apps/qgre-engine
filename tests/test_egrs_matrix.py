@@ -58,8 +58,12 @@ def test_apply_egrs_matrix_q1_uncertain_correct():
     step_correctness = {1: True}  # Correct
 
     modified, entropy_adj, hints = apply_egrs_matrix(
-        token_advantages, regions, token_entropy, step_correctness,
-        entropy_threshold=0.5, gate_temperature=0.1,
+        token_advantages,
+        regions,
+        token_entropy,
+        step_correctness,
+        entropy_threshold=0.5,
+        gate_temperature=0.1,
     )
 
     # Q1: advantage should be scaled by gate (~1 for uncertain)
@@ -80,8 +84,12 @@ def test_apply_egrs_matrix_q2_confident_correct():
     step_correctness = {1: True}  # Correct
 
     modified, entropy_adj, hints = apply_egrs_matrix(
-        token_advantages, regions, token_entropy, step_correctness,
-        entropy_threshold=0.5, gate_temperature=0.1,
+        token_advantages,
+        regions,
+        token_entropy,
+        step_correctness,
+        entropy_threshold=0.5,
+        gate_temperature=0.1,
     )
 
     # Q2: advantage should be 0
@@ -102,14 +110,21 @@ def test_apply_egrs_matrix_q3_confident_wrong():
     step_correctness = {1: False}  # Wrong
 
     modified, entropy_adj, hints = apply_egrs_matrix(
-        token_advantages, regions, token_entropy, step_correctness,
-        entropy_threshold=0.5, gate_temperature=0.1, exploration_weight=0.2,
+        token_advantages,
+        regions,
+        token_entropy,
+        step_correctness,
+        entropy_threshold=0.5,
+        gate_temperature=0.1,
+        exploration_weight=0.2,
     )
 
     # Q3: advantage should be 0
     assert modified[0].item() == 0.0, f"Q3 should have 0 advantage, got {modified[0]}"
     # Q3: entropy adjustment should be exploration_weight
-    assert abs(entropy_adj[0].item() - 0.2) < 0.001, f"Q3 should have entropy adj=0.2, got {entropy_adj[0]}"
+    assert abs(entropy_adj[0].item() - 0.2) < 0.001, (
+        f"Q3 should have entropy adj=0.2, got {entropy_adj[0]}"
+    )
     # No hints for Q3 (will get hint after entropy boost makes it uncertain)
     assert len(hints) == 0
 
@@ -124,8 +139,12 @@ def test_apply_egrs_matrix_q4_uncertain_wrong():
     step_correctness = {1: False}  # Wrong
 
     modified, entropy_adj, hints = apply_egrs_matrix(
-        token_advantages, regions, token_entropy, step_correctness,
-        entropy_threshold=0.5, gate_temperature=0.1,
+        token_advantages,
+        regions,
+        token_entropy,
+        step_correctness,
+        entropy_threshold=0.5,
+        gate_temperature=0.1,
     )
 
     # Q4: advantage should be 0
@@ -148,8 +167,13 @@ def test_apply_egrs_matrix_mixed_quadrants():
     step_correctness = {1: True, 2: True, 3: False, 4: False}
 
     modified, entropy_adj, hints = apply_egrs_matrix(
-        token_advantages, regions, token_entropy, step_correctness,
-        entropy_threshold=0.5, gate_temperature=0.1, exploration_weight=0.15,
+        token_advantages,
+        regions,
+        token_entropy,
+        step_correctness,
+        entropy_threshold=0.5,
+        gate_temperature=0.1,
+        exploration_weight=0.15,
     )
 
     # Step 1 (uncertain + correct) → Q1: scaled advantage
@@ -167,8 +191,12 @@ def test_apply_egrs_matrix_mixed_quadrants():
 
     # Step 4 (confident + wrong) → Q3: zero advantage, entropy boost
     assert modified[6].item() == 0.0, f"Q3 should have 0 advantage, got {modified[6]}"
-    assert abs(entropy_adj[6].item() - 0.15) < 0.001, f"Q3 should have entropy adj, got {entropy_adj[6]}"
-    assert abs(entropy_adj[7].item() - 0.15) < 0.001, f"Q3 should have entropy adj, got {entropy_adj[7]}"
+    assert abs(entropy_adj[6].item() - 0.15) < 0.001, (
+        f"Q3 should have entropy adj, got {entropy_adj[6]}"
+    )
+    assert abs(entropy_adj[7].item() - 0.15) < 0.001, (
+        f"Q3 should have entropy adj, got {entropy_adj[7]}"
+    )
 
 
 def test_apply_egrs_matrix_format_region_ignored():
@@ -178,8 +206,11 @@ def test_apply_egrs_matrix_format_region_ignored():
     token_entropy = torch.tensor([0.1, 0.1, 0.1])  # All confident
     step_correctness = {1: True}
 
-    modified, entropy_adj, hints = apply_egrs_matrix(
-        token_advantages, regions, token_entropy, step_correctness,
+    modified, _entropy_adj, _hints = apply_egrs_matrix(
+        token_advantages,
+        regions,
+        token_entropy,
+        step_correctness,
     )
 
     # FORMAT tokens should be unchanged
@@ -196,8 +227,11 @@ def test_apply_egrs_matrix_think_region():
     token_entropy = torch.tensor([0.8, 0.8])  # Uncertain
     step_correctness = {0: False}  # THINK is wrong
 
-    modified, entropy_adj, hints = apply_egrs_matrix(
-        token_advantages, regions, token_entropy, step_correctness,
+    _modified, _entropy_adj, hints = apply_egrs_matrix(
+        token_advantages,
+        regions,
+        token_entropy,
+        step_correctness,
     )
 
     # THINK (uncertain + wrong) → Q4: hint flag

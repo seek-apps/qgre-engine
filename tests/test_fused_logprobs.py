@@ -47,9 +47,9 @@ class TestChunkedLogprobs:
         without_ckpt = chunked_logprobs_from_hidden(
             hidden, lm_head, labels, chunk_size=8, use_checkpoint=False
         )
-        assert torch.allclose(
-            with_ckpt, without_ckpt, atol=1e-5
-        ), "Checkpoint must not change values"
+        assert torch.allclose(with_ckpt, without_ckpt, atol=1e-5), (
+            "Checkpoint must not change values"
+        )
 
     def test_single_chunk_equivalent_to_full(self):
         """When chunk_size >= seq_len, result should match non-chunked."""
@@ -133,7 +133,7 @@ class TestGetHiddenStatesAndLmHead:
         # GB3-005: Should raise RuntimeError instead of returning None
         import pytest
 
-        with pytest.raises(RuntimeError, match="GB3-005.*logits.*not hidden states"):
+        with pytest.raises(RuntimeError, match=r"GB3-005.*logits.*not hidden states"):
             get_hidden_states_and_lm_head(model, input_ids)
 
     def test_shape_check_succeeds_when_output_is_hidden_dim(self):
@@ -168,7 +168,7 @@ class TestGetHiddenStatesAndLmHead:
 
         model = NoConfigModel()
         input_ids = torch.randint(0, 100, (1, 10))
-        hs, lm = get_hidden_states_and_lm_head(model, input_ids)
+        hs, _lm = get_hidden_states_and_lm_head(model, input_ids)
         assert hs is not None, "Should succeed — output dim 32 matches lm_head.in_features"
 
     def test_no_lm_head_returns_none(self):

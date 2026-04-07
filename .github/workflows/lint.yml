@@ -30,7 +30,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install Ruff
-        run: pip install ruff
+        run: pip install ruff==0.15.9  # Pin to match pre-commit
 
       - name: Ruff Lint
         run: ruff check --output-format=github qgre/ tests/

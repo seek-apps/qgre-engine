@@ -109,7 +109,8 @@ def test_advantage_loss_pipeline_consistency():
     batch_size = 4
 
     results = [
-        RewardResult(reward=r, scores=dict.fromkeys(ALL_Q, r), phase=4) for r in [0.9, 0.3, 0.7, 0.5]
+        RewardResult(reward=r, scores=dict.fromkeys(ALL_Q, r), phase=4)
+        for r in [0.9, 0.3, 0.7, 0.5]
     ]
 
     est = QGREStepAdvantageEstimator(

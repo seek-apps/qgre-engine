@@ -108,7 +108,7 @@ class TestTargetForAdvantages:
         regions = ["STEP_1"] * 25 + ["STEP_5"] * 25
         rewards = {"q_format": 0.9, "q_correct_H": 0.4}
 
-        advs, losses = critic.compute_advantages(hs, regions, rewards, ctx=ctx)
+        _advs, losses = critic.compute_advantages(hs, regions, rewards, ctx=ctx)
 
         # Losses should have requires_grad (from online heads)
         for loss in losses.values():

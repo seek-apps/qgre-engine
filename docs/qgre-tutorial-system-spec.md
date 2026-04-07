@@ -68,21 +68,21 @@ A directed acyclic graph declared in YAML config. Each node is a skill. Each edg
 ```yaml
 tutorial:
   enabled: true
-  
+
   # Post-mastery behavior when ALL skills are mastered:
   #   review_only — sample only from mastered skills at review_probability (default)
   #   pause — stop training, log curriculum complete
   #   continue_all — re-enable all prompts at full sampling weight
   post_mastery_behavior: review_only
-  
+
   skill_tree:
-    # HYSTERESIS TUNING NOTE: The gap between mastery_threshold and 
-    # regression_threshold controls sensitivity to noise. Start with 
-    # a 0.2 gap (e.g., 0.85/0.65). If you see false regressions on 
-    # compound skills with high reward variance, tighten to 0.10-0.15 
-    # (e.g., 0.75/0.60). If you see skills staying mastered when the 
+    # HYSTERESIS TUNING NOTE: The gap between mastery_threshold and
+    # regression_threshold controls sensitivity to noise. Start with
+    # a 0.2 gap (e.g., 0.85/0.65). If you see false regressions on
+    # compound skills with high reward variance, tighten to 0.10-0.15
+    # (e.g., 0.75/0.60). If you see skills staying mastered when the
     # model has clearly forgotten, widen the gap.
-    
+
     freefall:
       prompts: [freefall_1, freefall_2, freefall_3]
       prerequisites: []
@@ -150,7 +150,7 @@ class SkillNode:
     recent_scores: deque = field(default_factory=lambda: deque(maxlen=20))
     _was_mastered: bool = field(default=False, repr=False)
     _status: str = field(default='locked', repr=False)
-    
+
     def __post_init__(self):
         """Root skills (no prerequisites) start as 'active'. Others start 'locked'."""
         if not self.prerequisites:
@@ -158,7 +158,7 @@ class SkillNode:
         # Ensure deque has correct maxlen if loaded from config
         if not isinstance(self.recent_scores, deque):
             self.recent_scores = deque(self.recent_scores, maxlen=self.mastery_window)
-    
+
     @property
     def mastered(self) -> bool:
         if len(self.recent_scores) < self.mastery_window:
@@ -170,24 +170,24 @@ class SkillNode:
             # Three bad review completions should not collapse the skill tree.
             return score >= self.regression_threshold
         return score >= self.mastery_threshold
-    
-    @property 
+
+    @property
     def mastery_score(self) -> float:
         if not self.recent_scores:
             return 0.0
         return sum(self.recent_scores) / len(self.recent_scores)
-    
+
     def unlocked(self, skill_tree: dict) -> bool:
         """All prerequisites must be mastered."""
         return all(skill_tree[pre].mastered for pre in self.prerequisites)
-    
+
     @property
     def status(self) -> str:
         """locked | active | mastered"""
         # Note: 'unlocked' is computed dynamically via unlocked() method
         # status is stored as 'locked', 'active', or 'mastered'
         return self._status
-    
+
     def record_score(self, v_correct: float):
         """Record a V_correct score for this skill."""
         self.recent_scores.append(v_correct)
@@ -273,36 +273,36 @@ def get_active_prompts(self) -> list[str]:
     Review sampling is re-rolled each call for mastered skills."""
     if not self.tutorial_enabled:
         return self.all_prompts
-    
+
     # Rebuild deterministic pool only when state changed
     if self._active_prompts_dirty:
         self._active_base_pool = []  # skills that are active (full weight)
         self._mastered_pool = []     # skills that are mastered (review weight)
-        
+
         for key, node in self.skill_tree.items():
             is_unlocked = node.unlocked(self.skill_tree)
-            
+
             if is_unlocked and not node.mastered:
                 self._active_base_pool.extend(node.prompts)
             elif node.mastered:
                 self._mastered_pool.append(node)
-        
+
         # Include untracked prompts if configured
         if self.untracked_always_active:
             tracked = set(self._prompt_to_skill.keys())
             untracked = [p for p in self.all_prompts if p not in tracked]
             self._active_base_pool.extend(untracked)
-        
+
         self._active_prompts_dirty = False
-    
+
     # Start with the deterministic base pool
     active = list(self._active_base_pool)
-    
+
     # Add mastered skills at review probability (re-rolled each step)
     for node in self._mastered_pool:
         if random.random() < node.review_probability:
             active.extend(node.prompts)
-    
+
     # Handle post_mastery_behavior when nothing is in active base pool
     if not self._active_base_pool and not active:
         if self.post_mastery_behavior == 'pause':
@@ -313,13 +313,13 @@ def get_active_prompts(self) -> list[str]:
             logger.info("[TUTORIAL] All skills mastered. post_mastery_behavior=continue_all.")
             return self.all_prompts
         # review_only: active will contain review samples (or empty if unlucky)
-    
+
     # Safety fallback
     if not active:
         logger.warning("Tutorial system: no active prompts this step. "
                       "Falling back to all.")
         return self.all_prompts
-    
+
     return active
 ```
 
@@ -343,7 +343,7 @@ def record_completion(self, prompt_id: str, v_correct: float):
             was_mastered_before = node.mastered
             node.record_score(v_correct)
             is_mastered_now = node.mastered
-            
+
             # Check for mastery GAIN
             if is_mastered_now and not was_mastered_before:
                 node._status = 'mastered'
@@ -351,7 +351,7 @@ def record_completion(self, prompt_id: str, v_correct: float):
                           f"(mastery={node.mastery_score:.2f}, "
                           f"threshold={node.mastery_threshold})")
                 self._check_unlocks()
-            
+
             # Check for mastery LOSS (regression through hysteresis)
             elif was_mastered_before and not is_mastered_now:
                 node._status = 'active'
@@ -359,9 +359,9 @@ def record_completion(self, prompt_id: str, v_correct: float):
                              f"(mastery={node.mastery_score:.2f}, "
                              f"regression_threshold={node.regression_threshold})")
                 self._check_relocks()
-            
+
             return
-    
+
     # Prompt not in any skill — untracked, no action needed
 
 def _check_unlocks(self):
@@ -374,9 +374,9 @@ def _check_unlocks(self):
 
 def _check_relocks(self):
     """After a regression event, cascade re-lock to dependents.
-    CRITICAL: re-locked skills get full mastery reset — _was_mastered 
-    and recent_scores are cleared. The model must re-demonstrate mastery 
-    from scratch. Old scores are stale because LoRA weights changed 
+    CRITICAL: re-locked skills get full mastery reset — _was_mastered
+    and recent_scores are cleared. The model must re-demonstrate mastery
+    from scratch. Old scores are stale because LoRA weights changed
     during the prerequisite's regression/re-mastery period."""
     changed = True
     while changed:
@@ -519,11 +519,11 @@ At config load time, validate the skill tree:
 ```python
 def validate_skill_tree(skill_tree: dict, prompt_registry: list[str]):
     """Validate DAG structure. Raise ConfigError on any violation."""
-    
+
     # 1. Check for cycles (topological sort)
     visited = set()
     temp = set()
-    
+
     def visit(key):
         if key in temp:
             raise ConfigError(f"Cycle detected in skill tree involving: {key}")
@@ -539,10 +539,10 @@ def validate_skill_tree(skill_tree: dict, prompt_registry: list[str]):
             visit(pre)
         temp.remove(key)
         visited.add(key)
-    
+
     for key in skill_tree:
         visit(key)
-    
+
     # 2. Check for duplicate prompts across skills
     seen_prompts = {}
     for key, node in skill_tree.items():
@@ -553,7 +553,7 @@ def validate_skill_tree(skill_tree: dict, prompt_registry: list[str]):
                     f"'{seen_prompts[prompt_id]}' and '{key}'"
                 )
             seen_prompts[prompt_id] = key
-    
+
     # 3. Check all prompts exist in registry
     for key, node in skill_tree.items():
         for prompt_id in node.prompts:
@@ -562,7 +562,7 @@ def validate_skill_tree(skill_tree: dict, prompt_registry: list[str]):
                     f"Prompt '{prompt_id}' in skill '{key}' "
                     f"not found in prompt registry"
                 )
-    
+
     # 4. Check at least one root skill exists
     roots = [k for k, n in skill_tree.items() if not n.prerequisites]
     if not roots:
@@ -570,7 +570,7 @@ def validate_skill_tree(skill_tree: dict, prompt_registry: list[str]):
             "No root skills (skills with empty prerequisites). "
             "Training cannot start."
         )
-    
+
     # 5. Check regression_threshold < mastery_threshold for all skills
     for key, node in skill_tree.items():
         if node.regression_threshold >= node.mastery_threshold:
@@ -579,7 +579,7 @@ def validate_skill_tree(skill_tree: dict, prompt_registry: list[str]):
                 f"must be less than mastery_threshold ({node.mastery_threshold}). "
                 f"Hysteresis requires a gap between gaining and losing mastery."
             )
-    
+
     logger.info(f"Skill tree validated: {len(skill_tree)} skills, "
                 f"{len(roots)} roots, {len(seen_prompts)} prompts mapped")
 ```

@@ -109,7 +109,7 @@ def test_egrs_with_hint_registry():
     # Step 1: correct, Step 2: wrong, Step 3: wrong
     span_correctness = {1: True, 2: False, 3: False}
 
-    modified_advs, entropy_adj, hint_flags = apply_egrs_matrix(
+    _modified_advs, _entropy_adj, hint_flags = apply_egrs_matrix(
         token_advantages,
         regions,
         token_entropy,

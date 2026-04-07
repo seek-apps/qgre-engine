@@ -181,9 +181,9 @@ class TestCriticAdvantages:
         )
         final_total = sum(l.item() for l in final_losses.values())
 
-        assert (
-            final_total < initial_total
-        ), f"Critic loss should decrease: {initial_total:.4f} → {final_total:.4f}"
+        assert final_total < initial_total, (
+            f"Critic loss should decrease: {initial_total:.4f} → {final_total:.4f}"
+        )
 
 
 # --- Batch computation tests ---
@@ -194,7 +194,7 @@ class TestBatchAdvantages:
         batch_hs = [sample_hidden_states] * 4
         batch_regions = [sample_regions] * 4
         batch_rewards = [dict.fromkeys(critic.quality_names, 0.5)] * 4
-        advs, loss = critic.compute_batch_advantages(
+        advs, _loss = critic.compute_batch_advantages(
             batch_hs, batch_regions, batch_rewards, ctx=ctx
         )
         assert len(advs) == 4
@@ -302,7 +302,7 @@ class TestVPRMAdvantagesIntegration:
         regions = ["STEP_1"] * 50  # Only one region
         rewards = RewardResult(reward=0.5, scores={"q_format": 0.5})
 
-        advs, loss, used = compute_advantages_vprm(
+        advs, _loss, used = compute_advantages_vprm(
             critic=critic,
             hidden_states=hs,
             regions=regions,

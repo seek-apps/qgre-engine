@@ -197,9 +197,9 @@ def test_credit_phase1_format_only():
     for step_n in [2, 3, 4]:
         step_advs = [advs[0][t].item() for t, r in enumerate(regions) if r == f"STEP_{step_n}"]
         if step_advs:
-            assert all(
-                abs(a) < 1e-6 for a in step_advs
-            ), f"STEP_{step_n} should be ~0, got {step_advs}"
+            assert all(abs(a) < 1e-6 for a in step_advs), (
+                f"STEP_{step_n} should be ~0, got {step_advs}"
+            )
 
 
 # --- SPO value tracker tests ---
@@ -359,9 +359,9 @@ def test_grpo_fallback_degenerate_group():
     # All advantages should be ~0 (degenerate group)
     for adv in advs:
         assert adv.isfinite().all()
-        assert (
-            adv.abs().max() < 0.01
-        ), f"Degenerate group should have ~0 advantages, got max={adv.abs().max()}"
+        assert adv.abs().max() < 0.01, (
+            f"Degenerate group should have ~0 advantages, got max={adv.abs().max()}"
+        )
 
 
 # --- GDPO normalization tests ---
@@ -671,9 +671,9 @@ def test_get_prompt_priorities_returns_abs_v():
 
     priorities = estimator.get_prompt_priorities()
     assert 1 in priorities and 2 in priorities
-    assert (
-        priorities[1] > 0 or priorities[2] > 0
-    ), "At least one prompt should have nonzero priority"
+    assert priorities[1] > 0 or priorities[2] > 0, (
+        "At least one prompt should have nonzero priority"
+    )
 
 
 # --- Fix 2: GRPO no double normalization ---

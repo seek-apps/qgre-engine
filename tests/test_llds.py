@@ -15,7 +15,7 @@ class TestLLDSLoss:
         lp = torch.tensor([[-1.0, -2.0, -1.5]])
         mask = torch.ones(1, 3)
         advantages = torch.tensor([[0.5, 0.3, 0.2]])
-        loss, llds_mask = compute_llds_loss(lp, lp, advantages, mask)
+        loss, _llds_mask = compute_llds_loss(lp, lp, advantages, mask)
         assert loss.item() == pytest.approx(0.0, abs=1e-6)
 
     def test_positive_displacement_triggers_loss(self):
@@ -47,7 +47,7 @@ class TestLLDSLoss:
         mask = torch.ones(1, 3)
         advantages = torch.tensor([[1.0, 1.0, 1.0]])
 
-        loss, llds_mask = compute_llds_loss(new_lp, old_lp, advantages, mask)
+        loss, _llds_mask = compute_llds_loss(new_lp, old_lp, advantages, mask)
         assert loss.item() == pytest.approx(0.0, abs=1e-6)
 
     def test_mask_respected(self):
@@ -57,7 +57,7 @@ class TestLLDSLoss:
         mask = torch.tensor([[1.0, 1.0, 0.0]])  # Third token is padding
         advantages = torch.tensor([[1.0, 1.0, 1.0]])
 
-        loss, llds_mask = compute_llds_loss(new_lp, old_lp, advantages, mask)
+        _loss, llds_mask = compute_llds_loss(new_lp, old_lp, advantages, mask)
         assert llds_mask[0, 2].item() == 0, "Padding token should not be gated"
 
     def test_mixed_batch(self):
@@ -67,7 +67,7 @@ class TestLLDSLoss:
         mask = torch.ones(2, 2)
         advantages = torch.tensor([[1.0, 1.0], [-1.0, -1.0]])
 
-        loss, llds_mask = compute_llds_loss(new_lp, old_lp, advantages, mask)
+        _loss, llds_mask = compute_llds_loss(new_lp, old_lp, advantages, mask)
         # Only first sample should contribute (positive advantage)
         assert llds_mask[0].sum().item() == 2
         assert llds_mask[1].sum().item() == 0

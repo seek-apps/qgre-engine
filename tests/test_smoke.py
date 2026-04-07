@@ -101,9 +101,9 @@ def test_three_steps_no_crash():
                 metrics = trainer.step(batch, output.token_ids, reward_results)
                 losses.append(metrics["loss"])
 
-                assert torch.isfinite(
-                    torch.tensor(metrics["loss"])
-                ), f"NaN/Inf loss at step {step_num}"
+                assert torch.isfinite(torch.tensor(metrics["loss"])), (
+                    f"NaN/Inf loss at step {step_num}"
+                )
                 break  # One batch per epoch for smoke test
 
         assert len(losses) == 3

@@ -317,21 +317,21 @@ hint_probability = max(0, 1 - mastery_score / mastery_threshold)
 def compute_token_gradient(token_t, span_reward, entropy_t, influence_t, mastery):
     """
     Compute the gradient treatment for a single token.
-    
+
     Returns: (advantage, entropy_adjustment, hint_flag)
     """
-    
+
     # Thresholds
     correct = span_reward >= REWARD_THRESHOLD  # e.g., 0.5
-    
+
     # Soft gating for confidence (sigmoid, not hard threshold)
     confidence_gate = sigmoid((ENTROPY_THRESHOLD - entropy_t) / GATE_TEMP)
     confident = confidence_gate > 0.5  # For branching logic
-    
+
     # ERIC dampening (always computed, applied to advantages only)
     position_weight = compute_position_weight(token_t, seq_len)
     influence_dampen = 1.0 / (1.0 + ERIC_STRENGTH * influence_t * position_weight)
-    
+
     if correct:
         if confident:
             # QUADRANT 2: Confident + Correct → Already learned
@@ -354,7 +354,7 @@ def compute_token_gradient(token_t, span_reward, entropy_t, influence_t, mastery
             # QUADRANT 4: Uncertain + Wrong → Flag for hint
             entropy_adjustment = 0
             hint_flag = True
-    
+
     return advantage, entropy_adjustment, hint_flag
 ```
 
@@ -370,14 +370,14 @@ def compute_loss(tokens, advantages, entropy_adjustments):
     for t, adv in enumerate(advantages):
         if adv > 0:
             pg_loss += -adv * log_prob[t]
-    
+
     # Entropy adjustment loss (exploration)
     entropy_loss = 0
     for t, adj in enumerate(entropy_adjustments):
         if adj > 0:
             # Maximize entropy = minimize negative entropy
             entropy_loss += -adj * entropy[t]
-    
+
     return pg_loss + entropy_loss
 ```
 
@@ -444,7 +444,7 @@ def compute_loss(tokens, advantages, entropy_adjustments):
 def soft_gate(entropy, threshold, temperature=0.1):
     """
     Soft gate that smoothly transitions from 1 (uncertain) to 0 (confident).
-    
+
     Returns ~1 when entropy >> threshold (uncertain, should reinforce)
     Returns ~0 when entropy << threshold (confident, don't reinforce)
     """

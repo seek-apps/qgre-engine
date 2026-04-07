@@ -101,7 +101,7 @@ def test_lora_sync_changes_output():
     )
 
     backend = UnslothBackend(model_cfg, gen_cfg)
-    model, tokenizer = backend.load()
+    _model, _tokenizer = backend.load()
 
     with tempfile.TemporaryDirectory() as tmpdir:
         lora_path = Path(tmpdir) / "lora_adapter"

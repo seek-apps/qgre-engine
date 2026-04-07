@@ -92,7 +92,7 @@ class TestSchemaValidation:
         schema = {
             "required_field": FieldSpec(str, Required.YES),
         }
-        with pytest.raises(ValueError, match="Required field.*required_field.*missing"):
+        with pytest.raises(ValueError, match=r"Required field.*required_field.*missing"):
             validate_schema({}, schema)
 
     def test_path_in_error_messages(self):
@@ -105,7 +105,7 @@ class TestSchemaValidation:
                 },
             ),
         }
-        with pytest.raises(ValueError, match="nested.inner"):
+        with pytest.raises(ValueError, match=r"nested\.inner"):
             validate_schema({"nested": {}}, schema)
 
 
@@ -138,7 +138,7 @@ class TestTrainerStateSchema:
 
     def test_requires_global_step(self):
         """global_step is required."""
-        with pytest.raises(ValueError, match="global_step.*missing"):
+        with pytest.raises(ValueError, match=r"global_step.*missing"):
             validate_schema({}, TRAINER_STATE_SCHEMA)
 
     def test_validates_complete_trainer_state(self):
@@ -178,7 +178,7 @@ class TestBugClassPrevention:
         # String to int works
         assert validate_field("100", spec, "test") == 100
         # Float to int warns
-        with pytest.warns(UserWarning):
+        with pytest.warns(UserWarning, match=r"Precision loss"):
             validate_field(100.5, spec, "test")
 
     def test_prevents_negative_weights(self):

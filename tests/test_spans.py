@@ -191,7 +191,7 @@ class TestSpanBasedAdvantages:
 
         # Second call: same prompt, DIFFERENT score → real advantage (score - baseline)
         reward2 = RewardResult(reward=0.9, scores={"q_format": 1.0, "q_correct_H": 0.9})
-        advantages, quality_metrics = estimator.compute_advantages_with_spans(
+        advantages, _quality_metrics = estimator.compute_advantages_with_spans(
             batch_prompt_ids=[0],
             batch_token_ids=[list(range(seq_len))],
             batch_reward_results=[reward2],
@@ -208,9 +208,9 @@ class TestSpanBasedAdvantages:
 
         # H tokens should have MORE signal than non-H tokens (format + H vs format only)
         # Token 10 only has format mask, tokens 3 has format + H
-        assert abs(advs[3].item()) > abs(
-            advs[10].item()
-        ), "H tokens should have stronger signal than non-expression tokens"
+        assert abs(advs[3].item()) > abs(advs[10].item()), (
+            "H tokens should have stronger signal than non-expression tokens"
+        )
 
     def test_backward_compat_empty_masks(self):
         """When token_masks are empty, all advantages should be zero."""
@@ -328,12 +328,12 @@ class TestRewardResultSpans:
         assert len(result.scored_spans["q_correct_H"]) >= 1
         # Format targets labeled sections only - NOT full completion
         # This prevents rewarding arbitrary text outside labeled regions
-        assert result.scored_spans["q_format"] != [
-            (0, len(text))
-        ], "q_format must NOT span full completion - only labeled sections"
-        assert (
-            len(result.scored_spans["q_format"]) >= 1
-        ), "q_format should have labeled section spans"
+        assert result.scored_spans["q_format"] != [(0, len(text))], (
+            "q_format must NOT span full completion - only labeled sections"
+        )
+        assert len(result.scored_spans["q_format"]) >= 1, (
+            "q_format should have labeled section spans"
+        )
 
 
 # --- Per-quality advantage edge cases ---
@@ -374,7 +374,7 @@ class TestPerQualityAdvantageEdgeCases:
         # Second pass: perfect H score
         estimator.set_current_step(2)
         reward2 = RewardResult(reward=0.9, scores={"q_format": 0.8, "q_correct_H": 1.0})
-        advs, metrics = estimator.compute_advantages_with_spans(
+        _advs, metrics = estimator.compute_advantages_with_spans(
             batch_prompt_ids=[0],
             batch_token_ids=[list(range(seq_len))],
             batch_reward_results=[reward2],
@@ -425,9 +425,9 @@ class TestPerQualityAdvantageEdgeCases:
 
         # Should decay toward prior (0.5)
         assert baseline_stale < baseline_fresh, "Stale baseline should decay"
-        assert (
-            baseline_stale > 0.4 and baseline_stale < 0.8
-        ), f"Stale baseline should be closer to prior (0.5): {baseline_stale}"
+        assert baseline_stale > 0.4 and baseline_stale < 0.8, (
+            f"Stale baseline should be closer to prior (0.5): {baseline_stale}"
+        )
 
     def test_overlapping_spans_normalized(self):
         """Tokens covered by multiple qualities should get normalized average."""
@@ -466,22 +466,22 @@ class TestPerQualityAdvantageEdgeCases:
 
         # Token 1 (only q_a): should get q_a advantage
         token_1_adv = advs[0][1].item()
-        assert (
-            abs(token_1_adv - a_adv) < 1e-4
-        ), f"Token 1 should match q_a adv: {token_1_adv} vs {a_adv}"
+        assert abs(token_1_adv - a_adv) < 1e-4, (
+            f"Token 1 should match q_a adv: {token_1_adv} vs {a_adv}"
+        )
 
         # Token 7 (only q_b): should get q_b advantage
         token_7_adv = advs[0][7].item()
-        assert (
-            abs(token_7_adv - b_adv) < 1e-4
-        ), f"Token 7 should match q_b adv: {token_7_adv} vs {b_adv}"
+        assert abs(token_7_adv - b_adv) < 1e-4, (
+            f"Token 7 should match q_b adv: {token_7_adv} vs {b_adv}"
+        )
 
         # Token 4 (overlap q_a + q_b): should get normalized average
         token_4_adv = advs[0][4].item()
         expected_overlap = (a_adv + b_adv) / 2.0
-        assert (
-            abs(token_4_adv - expected_overlap) < 1e-4
-        ), f"Overlap token should get average: {token_4_adv} vs {expected_overlap}"
+        assert abs(token_4_adv - expected_overlap) < 1e-4, (
+            f"Overlap token should get average: {token_4_adv} vs {expected_overlap}"
+        )
 
     def test_learnability_variance_thresholds(self):
         """Test learnability = p(1-p) at various mastery levels."""
@@ -524,7 +524,7 @@ class TestPerQualityAdvantageEdgeCases:
 
         # First observation: r=0.8, V=prior=0.5 → advantage = 0.3
         reward = RewardResult(reward=0.8, scores={"q_new": 0.8})
-        advs, metrics = estimator.compute_advantages_with_spans(
+        _advs, metrics = estimator.compute_advantages_with_spans(
             batch_prompt_ids=[0],
             batch_token_ids=[list(range(seq_len))],
             batch_reward_results=[reward],
@@ -615,13 +615,13 @@ class TestPerQualityAdvantageEdgeCases:
         q_b_loss = (per_token_loss[0] * q_b_mask).sum() / q_b_mask.sum()
 
         # Should be different (different token regions)
-        assert (
-            q_a_loss.item() != q_b_loss.item()
-        ), "Per-quality losses should differ for different regions"
+        assert q_a_loss.item() != q_b_loss.item(), (
+            "Per-quality losses should differ for different regions"
+        )
 
         # Full mask should match mean of per-token loss
         full_loss = per_token_loss[0].mean()
         weighted_avg = (q_a_loss * 10 + q_b_loss * 10) / 20
-        assert (
-            abs(full_loss.item() - weighted_avg.item()) < 1e-5
-        ), "Weighted average should match full mean"
+        assert abs(full_loss.item() - weighted_avg.item()) < 1e-5, (
+            "Weighted average should match full mean"
+        )

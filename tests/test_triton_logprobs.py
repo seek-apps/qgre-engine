@@ -33,9 +33,9 @@ def test_triton_logprobs_small():
         .squeeze(-1)
     )
 
-    assert torch.allclose(
-        result, expected, atol=1e-3
-    ), f"max diff: {(result - expected).abs().max()}"
+    assert torch.allclose(result, expected, atol=1e-3), (
+        f"max diff: {(result - expected).abs().max()}"
+    )
     assert (result <= 0).all()
 
 
@@ -60,9 +60,9 @@ def test_triton_logprobs_non_power_of_2_vocab():
         .squeeze(-1)
     )
 
-    assert torch.allclose(
-        result, expected, atol=1e-3
-    ), f"max diff: {(result - expected).abs().max()}"
+    assert torch.allclose(result, expected, atol=1e-3), (
+        f"max diff: {(result - expected).abs().max()}"
+    )
     assert result.isfinite().all()
 
 
@@ -87,6 +87,6 @@ def test_triton_logprobs_with_bias():
         .squeeze(-1)
     )
 
-    assert torch.allclose(
-        result, expected, atol=1e-3
-    ), f"max diff: {(result - expected).abs().max()}"
+    assert torch.allclose(result, expected, atol=1e-3), (
+        f"max diff: {(result - expected).abs().max()}"
+    )

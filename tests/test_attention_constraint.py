@@ -54,12 +54,12 @@ def test_advantage_dampening():
     dampened_pos = apply_importance_constraint(positive_advs, importance, strength=1.0)
 
     # Token 3 should have lower advantage (dampened)
-    assert (
-        dampened_pos[3] < dampened_pos[0]
-    ), "High-importance token should have lower positive advantage"
-    assert (
-        dampened_pos[3] < 0.6
-    ), f"Token 3 positive advantage should be dampened below 0.6, got {dampened_pos[3]}"
+    assert dampened_pos[3] < dampened_pos[0], (
+        "High-importance token should have lower positive advantage"
+    )
+    assert dampened_pos[3] < 0.6, (
+        f"Token 3 positive advantage should be dampened below 0.6, got {dampened_pos[3]}"
+    )
 
     # Test 2: NEGATIVE advantages should ALSO be dampened (symmetric treatment)
     # Fix: asymmetric dampening caused gradient bias — now both signs are dampened equally
@@ -69,9 +69,9 @@ def test_advantage_dampening():
     # Token 3 should have SAME dampening ratio as positive (symmetric)
     pos_ratio = dampened_pos[3] / 1.0  # dampened / original
     neg_ratio = dampened_neg[3] / -1.0  # dampened / original (both negative, so ratio positive)
-    assert (
-        abs(pos_ratio - neg_ratio) < 0.01
-    ), f"Dampening should be symmetric: pos={pos_ratio}, neg={neg_ratio}"
+    assert abs(pos_ratio - neg_ratio) < 0.01, (
+        f"Dampening should be symmetric: pos={pos_ratio}, neg={neg_ratio}"
+    )
 
     print(f"Positive advantages (dampened): {[f'{x:.3f}' for x in dampened_pos.tolist()]}")
     print(f"Negative advantages (dampened): {[f'{x:.3f}' for x in dampened_neg.tolist()]}")
@@ -100,9 +100,9 @@ def test_causal_decay_computation():
     assert 0.19 <= decay_2048 <= 0.21, f"decay(2048) should be 0.2, got {decay_2048}"
 
     # Monotonic: longer sequences should have lower decay
-    assert (
-        decay_128 >= decay_512 >= decay_2048
-    ), f"Decay should be monotonically decreasing: {decay_128} >= {decay_512} >= {decay_2048}"
+    assert decay_128 >= decay_512 >= decay_2048, (
+        f"Decay should be monotonically decreasing: {decay_128} >= {decay_512} >= {decay_2048}"
+    )
 
     print(
         f"Causal decay: seq=128 → {decay_128:.3f}, seq=512 → {decay_512:.3f}, seq=2048 → {decay_2048:.3f}"
@@ -166,9 +166,9 @@ def test_entropy_importance():
     # Late tokens with high entropy should have LOW importance (decision points)
     late_importance = importance[:, 15:20].mean().item()
 
-    assert (
-        early_importance > late_importance
-    ), f"Early/low-entropy tokens should have higher importance: {early_importance:.4f} > {late_importance:.4f}"
+    assert early_importance > late_importance, (
+        f"Early/low-entropy tokens should have higher importance: {early_importance:.4f} > {late_importance:.4f}"
+    )
 
     print(f"Early tokens (0-5) importance: {early_importance:.4f}")
     print(f"Late tokens (15-20) importance: {late_importance:.4f}")
@@ -206,9 +206,9 @@ def test_eric_modes():
         position_decay=1.0,
     )
     for i in range(seq - 1):
-        assert (
-            position_importance[0, i] >= position_importance[0, i + 1]
-        ), f"Position mode should be monotonically decreasing: pos {i} ({position_importance[0, i]:.3f}) < pos {i+1} ({position_importance[0, i+1]:.3f})"
+        assert position_importance[0, i] >= position_importance[0, i + 1], (
+            f"Position mode should be monotonically decreasing: pos {i} ({position_importance[0, i]:.3f}) < pos {i + 1} ({position_importance[0, i + 1]:.3f})"
+        )
 
     print("test_eric_modes PASSED")
 

@@ -297,7 +297,7 @@ class TestBatchValidation:
         batch_size = 0
 
         if batch_size == 0:
-            with pytest.raises(RuntimeError, match="[Ee]mpty batch"):
+            with pytest.raises(RuntimeError, match=r"[Ee]mpty batch"):
                 raise RuntimeError(
                     "Empty batch received. Check data pipeline or dynamic batch sizing.",
                 )
@@ -372,8 +372,7 @@ class TestPadTokenValidation:
         is_valid = vocab_size is None or tokenizer.pad_token_id < vocab_size
 
         assert is_valid, (
-            f"pad_token_id={tokenizer.pad_token_id} should be valid "
-            f"(< len(tokenizer)={vocab_size})"
+            f"pad_token_id={tokenizer.pad_token_id} should be valid (< len(tokenizer)={vocab_size})"
         )
 
     def test_truly_invalid_pad_token_rejected(self):

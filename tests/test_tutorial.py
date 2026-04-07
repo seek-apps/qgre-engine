@@ -804,7 +804,7 @@ class TestIntegration:
         rr1 = RewardResult(reward=0.5, scores={"q_format": 0.5, "q_accuracy": 0.5})
         rr2 = RewardResult(reward=0.5, scores={"q_format": 0.5, "q_accuracy": 0.5})
 
-        advs, regions = estimator.compute_advantages(
+        advs, _regions = estimator.compute_advantages(
             batch_prompt_ids=[1, 2],
             batch_token_ids=[[1, 2, 3], [4, 5, 6]],
             batch_reward_results=[rr1, rr2],

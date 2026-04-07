@@ -65,7 +65,7 @@ def test_all_prompts_filtered_raises(sample_prompts, tokenizer):
     """All prompts filtered → raises ValueError."""
     import pytest
 
-    with pytest.raises(ValueError, match="All .* prompts filtered"):
+    with pytest.raises(ValueError, match=r"All .* prompts filtered"):
         QGREDataLoader(
             prompts=sample_prompts,
             tokenizer=tokenizer,
@@ -243,9 +243,9 @@ def test_set_priorities_changes_sampling(sample_prompts, tokenizer):
     sampled_ids = [pid for batch in batches for pid in batch.prompt_ids]
     # First prompt should dominate (>50% of samples)
     first_count = sampled_ids.count(all_ids[0])
-    assert (
-        first_count > len(sampled_ids) * 0.3
-    ), f"High-priority prompt sampled {first_count}/{len(sampled_ids)} times, expected >30%"
+    assert first_count > len(sampled_ids) * 0.3, (
+        f"High-priority prompt sampled {first_count}/{len(sampled_ids)} times, expected >30%"
+    )
 
 
 def test_set_priorities_none_falls_back_to_uniform(sample_prompts, tokenizer):

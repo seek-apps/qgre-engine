@@ -473,9 +473,9 @@ def test_step_records_mastery_and_advances_phase():
             metrics = trainer.step(batch, [tokens, tokens], rrs)
 
         # After 25 steps with high step-1 scores, phase should have advanced
-        assert (
-            trainer.game_state.phase >= 2
-        ), f"Phase should have advanced, got {trainer.game_state.phase}"
+        assert trainer.game_state.phase >= 2, (
+            f"Phase should have advanced, got {trainer.game_state.phase}"
+        )
         assert "mastery/default/step_1" in metrics
 
 
@@ -534,9 +534,9 @@ def test_length_penalty_applied_when_high_correctness():
             RewardResult(reward=0.8, scores={"q_format_tags": 0.8, "q_tag_content": 0.8}),
         ]
         metrics = trainer.step(batch, [tokens, tokens], rrs)
-        assert (
-            "length_penalty" in metrics
-        ), "Length penalty should be in metrics when correctness is high"
+        assert "length_penalty" in metrics, (
+            "Length penalty should be in metrics when correctness is high"
+        )
 
 
 def test_length_penalty_skipped_when_low_correctness():
@@ -560,9 +560,9 @@ def test_length_penalty_skipped_when_low_correctness():
             RewardResult(reward=0.1, scores={"q_format_tags": 0.1, "q_tag_content": 0.1}),
         ]
         metrics = trainer.step(batch, [tokens, tokens], rrs)
-        assert (
-            "length_penalty" not in metrics
-        ), "Length penalty should NOT be applied when correctness is low"
+        assert "length_penalty" not in metrics, (
+            "Length penalty should NOT be applied when correctness is low"
+        )
 
 
 # --- Fix 1: KL defaults ---
