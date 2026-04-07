@@ -2323,18 +2323,19 @@ class QGRETrainer:
         # Restore fused_validated from checkpoint — same weights, same validation status
         self._fused_validated = checkpoint.trainer.fused_validated
 
-        # W11: Restore WeightLoaderState to backend.weight_loader
+        # W11: Restore WeightLoaderState to generation_backend.weight_loader
         if (
             checkpoint.weight_loader
-            and hasattr(self, "backend")
-            and hasattr(self.backend, "weight_loader")
+            and hasattr(self, "generation_backend")
+            and self.generation_backend is not None
+            and hasattr(self.generation_backend, "weight_loader")
         ):
             wl_state = checkpoint.weight_loader
-            self.backend.weight_loader._direct_ready = wl_state.initialized
-            self.backend.weight_loader._load_lora_called = wl_state.load_lora_called
+            self.generation_backend.weight_loader._direct_ready = wl_state.initialized  # type: ignore[union-attr]
+            self.generation_backend.weight_loader._load_lora_called = wl_state.load_lora_called  # type: ignore[union-attr]
             # Don't restore cleaned_up=True (would prevent future use)
             if not wl_state.cleaned_up:
-                self.backend.weight_loader._cleaned_up = False
+                self.generation_backend.weight_loader._cleaned_up = False  # type: ignore[union-attr]
 
         # Zero gradients AFTER resume to avoid clearing loaded optimizer state
         if self.optimizer is not None:
