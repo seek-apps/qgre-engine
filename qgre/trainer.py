@@ -3095,10 +3095,25 @@ class QGRETrainer:
                         torch.cuda.empty_cache()
                     raise
                 finally:
-                    # Always restore clean weights — even if generate crashes
-                    # Don't sync to vLLM here — step-end sync (after training) handles it
+                    # Always restore clean weights — even if generate crashes.
+                    # Don't sync to vLLM here — step-end sync (after training) handles it.
+                    # If restore itself raises on the happy path (e.g. CUDA OOM mid-copy),
+                    # log it but don't mask the successful generation: apply_lora_dropout's
+                    # restore closure has already set state.restore_failed=True via
+                    # exit_dropout(success=False), so the next weight_bus.sync() will be
+                    # blocked by check_sync_allowed() with full context. On the failure
+                    # path (generation already raising), let the restore exception
+                    # propagate so it chains with the original.
                     if restore_lora is not None:
-                        restore_lora()
+                        try:
+                            restore_lora()
+                        except Exception:
+                            logging.getLogger(__name__).exception(
+                                "LoRA dropout restore failed in finally block. "
+                                "state.restore_failed is set; next sync will halt with diagnostics.",
+                            )
+                            if not generation_succeeded:
+                                raise
 
                 # 2. Score via reward_fn
                 if output is None:
