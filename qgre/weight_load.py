@@ -348,7 +348,7 @@ class WeightLoader:
                             stacklevel=2,
                         )
                         tensor = tensor.to(dtype=target.dtype)
-                    target.data.copy_(tensor.to(device=target.device))
+                    target.data.copy_(tensor.to(device=target.device).contiguous())
                     synced.append(name)
         except Exception as e:
             # WS3-006: Rollback on failure (log error, don't crash)
@@ -435,6 +435,8 @@ class WeightLoader:
             f"has_model={hasattr(self._model, 'model')}, "
             f"base_has_vllm_engine={hasattr(getattr(self._model, 'model', None), 'vllm_engine')}",
         )
+        # Clear any cached reference before raising
+        self._cached_vllm_model = None
         raise RuntimeError(
             "get_vllm_model: traversal failed. Could not find vLLM model via engine chain. "
             f"Checked attributes: vllm_engine, model. "

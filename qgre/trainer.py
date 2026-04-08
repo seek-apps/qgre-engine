@@ -2178,9 +2178,16 @@ class QGRETrainer:
                     "Skipping scheduler restore, learning rate schedule will restart.",
                     stacklevel=2,
                 )
-            elif optimizer_loaded:
+            else:
+                # Load scheduler state even when optimizer is skipped (mid-accumulation NaN)
                 import warnings  # Import here for use in all branches below
 
+                if not optimizer_loaded:
+                    warnings.warn(
+                        "Optimizer skipped due to NaN but scheduler will still load. "
+                        "Learning rate schedule continues from checkpoint.",
+                        stacklevel=2,
+                    )
                 # Check if T_max changed (indicating new schedule)
                 if hasattr(self.scheduler, "T_max"):
                     ckpt_T_max = checkpoint.scheduler_state_dict.get("T_max")
@@ -2210,7 +2217,6 @@ class QGRETrainer:
                             "Learning rate schedule will restart from step 0.",
                             stacklevel=2,
                         )
-            # If optimizer wasn't loaded, scheduler starts fresh too
         if checkpoint.game_state:
             self.game_state = checkpoint.game_state
         # CheckpointState: advantage_estimator is AdvantageEstimatorState which wraps state_dict

@@ -479,23 +479,25 @@ class UnslothBackend:
                 )
             mask = attention_mask[i].bool()
             tokens = input_ids[i][mask].tolist()
+            prompt_token_count = len(tokens)  # Use original token count instead of round-trip
             text = self.tokenizer.decode(tokens, skip_special_tokens=False)  # type: ignore[union-attr]
             # Force disable thinking mode: append </think> if not already present
             # This ensures model generates direct answers, not <think> blocks
             if "</think>" not in text:
                 template = "<think>\n</think>\n\n"
                 text_with_template = text.rstrip() + template
-                # Validate total length after template injection
-                template_tokens = self.tokenizer.encode(text_with_template, add_special_tokens=False)  # type: ignore[union-attr]
+                # Validate total length after template injection using original token count
+                template_token_count = len(self.tokenizer.encode(template, add_special_tokens=False))  # type: ignore[union-attr]
+                total_tokens = prompt_token_count + template_token_count
                 max_seq_length = self.max_prompt_length + self.generation_config.max_tokens
-                if len(template_tokens) > max_seq_length:
+                if total_tokens > max_seq_length:
                     import logging
                     logging.getLogger(__name__).warning(
-                        f"Thinking template injection exceeds budget ({len(template_tokens)} > {max_seq_length}). "
+                        f"Thinking template injection exceeds budget ({total_tokens} > {max_seq_length}). "
                         f"Truncating prompt to fit within budget.",
                     )
                     # Truncate original text to make room for template
-                    budget_for_text = max_seq_length - len(self.tokenizer.encode(template, add_special_tokens=False))  # type: ignore[union-attr]
+                    budget_for_text = max_seq_length - template_token_count
                     if budget_for_text > 0:
                         truncated_tokens = self.tokenizer.encode(text, add_special_tokens=False)[:budget_for_text]  # type: ignore[union-attr]
                         text = self.tokenizer.decode(truncated_tokens, skip_special_tokens=False)  # type: ignore[union-attr]
@@ -601,7 +603,7 @@ class UnslothBackend:
             # We need the SAMPLED token's logprob at each position (not top-1).
             # With logprobs=1, vLLM always includes the sampled token plus up to 1 top token.
             sample_lps = []
-            if completion_out.logprobs is not None and len(completion_out.logprobs) > 0:
+            if completion_out.logprobs is not None and len(completion_out.logprobs) > 0 and len(completion_ids) > 0:
                 if len(completion_out.logprobs) != len(completion_ids):
                     import warnings
 
@@ -653,11 +655,28 @@ class UnslothBackend:
                             stacklevel=2,
                         )
                         sample_lps.append(float("-inf"))
-            if len(sample_lps) != len(completion_ids):
-                raise RuntimeError(
-                    f"Logprobs length mismatch: {len(sample_lps)} != {len(completion_ids)} for prompt {idx}"
+            # Handle empty logprobs or accept partial logprobs (first N tokens)
+            if len(sample_lps) == 0:
+                # Empty logprobs — append None to maintain indexing
+                all_logprobs.append(None)
+            elif len(sample_lps) < len(completion_ids):
+                # Partial logprobs (e.g., stop token truncated) — accept first N
+                import warnings
+                warnings.warn(
+                    f"Partial logprobs: {len(sample_lps)} < {len(completion_ids)} for prompt {idx}. "
+                    f"Accepting first {len(sample_lps)} logprobs (stop token or early truncation).",
+                    stacklevel=2,
                 )
-            all_logprobs.append(sample_lps)
+                # Pad with None to maintain length consistency
+                sample_lps.extend([None] * (len(completion_ids) - len(sample_lps)))  # type: ignore[arg-type]
+                all_logprobs.append(sample_lps)
+            elif len(sample_lps) > len(completion_ids):
+                # More logprobs than tokens — error condition
+                raise RuntimeError(
+                    f"Logprobs length mismatch: {len(sample_lps)} > {len(completion_ids)} for prompt {idx}"
+                )
+            else:
+                all_logprobs.append(sample_lps)
 
         # G6: Support partial logprobs — return valid logprobs for samples that passed, None for failed
         # has_logprobs = True if ALL samples have logprobs (strict mode for LLDS), False otherwise

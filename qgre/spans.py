@@ -23,6 +23,10 @@ if TYPE_CHECKING:
 # The actual sign-aware penalty is applied in advantages.py.
 REPETITION_MARKER = -1.0
 
+# Consistency validation: spans.py and segments.py must use same skip_special_tokens setting.
+# Both now use skip_special_tokens=False to preserve special tokens during decode.
+_EXPECTED_SKIP_SPECIAL_TOKENS = False
+
 
 def build_char_to_token_map(
     token_ids: list[int],
@@ -49,9 +53,9 @@ def build_char_to_token_map(
         return None
 
     # Get the full decoded text (this is what the reward function scored)
-    # CRITICAL: vLLM's output.text uses skip_special_tokens=True, so we must match
+    # CRITICAL: Match segments.py — use skip_special_tokens=False for consistency
     try:
-        full_text = tokenizer.decode(token_ids, skip_special_tokens=True)
+        full_text = tokenizer.decode(token_ids, skip_special_tokens=False)
     except (ValueError, TypeError, RuntimeError) as e:
         warnings.warn(f"build_char_to_token_map: full decode failed: {e}", stacklevel=2)
         return None
@@ -69,7 +73,7 @@ def build_char_to_token_map(
     for tok_idx, tid in enumerate(token_ids):
         try:
             # Decode this single token
-            tok_text = tokenizer.decode([tid], skip_special_tokens=True)
+            tok_text = tokenizer.decode([tid], skip_special_tokens=False)
             tok_len = len(tok_text)
 
             # Find where this token's text appears in full_text starting from char_pos

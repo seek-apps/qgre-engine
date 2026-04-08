@@ -16,6 +16,11 @@ import threading
 from enum import Enum
 from typing import TYPE_CHECKING
 
+# Import at module level to avoid ImportError in exception handler
+try:
+    from qgre.lora_dropout import apply_lora_dropout
+except ImportError:
+    apply_lora_dropout = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
     from torch import nn
@@ -96,7 +101,7 @@ class WeightBus:
                     exporter.get_modules_to_save(model, expected=modules_to_save), ctx
                 )
                 # Flush KV cache after DIRECT_COPY modules_to_save (embed_tokens, lm_head)
-                ctx.flush_kv_cache()
+                loader.flush_kv_cache()
                 # Mark sync as executed and set initialized flag
                 sync_executed = True
                 with self._sync_lock:
@@ -104,12 +109,8 @@ class WeightBus:
                     self._engine_id = engine_id
         except Exception as e:
             # Clear dropout state in exception handler to prevent stuck state
-            try:
-                from qgre.lora_dropout import apply_lora_dropout
-                if hasattr(apply_lora_dropout, "_dropout_active"):
-                    apply_lora_dropout._dropout_active = False
-            except ImportError:
-                pass
+            if apply_lora_dropout is not None and hasattr(apply_lora_dropout, "_dropout_active"):
+                apply_lora_dropout._dropout_active = False
             # Don't set initialized=True on failure — next sync will retry first_call path
             raise RuntimeError(f"Weight sync failed: {e}") from e
 
