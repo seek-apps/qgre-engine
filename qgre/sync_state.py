@@ -124,8 +124,10 @@ class SyncState:
                     "Generations may use corrupted cache. Call reset_for_engine_recreate()."
                 )
             if self.dropout_active:
-                # This is a skip, not an error - caller should check can_sync() first
-                pass
+                raise RuntimeError(
+                    "Cannot sync while LoRA dropout is active. "
+                    "Call can_sync() first or disable dropout."
+                )
 
     def begin_sync(self) -> None:
         """Begin sync operation. Transitions to LOADING state."""

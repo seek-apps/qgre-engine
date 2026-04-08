@@ -283,9 +283,11 @@ class LoRAProAdjuster:
                     X = solve_sylvester(B_TB, AA_T, C)
                 except Exception as e:
                     self._sylvester_failures += 1
-                    logger.warning(
+                    import warnings
+                    warnings.warn(
                         f"LoRA-Pro: Sylvester solve failed for {layer_id}: {e}. "
-                        f"Using simplified adjustment. Total failures: {self._sylvester_failures}"
+                        f"Using simplified adjustment (zero matrix). Total failures: {self._sylvester_failures}",
+                        stacklevel=2,
                     )
                     X = torch.zeros_like(C)
 

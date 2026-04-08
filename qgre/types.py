@@ -1705,7 +1705,8 @@ class GameState:
                 return None  # This tier hasn't mastered the required phase
 
         # All active tiers before next_tier are ready — unlock it
-        self.active_tiers.append(next_tier)
+        if next_tier not in self.active_tiers:
+            self.active_tiers.append(next_tier)
         self.tier_phases[next_tier] = 1
         self.tier_steps_at_phase_start[next_tier] = self.step_count
         return next_tier

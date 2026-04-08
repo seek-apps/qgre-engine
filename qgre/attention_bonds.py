@@ -317,7 +317,7 @@ def compute_entropy_importance(
     # Pad to requested seq_len if needed
     if actual_len < seq_len:
         pad_size = seq_len - actual_len
-        importance = F.pad(importance, (0, pad_size), value=0.0)
+        importance = F.pad(importance, (0, pad_size), value=1.0)
 
     return importance.clamp(0.0, 1.0)
 

@@ -171,7 +171,7 @@ class VPRMCritic(nn.Module):
         for step_id in step_ids_present:
             mask = (region_ids == step_id).float()
             count = mask.sum()
-            if count > 0:
+            if count > 1e-6:
                 pooled = (hidden_states * mask.unsqueeze(-1)).sum(dim=0) / count
                 region_pools[f"STEP_{step_id}"] = pooled
 
@@ -318,21 +318,19 @@ class VPRMCritic(nn.Module):
                 )
                 continue
             # ADV-R2-6: Warn when no gradient will flow
+            if not hasattr(self, "_no_grad_warned"):
+                self._no_grad_warned = set()
             if not online_pred.requires_grad:
-                if not hasattr(self, "_no_grad_warned"):
-                    self._no_grad_warned = set()
                 if q_name not in self._no_grad_warned:
-                    import warnings
-
-                    warnings.warn(
-                        f"Critic head '{q_name}' has requires_grad=False — no loss recorded, critic will not learn",
-                        stacklevel=2,
+                    import logging
+                    logging.getLogger(__name__).error(
+                        f"Critic head '{q_name}' has requires_grad=False — skipping advantage computation to prevent stale predictions"
                     )
                     self._no_grad_warned.add(q_name)
-            if online_pred.requires_grad:
-                # C01-DEVICE: Use ctx.device for tensor creation
-                reward_target = torch.tensor(actual, device=ctx.device, dtype=online_pred.dtype)
-                critic_losses[q_name] = (online_pred - reward_target) ** 2
+                continue
+            # C01-DEVICE: Use ctx.device for tensor creation
+            reward_target = torch.tensor(actual, device=ctx.device, dtype=online_pred.dtype)
+            critic_losses[q_name] = (online_pred - reward_target) ** 2
 
         return advantages, critic_losses
 

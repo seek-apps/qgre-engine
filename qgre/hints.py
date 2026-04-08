@@ -254,6 +254,8 @@ class HintRegistry:
         mastery = max(0.0, min(1.0, mastery))
         if mastery >= self.mastery_threshold:
             return 0.0
+        if self.mastery_threshold <= 0:
+            return 0.0
         prob = 1.0 - mastery / self.mastery_threshold
         return max(0.0, min(1.0, prob))
 

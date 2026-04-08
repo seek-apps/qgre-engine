@@ -324,7 +324,7 @@ class WeightLoader:
                             stacklevel=2,
                         )
                         tensor = tensor.to(dtype=target.dtype)
-                    target.data.copy_(tensor.to(device=target.device))
+                    target.data.copy_(tensor.to(device=target.device).contiguous())
                     synced.append(name)
                 elif name == "embed_tokens":
                     try:

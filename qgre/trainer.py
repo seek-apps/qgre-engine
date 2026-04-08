@@ -2147,8 +2147,23 @@ class QGRETrainer:
                     print(f"│  Step counter: ✓ LOADED{' ' * 34}│")
                     print(f"└{'─' * 60}┘")
                 else:
-                    self.optimizer.load_state_dict(ckpt_opt)
-                    optimizer_loaded = True
+                    has_nan = False
+                    for state in ckpt_opt.get("state", {}).values():
+                        if any(
+                            torch.isnan(v).any() if isinstance(v, torch.Tensor) else False
+                            for v in state.values()
+                        ):
+                            has_nan = True
+                            break
+                    if has_nan:
+                        import warnings
+                        warnings.warn(
+                            "Optimizer state contains NaN values. Skipping load to prevent corruption.",
+                            stacklevel=2,
+                        )
+                    else:
+                        self.optimizer.load_state_dict(ckpt_opt)
+                        optimizer_loaded = True
 
         if checkpoint.scheduler_state_dict and self.scheduler:
             # R2-CSM-003: Validate scheduler state dict is non-empty before load
@@ -2348,6 +2363,11 @@ class QGRETrainer:
             self._accumulated_loss = checkpoint.trainer.accumulated_loss
             self._accumulated_samples = checkpoint.trainer.accumulated_samples
             self._accumulation_count = checkpoint.trainer.accumulation_count
+            if not torch.isfinite(torch.tensor(self._accumulated_loss)):
+                logging.getLogger(__name__).warning(
+                    f"Accumulated loss is not finite ({self._accumulated_loss}). Resetting to 0.0."
+                )
+                self._accumulated_loss = 0.0
         # DI1: Store dataloader state for restore in train() when dataloader is available
         # CheckpointState: dataloader is now DataLoaderState dataclass
         from dataclasses import asdict

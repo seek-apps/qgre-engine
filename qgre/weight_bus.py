@@ -95,6 +95,8 @@ class WeightBus:
                 loader.sync_modules_to_save(
                     exporter.get_modules_to_save(model, expected=modules_to_save), ctx
                 )
+                # Flush KV cache after DIRECT_COPY modules_to_save (embed_tokens, lm_head)
+                ctx.flush_kv_cache()
                 # Mark sync as executed and set initialized flag
                 sync_executed = True
                 with self._sync_lock:

@@ -450,10 +450,16 @@ class UnslothBackend:
                             stacklevel=2,
                         )
 
+        temperature = self.generation_config.temperature
+        top_p = self.generation_config.top_p
+        top_k = self.generation_config.top_k if self.generation_config.top_k > 0 else -1
+        if temperature == 0:
+            top_p = 1.0
+            top_k = -1
         sampling_params = SamplingParams(
-            temperature=self.generation_config.temperature,
-            top_p=self.generation_config.top_p,
-            top_k=self.generation_config.top_k if self.generation_config.top_k > 0 else -1,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
             min_p=self.generation_config.min_p,
             max_tokens=self.generation_config.max_tokens,
             repetition_penalty=self.generation_config.repetition_penalty,
@@ -551,6 +557,10 @@ class UnslothBackend:
             lora_request=lora_req,
         )
 
+        if len(outputs) != len(prompts):
+            raise RuntimeError(
+                f"vLLM output count mismatch: {len(outputs)} outputs != {len(prompts)} prompts"
+            )
         token_ids = []
         texts = []
         all_logprobs = []
@@ -606,7 +616,7 @@ class UnslothBackend:
                         continue
                     # Extract by the actual sampled token_id — NOT by dict iteration order.
                     # With temperature > 0, the sampled token may differ from top-1.
-                    sampled_id = completion_ids[t]
+                    sampled_id = int(completion_ids[t])
                     if sampled_id in pos_dict:
                         sample_lps.append(pos_dict[sampled_id].logprob)
                     else:
@@ -620,6 +630,10 @@ class UnslothBackend:
                             stacklevel=2,
                         )
                         sample_lps.append(float("-inf"))
+            if len(sample_lps) != len(completion_ids):
+                raise RuntimeError(
+                    f"Logprobs length mismatch: {len(sample_lps)} != {len(completion_ids)} for prompt {idx}"
+                )
             all_logprobs.append(sample_lps)
 
         # G6: Support partial logprobs — return valid logprobs for samples that passed, None for failed

@@ -65,9 +65,9 @@ def selective_log_softmax(
         # Loop over batch to avoid materializing full [batch, seq, vocab]
         # LP-R3-01: Add bounds validation for fp32 path
         if logits.ndim > 3:
-            logits = logits.squeeze()
+            logits = logits.reshape(-1, logits.shape[-2], logits.shape[-1])
         if index.ndim > 2:
-            index = index.squeeze()
+            index = index.reshape(-1, index.shape[-1])
         vocab_size = logits.shape[-1]
         if (index < 0).any() or (index >= vocab_size).any():
             raise ValueError(

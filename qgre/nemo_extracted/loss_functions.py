@@ -213,7 +213,9 @@ class ClippedPGLossFn:
         # KL regularization
         if self.reference_policy_kl_penalty != 0 and reference_logprobs is not None:
             if self.use_on_policy_kl_approximation:
-                kl_weights = torch.exp(curr_logprobs - prev_logprobs).detach()
+                log_ratio = (curr_logprobs - prev_logprobs).detach()
+                log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
+                kl_weights = torch.exp(log_ratio)
                 kl_weights = torch.nan_to_num(kl_weights, nan=0.0, posinf=0.0, neginf=0.0)
             else:
                 kl_weights = torch.ones_like(curr_logprobs)
