@@ -39,6 +39,7 @@ from qgre.types import (
     TrainerState,
     TrainingContext,
     TrainingStep,
+    WeightLoaderState,
 )
 
 
@@ -2063,6 +2064,17 @@ class QGRETrainer:
             cuda_rng_state=torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
         )
 
+        # Persist SyncState through the legacy WeightLoaderState container so
+        # restore_failed and the lifecycle survive a restart. SyncState.state_dict()
+        # uses uppercase enum names ("READY"); WeightLoaderLifecycle is lowercase
+        # ("ready") — convert at the seam.
+        sync_dict = self.sync_state.state_dict()
+        weight_loader_state = WeightLoaderState(
+            initialized=sync_dict["initialized"],
+            restore_failed=sync_dict["restore_failed"],
+            lifecycle=sync_dict["lifecycle"].lower(),
+        )
+
         save_checkpoint(
             path=path,
             global_step=self.global_step,
@@ -2080,6 +2092,7 @@ class QGRETrainer:
             if self._lora_pro_adjuster
             else None,
             trainer_state=trainer_state,  # Use StateSpec instead of individual fields
+            weight_loader_state=weight_loader_state,
         )
 
     def resume(self, checkpoint_dir: str | Path) -> bool:
@@ -2425,7 +2438,9 @@ class QGRETrainer:
             wl_state = checkpoint.weight_loader
             # Drive lifecycle through SyncState rather than the read-only legacy
             # _direct_ready / _load_lora_called properties (which now derive from
-            # state.lifecycle and have no setters).
+            # state.lifecycle and have no setters). By the time resume() runs in
+            # train(), backend.weight_loader._state has already been swapped to
+            # self.sync_state, so mutations here land on the authoritative state.
             loader_state = self.generation_backend.weight_loader._state
             from qgre.sync_state import SyncLifecycle
 
@@ -2434,6 +2449,10 @@ class QGRETrainer:
                 loader_state.initialized = True
             elif wl_state.load_lora_called:
                 loader_state.lifecycle = SyncLifecycle.LOADING
+            # Restore restore_failed — the only sticky safety flag that MUST
+            # round-trip. A run that crashed mid-LoRA-dropout-restore must
+            # refuse to re-enter dropout on resume.
+            loader_state.restore_failed = wl_state.restore_failed
             # W1: Restore lora_request_id if present (backward compat: may be None in old checkpoints)
             if hasattr(wl_state, "lora_request_id") and wl_state.lora_request_id is not None:
                 # Note: _lora_request is the actual LoRARequest object, not restored from checkpoint

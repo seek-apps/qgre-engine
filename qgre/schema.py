@@ -351,6 +351,11 @@ WEIGHT_LOADER_STATE_SCHEMA: dict[str, FieldSpec] = {
     "cleaned_up": FieldSpec(bool, Required.NO, default=False),
     "lora_request_id": FieldSpec(int, Required.NO, default=None),
     "lifecycle": FieldSpec(str, Required.NO, default="uninitialized"),
+    # SyncState.restore_failed — set when a LoRA dropout restore() failed mid-run.
+    # MUST persist across checkpoint/restart so a corrupted-weights state cannot
+    # silently re-enter dropout after restart. Default False for back-compat with
+    # older checkpoints that predate the field.
+    "restore_failed": FieldSpec(bool, Required.NO, default=False),
 }
 
 

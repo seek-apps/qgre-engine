@@ -248,6 +248,11 @@ class WeightLoaderState:
     lora_request_id: int | None = None
     # New: lifecycle enum as string (source of truth)
     lifecycle: str = "uninitialized"
+    # SyncState.restore_failed — sticky safety flag set when a LoRA dropout
+    # restore() failed mid-run. MUST round-trip through checkpoints so a
+    # corrupted-weights state cannot silently re-enter dropout after restart.
+    # Default False for back-compat with older checkpoints.
+    restore_failed: bool = False
 
     def __post_init__(self):
         """Sync legacy fields from lifecycle if lifecycle is explicitly set."""
