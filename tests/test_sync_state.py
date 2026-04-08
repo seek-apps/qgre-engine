@@ -56,7 +56,8 @@ class TestSyncStateTransitions:
 
         state = SyncState()
         state.enter_dropout()
-        with pytest.warns(UserWarning, match="twice without exit_dropout"):
+        # FIX 5: Double-entry now raises instead of warns
+        with pytest.raises(RuntimeError, match="already active"):
             state.enter_dropout()
 
 

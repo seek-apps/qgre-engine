@@ -248,24 +248,26 @@ def scored_spans_to_token_masks(
                     "Advantage signal lost for this span.",
                     stacklevel=2,
                 )
-            # Map char range → token indices and set mask
-            # First span: +1.0 (reward original answer), later spans: REPETITION_MARKER (penalize repeats)
-            # The marker is detected in advantages.py where sign-aware penalty is applied
+            # FIX 11: Validate all token indices BEFORE mutating mask
+            # First pass: validate
+            for c in range(cs, ce):
+                tok_idx = char_to_token[c]
+                if tok_idx == -1:
+                    continue
+                if tok_idx >= seq_len:
+                    raise RuntimeError(
+                        f"Span mapping exceeds seq_len. "
+                        f"tok_idx={tok_idx} >= seq_len={seq_len} for quality '{quality_name}'. "
+                        f"char_range=({cs}, {ce}), max_char={max_char}. "
+                        "Tokenizer or span detection is inconsistent."
+                    )
+            # Second pass: apply (only after all validation passed)
             is_first_span = has_any_first_occurrence and span_idx == 0
             span_value = 1.0 if is_first_span else REPETITION_MARKER
             for c in range(cs, ce):
                 tok_idx = char_to_token[c]
-                # AE-R2-02: Skip assignment when tok_idx == -1 (invalid mapping)
                 if tok_idx == -1:
                     continue
-                # DP3-005: Add assertion that tok_idx < seq_len with informative error
-                if tok_idx >= seq_len:
-                    raise RuntimeError(
-                        f"DP3-005: Span mapping exceeds seq_len. "
-                        f"tok_idx={tok_idx} >= seq_len={seq_len} for quality '{quality_name}'. "
-                        f"char_range=({cs}, {ce}), max_char={max_char}. "
-                        "Tokenizer or span detection is inconsistent.",
-                    )
                 mask[tok_idx] = span_value
         masks[quality_name] = mask
 

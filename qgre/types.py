@@ -273,14 +273,29 @@ class WeightLoaderState:
                     f"Valid values: {valid_values}. "
                     "This may indicate checkpoint corruption or schema mismatch.",
                 ) from e
-            # ELI-001: initialized = True only when READY (ERROR means failed)
-            self.initialized = lc == WeightLoaderLifecycle.READY
-            # load_lora_called = True when we've attempted loading (includes ERROR)
-            self.load_lora_called = lc in (
+            # FIX 17: Warn on inconsistent legacy fields before overwriting
+            expected_initialized = lc == WeightLoaderLifecycle.READY
+            expected_load_lora_called = lc in (
                 WeightLoaderLifecycle.LOADING,
                 WeightLoaderLifecycle.READY,
                 WeightLoaderLifecycle.ERROR,
             )
+            if self.initialized != expected_initialized:
+                warnings.warn(
+                    f"WeightLoaderState inconsistency: lifecycle={self.lifecycle} implies initialized={expected_initialized}, "
+                    f"but checkpoint has initialized={self.initialized}. Using lifecycle value.",
+                    stacklevel=2,
+                )
+            if self.load_lora_called != expected_load_lora_called:
+                warnings.warn(
+                    f"WeightLoaderState inconsistency: lifecycle={self.lifecycle} implies load_lora_called={expected_load_lora_called}, "
+                    f"but checkpoint has load_lora_called={self.load_lora_called}. Using lifecycle value.",
+                    stacklevel=2,
+                )
+            # ELI-001: initialized = True only when READY (ERROR means failed)
+            self.initialized = expected_initialized
+            # load_lora_called = True when we've attempted loading (includes ERROR)
+            self.load_lora_called = expected_load_lora_called
         # If legacy fields set but lifecycle is default, infer lifecycle
         elif self.initialized:
             self.lifecycle = WeightLoaderLifecycle.READY.value
@@ -1080,6 +1095,18 @@ class GameState:
                 learnability_threshold=sc.learnability_threshold,
                 recent_scores=deque(maxlen=sc.mastery_window),
             )
+
+            # FIX 6: Validate skill prompts exist in dataloader
+            if prompts:
+                # Check if any skill prompts are not in the dataloader
+                missing_prompts = set(prompts) - set(self.all_prompts)
+                if missing_prompts:
+                    raise ValueError(
+                        f"Skill '{key}' specifies prompt_ids not in dataloader: {missing_prompts}. "
+                        f"Available prompts: {len(self.all_prompts)}. "
+                        f"Skill would never receive completions and block dependent skills. "
+                        f"Check skill_tree config or dataloader filtering."
+                    )
 
             if not prompts:
                 # Check if this skill blocks any dependents — deadlock if so

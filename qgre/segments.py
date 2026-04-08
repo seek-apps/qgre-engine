@@ -203,20 +203,22 @@ def _hif_json_segmenter_impl(token_ids: list[int], tokenizer: Any) -> list[str]:
         # Region extends from this key to the next key (or end of text)
         region_end_char = section_spans[idx + 1][0] if idx + 1 < len(section_spans) else len(text)
 
+        # FIX 13: Clamp regex match positions to char_to_token range
+        import logging
+
+        logger = logging.getLogger(__name__)
+        if start_char >= len(char_to_token):
+            logger.warning(
+                f"Region '{region}' start_char {start_char} >= len(char_to_token) {len(char_to_token)}. Skipping region."
+            )
+            continue
+        region_end_char = min(region_end_char, len(char_to_token))
+
         # Map char range to token indices
-        truncation_occurred = region_end_char > len(char_to_token)
-        for c in range(start_char, min(region_end_char, len(char_to_token))):
+        for c in range(start_char, region_end_char):
             tok_idx = char_to_token[c]
             if regions[tok_idx] != "THINK":  # Don't overwrite think tokens
                 regions[tok_idx] = region
-        # AE-R2-04: Log warning when truncation happens
-        if truncation_occurred:
-            import logging
-
-            logging.getLogger(__name__).warning(
-                f"Region '{region}' truncated: region_end_char={region_end_char} > len(char_to_token)={len(char_to_token)}. "
-                "Some region tokens may be lost.",
-            )
 
     return regions
 

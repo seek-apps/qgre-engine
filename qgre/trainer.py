@@ -2429,11 +2429,18 @@ class QGRETrainer:
         self._fused_validated = checkpoint.trainer.fused_validated
 
         # W11: Restore WeightLoaderState to generation_backend.weight_loader
+        # FIX 7: Always restore restore_failed, even if weight_loader path is skipped
+        if checkpoint.weight_loader:
+            wl_state = checkpoint.weight_loader
+            # Always restore restore_failed to sync_state (it may be on a different object)
+            self.sync_state.restore_failed = wl_state.restore_failed
+
         if (
             checkpoint.weight_loader
             and hasattr(self, "generation_backend")
             and self.generation_backend is not None
             and hasattr(self.generation_backend, "weight_loader")
+            and self.generation_backend.weight_loader is not None
         ):
             wl_state = checkpoint.weight_loader
             # Drive lifecycle through SyncState rather than the read-only legacy
@@ -2449,10 +2456,7 @@ class QGRETrainer:
                 loader_state.initialized = True
             elif wl_state.load_lora_called:
                 loader_state.lifecycle = SyncLifecycle.LOADING
-            # Restore restore_failed — the only sticky safety flag that MUST
-            # round-trip. A run that crashed mid-LoRA-dropout-restore must
-            # refuse to re-enter dropout on resume.
-            loader_state.restore_failed = wl_state.restore_failed
+            # Note: restore_failed already restored above (outside this block)
             # W1: Restore lora_request_id if present (backward compat: may be None in old checkpoints)
             if hasattr(wl_state, "lora_request_id") and wl_state.lora_request_id is not None:
                 # Note: _lora_request is the actual LoRARequest object, not restored from checkpoint
@@ -2486,7 +2490,9 @@ class QGRETrainer:
                 warnings.warn(f"LoRA verification import failed unexpectedly: {e}", stacklevel=2)
         else:
             try:
-                is_active = LoRAVerifier.verify_active(self.model, self.tokenizer)
+                is_active = LoRAVerifier.verify_active(
+                    self.model, self.tokenizer, state=self.sync_state
+                )
                 if not is_active:
                     import warnings
 

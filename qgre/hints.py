@@ -108,6 +108,17 @@ class HintRegistry:
             current_mastery: Current mastery score for decay calculation.
             current_step: Training step for tracking.
         """
+        # FIX 14: Validate hint token budget
+        import logging
+
+        max_hint_tokens = 256
+        if len(hint_tokens) > max_hint_tokens:
+            logging.getLogger(__name__).warning(
+                f"Hint tokens for prompt_id={prompt_id} span_id={span_id} exceeds {max_hint_tokens} "
+                f"({len(hint_tokens)} tokens). Truncating to {max_hint_tokens}."
+            )
+            hint_tokens = hint_tokens[:max_hint_tokens]
+
         key = (prompt_id, span_id)
         if key in self._hints:
             # Update existing entry

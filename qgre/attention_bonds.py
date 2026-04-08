@@ -126,11 +126,8 @@ def compute_bond_strength(
     # Final token always has zero bond strength (no later tokens to attend to it)
     bond_strength[:, -1] = 0.0
 
-    # Clamp to [0, 1] for max mode (other modes may exceed 1.0)
-    if mode == "max_received":
-        bond_strength = torch.clamp(bond_strength, 0.0, 1.0)
-
-    return bond_strength
+    # FIX 9: Clamp all modes to [0, 1]
+    return bond_strength.clamp(0.0, 1.0)
 
 
 def select_attention_layer(

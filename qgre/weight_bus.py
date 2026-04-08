@@ -72,6 +72,8 @@ class WeightBus:
             ctx: TrainingContext for device/dtype validation
             modules_to_save: Expected modules (e.g., ["lm_head"]). Warns if missing.
         """
+        # FIX 1: Gate MERGE strategy on restore_failed and cache_stale
+        self._state.check_sync_allowed()
         with self._sync_lock:
             # R10: Handle None engine (lazy init) - skip engine_id tracking until engine exists
             engine = loader.engine

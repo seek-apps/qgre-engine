@@ -14,7 +14,6 @@ After: One SyncState object, explicit transition methods, impossible states
 from __future__ import annotations
 
 import threading
-import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -70,7 +69,7 @@ class SyncState:
         """Enter dropout state for generation.
 
         Raises:
-            RuntimeError: If previous restore failed (weights corrupted)
+            RuntimeError: If previous restore failed (weights corrupted) or double-entry
         """
         with self._lock:
             if self.restore_failed:
@@ -79,10 +78,9 @@ class SyncState:
                     "Cannot apply dropout again. Restart training from checkpoint."
                 )
             if self.dropout_active:
-                warnings.warn(
-                    "LoRA dropout applied twice without exit_dropout() call between. "
-                    "Previous dropout state may be stale.",
-                    stacklevel=2,
+                raise RuntimeError(
+                    "LoRA dropout is already active. Call exit_dropout() before re-entering. "
+                    "This usually indicates a missing restore() call."
                 )
             self.dropout_active = True
 
@@ -141,18 +139,18 @@ class SyncState:
         """Check sync preconditions, raise if not met.
 
         Raises:
-            RuntimeError: If cache is stale or dropout is active.
+            RuntimeError: If cache is stale or restore failed.
         """
         with self._lock:
+            if self.restore_failed:
+                raise RuntimeError(
+                    "Previous LoRA dropout restore failed. Weights are corrupted. Cannot sync. "
+                    "Restart training from a checkpoint where restore_failed is False."
+                )
             if self.cache_stale:
                 raise RuntimeError(
                     "KV cache is potentially stale due to previous flush failure. "
                     "Generations may use corrupted cache. Call reset_for_engine_recreate()."
-                )
-            if self.dropout_active:
-                raise RuntimeError(
-                    "Cannot sync while LoRA dropout is active. "
-                    "Call can_sync() first or disable dropout."
                 )
 
     def begin_sync(self) -> None:

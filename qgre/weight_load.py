@@ -157,22 +157,9 @@ class WeightLoader:
         # ELI-002/003: Lock protects ALL operations including dropout check and fast path
         # to prevent race conditions between state checks and transitions
         with self._lock:
-            # CR-002: Check if KV cache is potentially stale before sync
-            if self._state.cache_stale:
-                raise RuntimeError(
-                    "KV cache is potentially stale due to previous flush failure. "
-                    "Generations may use corrupted cache. Recreate vLLM engine or restart training."
-                )
-
-            # WS3-001: Track dropout state, skip sync if dropout active
-            # (checked inside lock to prevent race with dropout activation)
-            if self._state.dropout_active:
-                warnings.warn(
-                    "WS3-001: sync_lora_direct called while LoRA dropout is active. "
-                    "Skipping sync to avoid race condition. Call restore() first.",
-                    stacklevel=2,
-                )
-                return
+            # FIX 1: Check all sync preconditions via check_sync_allowed()
+            # This gates on restore_failed, cache_stale, and dropout_active
+            self._state.check_sync_allowed()
 
             if first_call or not self._direct_ready:
                 # Bootstrap: register adapter once, set up GPU→GPU copy mappings

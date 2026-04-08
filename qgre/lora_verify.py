@@ -84,7 +84,7 @@ class LoRAVerifier:
         self._steps_since_recreate = 0
 
     @staticmethod
-    def verify_active(model, tokenizer, test_prompt: str = "Hello") -> bool:
+    def verify_active(model, tokenizer, test_prompt: str = "Hello", state=None) -> bool:
         """Verify LoRA is actively applied by generating 1 token.
 
         Generates from a fixed prompt and checks the output is non-empty.
@@ -95,16 +95,24 @@ class LoRAVerifier:
             model: The language model (with LoRA applied)
             tokenizer: The tokenizer
             test_prompt: Fixed prompt to generate from
+            state: Optional SyncState to check for corrupted weights
 
         Returns:
             True if generation produces non-empty output
 
         Raises:
-            RuntimeError: On unexpected errors (not OOM or generation failures)
+            RuntimeError: On unexpected errors, corrupted weights, or generation failures
         """
         import warnings
 
         import torch
+
+        # FIX 4: Check restore_failed before generating
+        if state is not None and state.restore_failed:
+            raise RuntimeError(
+                "Weights are corrupted (restore_failed=True). "
+                "Cannot verify LoRA. Restart training from a clean checkpoint."
+            )
 
         # Pre-validation: check model and tokenizer have required methods
         if not hasattr(tokenizer, "encode"):

@@ -175,7 +175,8 @@ def apply_egrs_matrix(
         correct = step_correctness[step_num]
         # Confidence from gate: low gate = confident, high gate = uncertain
         gate_val = confidence_gate[t].item()
-        confident = gate_val < 0.5
+        # FIX 15: Add dead-zone at 0.5 boundary to avoid noise-driven flips
+        confident = gate_val < 0.5 - 1e-3
 
         if correct:
             if confident:
@@ -189,14 +190,9 @@ def apply_egrs_matrix(
                 # Apply ERIC dampening if importance provided (prevents cascade destabilization)
                 if importance is not None:
                     clamped_strength = min(eric_strength, 10.0)
-                    # Clamp importance to valid range before using in dampening
+                    # FIX 16: After FIX 9, bond_strength (source of importance) is already clamped
+                    # at the source, so redundant clamping removed
                     importance_val = importance[t].item()
-                    if not (0.0 <= importance_val <= 1.0):
-                        warnings.warn(
-                            f"ERIC: importance value {importance_val} out of range [0,1] at position {t}. Clamping.",
-                            stacklevel=2,
-                        )
-                        importance_val = max(0.0, min(1.0, importance_val))
                     dampening = 1.0 + clamped_strength * importance_val
                     scaled_adv = scaled_adv / dampening
                 modified_advs[t] = scaled_adv
@@ -303,14 +299,13 @@ def broadcast_step_advantages_to_tokens(
                 for vs in region_extra_steps.get(sn, []):
                     if vs in step_advs:
                         v = step_advs[vs]
-                        # A-2: Bounds check for virtual steps too
+                        # FIX 10: Bounds check for virtual steps - raise instead of warn
                         if sample_idx is not None:
                             if isinstance(v, torch.Tensor) and sample_idx >= v.shape[0]:
-                                warnings.warn(
-                                    f"A-2: sample_idx {sample_idx} >= step_advs[{vs}].shape[0] ({v.shape[0]}). Skipping.",
-                                    stacklevel=2,
+                                raise RuntimeError(
+                                    f"Virtual step out-of-bounds: sample_idx {sample_idx} >= step_advs[{vs}].shape[0] ({v.shape[0]}). "
+                                    f"Cannot include virtual step contribution. Check batch indexing or step_advs structure."
                                 )
-                                continue
                             contribs.append(v[sample_idx])  # type: ignore[index]
                         else:
                             contribs.append(v)
