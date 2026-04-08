@@ -931,7 +931,7 @@ class QGRETrainer:
                 # FIX R3-T2: Don't increment _accumulated_samples either — no backward means
                 # this step doesn't contribute to the loss average. Incrementing the denominator
                 # would dilute the average incorrectly.
-                self._accumulated_loss += 0.0
+                self._skip_microbatch("SPO filtered all samples")
                 self.global_step += 1
                 self.ctx.step = self.global_step
                 # T3: Scheduler step removed from early-return path - normal path handles it
@@ -1526,8 +1526,11 @@ class QGRETrainer:
                 mb_lp.shape[1], mb_old_lp.shape[1], mb_advs_shifted.shape[1], mb_mask.shape[1]
             )
             mb_kl_weights = mb_kl_shifted[:, :min_len] if mb_kl_shifted is not None else None
-            # Request per-token loss when computing per-quality metrics
-            need_per_token = use_spans and batch_token_masks
+            # Request per-token loss when computing per-quality metrics.
+            # Coerce to bool — `use_spans and batch_token_masks` returns
+            # the list itself on the truthy path, which is a latent type bug
+            # the loss_fn signature doesn't accept.
+            need_per_token = bool(use_spans and batch_token_masks)
             loss_result = self.loss_fn(
                 curr_logprobs=mb_lp[:, :min_len],
                 prev_logprobs=mb_old_lp[:, :min_len],
@@ -1717,8 +1720,7 @@ class QGRETrainer:
                 )
                 self.optimizer.zero_grad()
                 # Clear accumulated loss from successful micro-batches to prevent corrupt update
-                self._accumulated_loss = 0.0
-                self._accumulation_count = 0
+                self._reset_accumulators()
                 # Clear CUDA cache to free memory before re-raising
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -1770,10 +1772,7 @@ class QGRETrainer:
                     metrics[k] = 0.0
 
         # Track accumulated loss across gradient accumulation steps
-        self._accumulated_loss += total_loss
-        self._accumulation_count += 1
-        # Track filtered samples (not original) for accurate loss averaging
-        self._accumulated_samples += len(step)
+        self._record_microbatch(len(step), total_loss)
 
         # Optimizer step (backward already done in micro-batches above)
         if (self.global_step + 1) % self.config.training.gradient_accumulation_steps == 0:
@@ -1983,9 +1982,7 @@ class QGRETrainer:
             # TL-R2-04: Divide by accumulated samples, not accumulation count
             actual_samples = self._accumulated_samples if self._accumulated_samples > 0 else 1
             metrics["accumulated_loss"] = self._accumulated_loss / actual_samples
-            self._accumulated_loss = 0.0
-            self._accumulation_count = 0
-            self._accumulated_samples = 0
+            self._reset_accumulators()
         elif self._accumulated_samples > 0:
             actual_samples = self._accumulated_samples
             metrics["accumulated_loss"] = self._accumulated_loss / actual_samples
@@ -2386,9 +2383,7 @@ class QGRETrainer:
                 f"Checkpoint saved mid-accumulation (count={checkpoint.trainer.accumulation_count}). "
                 "Resetting accumulated loss and scheduler state to avoid batch size inconsistency.",
             )
-            self._accumulated_loss = 0.0
-            self._accumulated_samples = 0
-            self._accumulation_count = 0
+            self._reset_accumulators()
             # Reset scheduler last_epoch to match global_step
             if self.scheduler is not None and hasattr(self.scheduler, "last_epoch"):
                 # Scheduler last_epoch should match optimizer steps, not global_step
@@ -2400,9 +2395,9 @@ class QGRETrainer:
             self._accumulation_count = checkpoint.trainer.accumulation_count
             if not torch.isfinite(torch.tensor(self._accumulated_loss)):
                 logging.getLogger(__name__).warning(
-                    f"Accumulated loss is not finite ({self._accumulated_loss}). Resetting to 0.0."
+                    f"Accumulated loss is not finite ({self._accumulated_loss}). Resetting accumulators."
                 )
-                self._accumulated_loss = 0.0
+                self._reset_accumulators()
         # DI1: Store dataloader state for restore in train() when dataloader is available
         # CheckpointState: dataloader is now DataLoaderState dataclass
         from dataclasses import asdict
@@ -2737,6 +2732,75 @@ class QGRETrainer:
             print(f"│  ⚠ ZERO PROMPTS — falling back to uniform{' ' * 17}│")
         print(f"└{'─' * 60}┘")
 
+    def _record_microbatch(self, sample_count: int, loss_value: float) -> None:
+        """Record one micro-batch contribution to gradient accumulation.
+
+        The ONLY place outside __init__ and resume() where the accumulators
+        advance. Keeps _accumulation_count, _accumulated_samples, and
+        _accumulated_loss in lockstep.
+        """
+        self._accumulation_count += 1
+        self._accumulated_samples += sample_count
+        self._accumulated_loss += loss_value
+
+    def _skip_microbatch(self, reason: str) -> None:
+        """Mark a micro-batch as skipped (e.g., SPO filtered all samples).
+
+        Does NOT advance the accumulators — a skipped batch contributes
+        nothing to gradient accumulation. Logs the reason for diagnostics.
+        """
+        logging.getLogger(__name__).debug(
+            f"Skipped microbatch at global_step={self.global_step}: {reason}"
+        )
+
+    def _reset_accumulators(self) -> None:
+        """Reset accumulators after an optimizer step. The third (and only
+        other) place these fields mutate."""
+        self._accumulation_count = 0
+        self._accumulated_samples = 0
+        self._accumulated_loss = 0.0
+
+    def _sync_weights_guarded(
+        self,
+        weight_bus: Any,
+        backend: GenerationBackend,
+        *,
+        reason: str,
+        restore_lora: Callable[[], None] | None = None,
+    ) -> None:
+        """Run weight_bus.sync with the standard guard contract.
+
+        Owns the entire sync invariant in one place:
+          1. The pre-condition gate (delegated to weight_bus.sync, which calls
+             self.sync_state.check_sync_allowed at the top).
+          2. The try/except that runs cleanup on failure.
+          3. The restore_lora callback if provided (dropout path).
+          4. Translating any exception into a clear message tagged with `reason`.
+
+        Args:
+            weight_bus: the WeightBus instance for this train() invocation.
+            backend: the generation backend (must have weight_exporter and weight_loader).
+            reason: short tag for diagnostics ("pre-dropout-generate",
+                "pre-generate-fresh", "post-optimizer-step").
+            restore_lora: optional cleanup callable; called on exception to
+                restore LoRA weights and clear dropout_active before re-raising.
+                Pass None for sync paths that don't follow apply_lora_dropout.
+        """
+        try:
+            weight_bus.sync(
+                backend.weight_exporter,
+                backend.weight_loader,
+                self.model,
+                ctx=self.ctx,
+                modules_to_save=self.config.model.modules_to_save,
+            )
+        except Exception:
+            if restore_lora is not None:
+                with contextlib.suppress(Exception):
+                    # restore_lora records its own failure in state.restore_failed
+                    restore_lora()
+            raise
+
     def train(
         self,
         dataloader: QGREDataLoader,
@@ -2893,21 +2957,16 @@ class QGRETrainer:
                         restore_lora = apply_lora_dropout(self.model, current_rate, self.sync_state)
                         # Sync noisy weights to vLLM via Weight Sync Bus
                         try:
-                            weight_bus.sync(
-                                backend.weight_exporter,
-                                backend.weight_loader,
-                                self.model,
-                                ctx=self.ctx,
-                                modules_to_save=self.config.model.modules_to_save,
+                            self._sync_weights_guarded(
+                                weight_bus,
+                                backend,
+                                reason="pre-dropout-generate",
+                                restore_lora=restore_lora,
                             )
                         except Exception:
-                            # If sync raises (e.g., check_sync_allowed gates), we still need to
-                            # restore the dropped LoRA weights and clear dropout_active. Restore
-                            # before re-raising so the in-memory state is clean.
-                            with contextlib.suppress(Exception):
-                                # restore_lora already records its own failure in state.restore_failed
-                                restore_lora()
-                            restore_lora = None  # prevent the later finally from double-restoring
+                            # Sync failed — restore_lora was already called inside _sync_weights_guarded.
+                            # Clear it so the finally block doesn't call it again.
+                            restore_lora = None
                             raise
 
                 # Ensure LoRA weights are synced before first generate (fixes first-batch base-model bug)
@@ -2920,13 +2979,7 @@ class QGRETrainer:
                 ):
                     # R3-W1: Sync can raise from check_sync_allowed. If it raises,
                     # _needs_weight_sync stays True so next step retries. Only clear on success.
-                    weight_bus.sync(
-                        backend.weight_exporter,
-                        backend.weight_loader,
-                        self.model,
-                        ctx=self.ctx,
-                        modules_to_save=self.config.model.modules_to_save,
-                    )
+                    self._sync_weights_guarded(weight_bus, backend, reason="pre-generate-fresh")
                     self._needs_weight_sync = False
 
                 generation_succeeded = False
@@ -3356,13 +3409,7 @@ class QGRETrainer:
                 # 6. Weight sync via Weight Sync Bus (LoRA + modules_to_save → vLLM)
                 # Skip if generation failed — stale weights shouldn't be synced
                 if backend.weight_loader is not None and generation_succeeded:
-                    weight_bus.sync(
-                        backend.weight_exporter,
-                        backend.weight_loader,
-                        self.model,
-                        ctx=self.ctx,
-                        modules_to_save=self.config.model.modules_to_save,
-                    )
+                    self._sync_weights_guarded(weight_bus, backend, reason="post-optimizer-step")
 
                 # 7. Periodic vLLM KV cache flush to prevent VRAM leak (unsloth #3864)
                 flush_freq = self.config.training.kv_cache_flush_freq
