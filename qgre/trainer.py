@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 from pathlib import Path
@@ -924,9 +925,9 @@ class QGRETrainer:
                         reward_components=sample.reward_result.scores,
                         phase=self.game_state.phase,
                     )
-                # T2: Update accumulation counters before early return
+                # FIX 15: Don't increment _accumulation_count on early return without backward
+                # The count tracks actual backward() calls, not skipped steps
                 self._accumulated_loss += 0.0
-                self._accumulation_count += 1
                 self._accumulated_samples += len(step)
                 self.global_step += 1
                 self.ctx.step = self.global_step
@@ -1779,7 +1780,7 @@ class QGRETrainer:
                 and self.global_step < self._gradient_probe_steps
                 and self._gradient_probe_prompt_ids is None
             ):
-                if batch.input_ids.shape[0] == 0:
+                if batch.input_ids.shape[0] == 0 or batch.input_ids.shape[1] == 0:
                     logging.getLogger(__name__).warning(
                         "TL-8: Cannot initialize gradient probe with empty batch"
                     )
@@ -2848,13 +2849,23 @@ class QGRETrainer:
                     if current_rate > 0:
                         restore_lora = apply_lora_dropout(self.model, current_rate, self.sync_state)
                         # Sync noisy weights to vLLM via Weight Sync Bus
-                        weight_bus.sync(
-                            backend.weight_exporter,
-                            backend.weight_loader,
-                            self.model,
-                            ctx=self.ctx,
-                            modules_to_save=self.config.model.modules_to_save,
-                        )
+                        try:
+                            weight_bus.sync(
+                                backend.weight_exporter,
+                                backend.weight_loader,
+                                self.model,
+                                ctx=self.ctx,
+                                modules_to_save=self.config.model.modules_to_save,
+                            )
+                        except Exception:
+                            # If sync raises (e.g., check_sync_allowed gates), we still need to
+                            # restore the dropped LoRA weights and clear dropout_active. Restore
+                            # before re-raising so the in-memory state is clean.
+                            with contextlib.suppress(Exception):
+                                # restore_lora already records its own failure in state.restore_failed
+                                restore_lora()
+                            restore_lora = None  # prevent the later finally from double-restoring
+                            raise
 
                 # Ensure LoRA weights are synced before first generate (fixes first-batch base-model bug)
                 # When lora_dropout_rate=0, the dropout path above is skipped, but we still need
@@ -3294,7 +3305,7 @@ class QGRETrainer:
                         self._mlflow_warned = True
 
                 # 5. Save checkpoint
-                if self.global_step % cfg.save_freq == 0:
+                if cfg.save_freq > 0 and self.global_step % cfg.save_freq == 0:
                     self.save()
 
                 # 6. Weight sync via Weight Sync Bus (LoRA + modules_to_save → vLLM)

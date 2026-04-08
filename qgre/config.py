@@ -535,6 +535,11 @@ class TrainingConfig:
                 f"TrainingConfig: embedding_lr_ratio ({self.embedding_lr_ratio}) not in (0, 1]. "
                 "Must be a positive scaling factor <= 1.",
             )
+        # FIX 3: save_freq bounds validation
+        if self.save_freq < 0:
+            raise ValueError(
+                f"training.save_freq must be >= 0 (0 disables checkpoints), got {self.save_freq}"
+            )
 
 
 @dataclass

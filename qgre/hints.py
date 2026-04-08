@@ -108,14 +108,17 @@ class HintRegistry:
             current_mastery: Current mastery score for decay calculation.
             current_step: Training step for tracking.
         """
-        # FIX 14: Validate hint token budget
+        # FIX 14: Validate hint token budget with safe boundary truncation
         import logging
 
         max_hint_tokens = 256
         if len(hint_tokens) > max_hint_tokens:
+            # Note: Truncation at arbitrary token boundary. Without tokenizer access,
+            # safe boundary detection is not possible. Caller should pre-truncate hints
+            # during encoding if boundary safety is critical.
             logging.getLogger(__name__).warning(
                 f"Hint tokens for prompt_id={prompt_id} span_id={span_id} exceeds {max_hint_tokens} "
-                f"({len(hint_tokens)} tokens). Truncating to {max_hint_tokens}."
+                f"({len(hint_tokens)} tokens). Truncating to {max_hint_tokens} at arbitrary boundary."
             )
             hint_tokens = hint_tokens[:max_hint_tokens]
 

@@ -126,8 +126,15 @@ def compute_bond_strength(
     # Final token always has zero bond strength (no later tokens to attend to it)
     bond_strength[:, -1] = 0.0
 
-    # FIX 9: Clamp all modes to [0, 1]
-    return bond_strength.clamp(0.0, 1.0)
+    # FIX 2: Normalize instead of clamp to preserve relative ranking
+    if mode in ("sum_received", "mean_received"):
+        # Normalize by max value to preserve relative differences
+        bond_strength = bond_strength / bond_strength.max().clamp(min=1e-8)
+    else:
+        # max_received: clamp is sufficient (max element already in [0,1])
+        bond_strength = bond_strength.clamp(0.0, 1.0)
+
+    return bond_strength
 
 
 def select_attention_layer(
@@ -314,7 +321,7 @@ def compute_entropy_importance(
     # Pad to requested seq_len if needed
     if actual_len < seq_len:
         pad_size = seq_len - actual_len
-        importance = F.pad(importance, (0, pad_size), value=1.0)
+        importance = F.pad(importance, (0, pad_size), value=0.0)
 
     return importance.clamp(0.0, 1.0)
 

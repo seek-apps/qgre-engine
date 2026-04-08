@@ -43,6 +43,12 @@ class WeightBus:
 
     def __init__(self, state: SyncState, strategy: SyncStrategy = SyncStrategy.DIRECT_COPY):
         self._state = state
+        # FIX 5: MERGE strategy is unsupported — restore_for_training is never called
+        if strategy == SyncStrategy.MERGE:
+            raise ValueError(
+                "MERGE strategy is not currently supported — restore_for_training is never called, "
+                "training will diverge after first sync. Use DIRECT_COPY."
+            )
         self.strategy = strategy
         self._engine_id: int | None = None  # W5: Track engine identity to detect recreation
         self._sync_lock = threading.Lock()  # Protect engine_id checks and _initialized updates

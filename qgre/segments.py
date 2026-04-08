@@ -199,14 +199,17 @@ def _hif_json_segmenter_impl(token_ids: list[int], tokenizer: Any) -> list[str]:
     # Sort by position and assign regions between section markers
     section_spans.sort(key=lambda x: x[0])
 
+    # FIX 8: Track successful region assignments to detect complete failure
+    import logging
+
+    logger = logging.getLogger(__name__)
+    successful_regions = 0
+
     for idx, (start_char, _end_char, region) in enumerate(section_spans):
         # Region extends from this key to the next key (or end of text)
         region_end_char = section_spans[idx + 1][0] if idx + 1 < len(section_spans) else len(text)
 
         # FIX 13: Clamp regex match positions to char_to_token range
-        import logging
-
-        logger = logging.getLogger(__name__)
         if start_char >= len(char_to_token):
             logger.warning(
                 f"Region '{region}' start_char {start_char} >= len(char_to_token) {len(char_to_token)}. Skipping region."
@@ -219,6 +222,17 @@ def _hif_json_segmenter_impl(token_ids: list[int], tokenizer: Any) -> list[str]:
             tok_idx = char_to_token[c]
             if regions[tok_idx] != "THINK":  # Don't overwrite think tokens
                 regions[tok_idx] = region
+
+        successful_regions += 1
+
+    # FIX 8: Raise if all regions failed
+    if successful_regions == 0 and len(section_spans) > 0:
+        raise RuntimeError(
+            f"HIF JSON segmenter failed completely: all {len(section_spans)} regex matches fell outside "
+            f"char_to_token map (max mapped char = {len(char_to_token) - 1}, "
+            f"first match position = {section_spans[0][0]}). "
+            "Tokenizer decode coverage is too low. Check tokenizer or input data."
+        )
 
     return regions
 

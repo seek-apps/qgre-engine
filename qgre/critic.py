@@ -113,13 +113,10 @@ class VPRMCritic(nn.Module):
                 strict=False,
             ):
                 if not torch.isfinite(op.data).all():
-                    import warnings
-
-                    warnings.warn(
-                        f"NaN/Inf in online head '{q_name}' — skipping Polyak update for this head",
-                        stacklevel=2,
+                    raise RuntimeError(
+                        f"VPRMCritic Polyak update detected NaN in online_head['{q_name}'] — "
+                        "training has diverged. Halt and restart from a clean checkpoint."
                     )
-                    continue
                 # Move online params to target device before Polyak update
                 op_data = op.data.to(device=tp.device, dtype=tp.dtype)
                 tp.data.mul_(1.0 - tau).add_(op_data, alpha=tau)
@@ -480,13 +477,13 @@ class VPRMCritic(nn.Module):
                 reward_target = torch.tensor(actual, device=ctx.device, dtype=online_pred.dtype)
                 critic_losses[q_name] = (online_pred - reward_target) ** 2
 
-        # R2-RSP-004: Log warning when all qualities return None for a sample
+        # FIX 12: Raise when all qualities return None (empty masks)
         if all(v is None for v in advantages.values()):
-            import logging
-
-            logging.getLogger(__name__).warning(
-                f"R2-RSP-004: All qualities returned None from critic (all missing from masks). "
-                f"Quality names: {self.quality_names}, masks: {list(token_masks.keys())}",
+            raise RuntimeError(
+                "Critic compute_advantages_from_spans called with all-empty masks — "
+                "reward function returned no scored tokens for any quality in this batch. "
+                f"Quality names: {self.quality_names}, masks: {list(token_masks.keys())}. "
+                "Check reward_fn output."
             )
 
         return advantages, critic_losses

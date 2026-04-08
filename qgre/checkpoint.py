@@ -360,6 +360,13 @@ def load_checkpoint(path: str | Path) -> CheckpointState:
         # Safe: checkpoints are local-only, never downloaded from untrusted sources.
         raw_checkpoint = torch.load(path, map_location="cpu", weights_only=False)  # nosec B614
 
+        # FIX 11: Validate raw_checkpoint is a dict
+        if not isinstance(raw_checkpoint, dict):
+            raise TypeError(
+                f"Checkpoint file {path} contains a {type(raw_checkpoint).__name__}, "
+                "not a dict. File is corrupted or was not saved by qgre.save_checkpoint."
+            )
+
         # C06-SCHEMA: Validate schema_version exists
         checkpoint_schema = raw_checkpoint.get("schema_version")
         if checkpoint_schema is None:
@@ -529,11 +536,11 @@ def discover_latest_checkpoint(checkpoint_dir: str | Path) -> Path | None:
     if not checkpoint_dir.exists():
         return None
 
-    pattern = re.compile(r"global_step_(\d+)")
+    pattern = re.compile(r"^global_step_(\d+)\.pt$")
     candidates = []
     for entry in checkpoint_dir.iterdir():
-        if entry.is_file():
-            match = pattern.search(entry.name)
+        if entry.is_file() and entry.suffix == ".pt":
+            match = pattern.match(entry.name)
             if match:
                 candidates.append((int(match.group(1)), entry))
 
