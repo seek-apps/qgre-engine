@@ -275,7 +275,6 @@ class WeightLoaderState:
                     f"Valid values: {valid_values}. "
                     "This may indicate checkpoint corruption or schema mismatch.",
                 ) from e
-            # FIX 17: Warn on inconsistent legacy fields before overwriting
             expected_initialized = lc == WeightLoaderLifecycle.READY
             expected_load_lora_called = lc in (
                 WeightLoaderLifecycle.LOADING,
@@ -1098,7 +1097,6 @@ class GameState:
                 recent_scores=deque(maxlen=sc.mastery_window),
             )
 
-            # FIX 6: Validate skill prompts exist in dataloader
             if prompts:
                 # Check if any skill prompts are not in the dataloader
                 missing_prompts = set(prompts) - set(self.all_prompts)

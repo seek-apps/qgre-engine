@@ -5,12 +5,70 @@ LoRA A/B. Does NOT know vLLM, engine internals, or buffer formats.
 
 Replaceable: if we switch from PEFT to a different adapter framework, only this
 file changes. WeightBus and WeightLoader are untouched.
+
+NOTE on Params4bit monkey-patch (April 2026):
+    PEFT's Linear4bit.merge (peft/tuners/lora/bnb.py:402) does
+        kwargs = weight.__dict__
+        bnb.nn.Params4bit(w_data.to("cpu"), **kwargs)
+    to rebuild the quantized weight after adding LoRA deltas. But on current
+    bitsandbytes (0.49.2) + unsloth (2026.4.4), weight.__dict__ contains
+    attributes that are NOT valid Params4bit constructor kwargs (e.g. 'to'),
+    causing a TypeError on every merge_adapter() call. Known PEFT issue #2501.
+    We wrap Params4bit.__new__ once at import time to silently drop unknown
+    kwargs. This restores 4-bit merge_adapter functionality so MERGE weight
+    sync strategy works.
 """
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from torch import nn
+
+
+def _patch_params4bit_accept_unknown_kwargs() -> None:
+    """Wrap bitsandbytes.nn.Params4bit.__new__ to drop unknown kwargs.
+
+    Idempotent: safe to call multiple times. Only wraps the original __new__
+    once, marked by a _qgre_patched attribute on the class.
+    """
+    try:
+        import bitsandbytes as bnb  # type: ignore[import-untyped]
+    except ImportError:
+        return  # No bnb, no Params4bit, no patch needed.
+
+    p4b_class = bnb.nn.Params4bit
+    if getattr(p4b_class, "_qgre_patched", False):
+        return
+
+    # Valid constructor kwargs for Params4bit (from bitsandbytes 0.49.2 source).
+    # Anything else in weight.__dict__ (e.g. bound method caches, torch-compile
+    # attrs, Unsloth instrumentation) must be filtered out before construction.
+    valid_kwargs = {
+        "data",
+        "requires_grad",
+        "quant_state",
+        "blocksize",
+        "compress_statistics",
+        "quant_type",
+        "quant_storage",
+        "module",
+        "bnb_quantized",
+    }
+    original_new = p4b_class.__new__
+
+    def patched_new(cls: type, *args: Any, **kwargs: Any) -> Any:
+        filtered = {k: v for k, v in kwargs.items() if k in valid_kwargs}
+        return original_new(cls, *args, **filtered)
+
+    p4b_class.__new__ = staticmethod(patched_new)  # type: ignore[method-assign]
+    p4b_class._qgre_patched = True  # type: ignore[attr-defined]
+
+
+# Apply the patch at module import so any downstream PEFT merge_adapter call
+# benefits automatically. Downstream callers do not need to know this exists.
+_patch_params4bit_accept_unknown_kwargs()
 
 
 class WeightExporter:

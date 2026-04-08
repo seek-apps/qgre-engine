@@ -477,7 +477,7 @@ class VPRMCritic(nn.Module):
                 reward_target = torch.tensor(actual, device=ctx.device, dtype=online_pred.dtype)
                 critic_losses[q_name] = (online_pred - reward_target) ** 2
 
-        # FIX 12: Raise when all qualities return None (empty masks)
+        # Raise when all qualities return None (prevents silent zero-advantage bugs)
         if all(v is None for v in advantages.values()):
             raise RuntimeError(
                 "Critic compute_advantages_from_spans called with all-empty masks — "

@@ -175,7 +175,7 @@ def apply_egrs_matrix(
         correct = step_correctness[step_num]
         # Confidence from gate: low gate = confident, high gate = uncertain
         gate_val = confidence_gate[t].item()
-        # FIX 15: Add dead-zone at 0.5 boundary to avoid noise-driven flips
+        # Dead-zone at confidence boundary (0.5 ± 1e-3) prevents noise-driven oscillation
         confident = gate_val < 0.5 - 1e-3
 
         if correct:
@@ -190,7 +190,6 @@ def apply_egrs_matrix(
                 # Apply ERIC dampening if importance provided (prevents cascade destabilization)
                 if importance is not None:
                     clamped_strength = min(eric_strength, 10.0)
-                    # FIX 16: After FIX 9, bond_strength (source of importance) is already clamped
                     # at the source, so redundant clamping removed
                     importance_val = importance[t].item()
                     dampening = 1.0 + clamped_strength * importance_val
@@ -299,7 +298,6 @@ def broadcast_step_advantages_to_tokens(
                 for vs in region_extra_steps.get(sn, []):
                     if vs in step_advs:
                         v = step_advs[vs]
-                        # FIX 10: Bounds check for virtual steps - raise instead of warn
                         if sample_idx is not None:
                             if isinstance(v, torch.Tensor) and sample_idx >= v.shape[0]:
                                 raise RuntimeError(
@@ -1215,17 +1213,9 @@ class QGREStepAdvantageEstimator:
 
             # Normalize: tokens in multiple quality spans get their advantage divided by overlap count.
             # Example: token in both q_format and q_correct_H spans → advantage / 2
-            # Tokens with zero overlap (thinking, whitespace) get advantage = 0 (no training signal).
-            # R3-RSP-006: Log warning if any tokens have zero overlap count before clamping
+            # Tokens with zero overlap (thinking, whitespace, structure) get advantage = 0 by design —
+            # QGRE only trains on tokens in quality spans; everything else receives no signal.
             zero_overlap_mask = overlap_count == 0.0
-            if zero_overlap_mask.any():
-                zero_count = zero_overlap_mask.sum().item()
-                warnings.warn(
-                    f"R3-RSP-006: {zero_count} tokens in sample {i} have zero overlap "
-                    f"(missing from all quality masks). These tokens get zero advantage silently.",
-                    stacklevel=2,
-                )
-            # A2: Zero out token_advs where overlap_count == 0 before clamping
             token_advs = torch.where(zero_overlap_mask, 0.0, token_advs)
             overlap_count = torch.clamp(overlap_count, min=1.0)
             token_advs = token_advs / overlap_count

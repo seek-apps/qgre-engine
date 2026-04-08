@@ -257,22 +257,6 @@ class TestCriticGradientFlow:
 # =============================================================================
 
 
-class TestWeightSyncStrategyValidation:
-    """Tests for weight sync strategy validation at init (trainer.py:99-106)."""
-
-    def test_merge_incompatible_with_4bit(self):
-        """weight_sync_strategy='merge' with load_in_4bit=True must raise ValueError."""
-        # Simulate the validation
-        load_in_4bit = True
-        weight_sync_strategy = "merge"
-
-        if load_in_4bit and weight_sync_strategy == "merge":
-            with pytest.raises(ValueError, match="incompatible"):
-                raise ValueError(
-                    "weight_sync_strategy='merge' is incompatible with load_in_4bit=True.",
-                )
-
-
 class TestVPRMHiddenDimValidation:
     """Tests for VPRM hidden_dim validation on resume (trainer.py:1200-1210)."""
 

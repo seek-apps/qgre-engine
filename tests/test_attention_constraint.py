@@ -1,12 +1,14 @@
 """Test attention-constrained advantage - both attention and ERIC (entropy) modes."""
 
 import torch
+from torch import nn
 
 from qgre.attention_bonds import (
     apply_importance_constraint,
     compute_bond_strength,
     compute_causal_decay,
     compute_entropy_importance,
+    compute_entropy_importance_from_hidden,
     select_attention_layer,
 )
 
@@ -213,6 +215,168 @@ def test_eric_modes():
     print("test_eric_modes PASSED")
 
 
+def test_eric_from_hidden_matches_legacy():
+    """Chunked from-hidden path and legacy logits path should produce equivalent output."""
+    torch.manual_seed(0)
+    batch, seq, hidden, vocab = 2, 20, 32, 500
+    hidden_states = torch.randn(batch, seq, hidden)
+    lm_head = nn.Linear(hidden, vocab, bias=False)
+
+    # Reference: materialize logits, call legacy function
+    with torch.no_grad():
+        ref_logits = lm_head(hidden_states)
+    ref_importance = compute_entropy_importance(
+        ref_logits, seq_len=seq, mode="entropy_position", position_decay=0.5
+    )
+
+    # Chunked path (from_hidden)
+    with torch.no_grad():
+        chunked_importance = compute_entropy_importance_from_hidden(
+            hidden_states,
+            lm_head,
+            seq_len=seq,
+            mode="entropy_position",
+            position_decay=0.5,
+            chunk_size=4,  # small chunk to force multiple iterations
+        )
+
+    # Shapes match
+    assert ref_importance.shape == chunked_importance.shape == (batch, seq)
+    # Values match within fp32 tolerance
+    assert torch.allclose(ref_importance, chunked_importance, atol=1e-5), (
+        f"chunked != ref: max diff {(ref_importance - chunked_importance).abs().max()}"
+    )
+    # All in [0, 1]
+    assert (chunked_importance >= 0.0).all() and (chunked_importance <= 1.0).all()
+    print("test_eric_from_hidden_matches_legacy PASSED")
+
+
+def test_eric_from_hidden_padding():
+    """Requesting seq_len > hidden_states.shape[1] should zero-pad the tail."""
+    torch.manual_seed(1)
+    batch, hidden_seq, hidden, vocab = 2, 15, 32, 256
+    target_seq = 20  # request longer than hidden
+    hidden_states = torch.randn(batch, hidden_seq, hidden)
+    lm_head = nn.Linear(hidden, vocab, bias=False)
+
+    with torch.no_grad():
+        importance = compute_entropy_importance_from_hidden(
+            hidden_states,
+            lm_head,
+            seq_len=target_seq,
+            mode="entropy_position",
+            chunk_size=4,
+        )
+
+    assert importance.shape == (batch, target_seq)
+    # First 15 positions computed normally — at least one nonzero value expected
+    assert importance[:, :hidden_seq].abs().sum() > 0
+    # Last 5 positions zero-padded
+    assert (importance[:, hidden_seq:] == 0.0).all(), (
+        f"padded region should be zero, got {importance[:, hidden_seq:]}"
+    )
+    print("test_eric_from_hidden_padding PASSED")
+
+
+def test_eric_from_hidden_returns_normalized_entropy():
+    """return_normalized_entropy=True should return (importance, normalized_entropy)."""
+    torch.manual_seed(2)
+    batch, seq, hidden, vocab = 2, 10, 16, 100
+    hidden_states = torch.randn(batch, seq, hidden)
+    lm_head = nn.Linear(hidden, vocab, bias=False)
+
+    with torch.no_grad():
+        result = compute_entropy_importance_from_hidden(
+            hidden_states,
+            lm_head,
+            seq_len=seq,
+            return_normalized_entropy=True,
+            chunk_size=3,
+        )
+
+    assert isinstance(result, tuple) and len(result) == 2
+    importance, entropy_norm = result
+    assert importance.shape == (batch, seq)
+    assert entropy_norm.shape == (batch, seq)  # actual_len == seq here
+    # Normalized entropy in [0, 1]
+    assert (entropy_norm >= 0.0).all() and (entropy_norm <= 1.0).all()
+    # Uniform random logits → high entropy → importance should be low
+    assert entropy_norm.mean().item() > 0.5, (
+        f"random logits should yield high entropy, got mean {entropy_norm.mean().item()}"
+    )
+    print("test_eric_from_hidden_returns_normalized_entropy PASSED")
+
+
+def test_eric_from_hidden_no_full_vocab_materialization():
+    """Verify the chunked path never holds more than chunk_size * vocab in a single tensor.
+
+    This is a behavioural test using a hooked lm_head that records call shapes.
+    If the implementation accidentally materializes the full tensor, the hook
+    will see a chunk of shape [batch, seq, vocab] instead of [batch, chunk, vocab].
+    """
+    torch.manual_seed(3)
+    batch, seq, hidden, vocab = 2, 32, 16, 200
+    chunk_size = 8
+    hidden_states = torch.randn(batch, seq, hidden)
+
+    call_shapes = []
+
+    class _HookedLmHead(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(hidden, vocab, bias=False)
+
+        def forward(self, x):
+            call_shapes.append(tuple(x.shape))
+            return self.linear(x)
+
+    lm_head = _HookedLmHead()
+
+    with torch.no_grad():
+        compute_entropy_importance_from_hidden(
+            hidden_states,
+            lm_head,
+            seq_len=seq,
+            chunk_size=chunk_size,
+        )
+
+    # Expected: seq // chunk_size = 4 chunks, each with seq dim = chunk_size
+    # (last chunk may be smaller if seq % chunk_size != 0)
+    assert len(call_shapes) == seq // chunk_size, (
+        f"expected {seq // chunk_size} chunked calls, got {len(call_shapes)}: {call_shapes}"
+    )
+    for shape in call_shapes:
+        assert shape[0] == batch, f"chunk batch mismatch: {shape}"
+        assert shape[1] <= chunk_size, f"chunk exceeded chunk_size={chunk_size}: {shape}"
+        assert shape[2] == hidden, f"chunk hidden mismatch: {shape}"
+    print("test_eric_from_hidden_no_full_vocab_materialization PASSED")
+
+
+def test_eric_legacy_internal_chunking_matches_unchunked_reference():
+    """compute_entropy_importance now chunks internally; output must match the old unchunked math."""
+    torch.manual_seed(4)
+    batch, seq, vocab = 2, 24, 300
+    logits = torch.randn(batch, seq, vocab)
+
+    # Reference: compute entropy manually (one big fp32 pass, like the old code)
+    with torch.no_grad():
+        ref_log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
+        ref_probs = ref_log_probs.exp()
+        ref_entropy = -(ref_probs * ref_log_probs).sum(dim=-1)
+        theoretical_max = torch.log(torch.tensor(float(vocab)))
+        ref_entropy_norm = ref_entropy / theoretical_max
+        ref_entropy_importance = 1.0 - ref_entropy_norm
+
+    # Chunked path via public API — default mode "entropy_position" adds position weighting,
+    # so use "entropy" mode for a pure entropy-vs-entropy comparison.
+    chunked_importance = compute_entropy_importance(
+        logits, seq_len=seq, mode="entropy", chunk_size=5
+    )
+
+    assert torch.allclose(chunked_importance, ref_entropy_importance.clamp(0.0, 1.0), atol=1e-5)
+    print("test_eric_legacy_internal_chunking_matches_unchunked_reference PASSED")
+
+
 if __name__ == "__main__":
     test_bond_strength_computation()
     test_advantage_dampening()
@@ -220,5 +384,10 @@ if __name__ == "__main__":
     test_select_attention_layer()
     test_entropy_importance()
     test_eric_modes()
+    test_eric_from_hidden_matches_legacy()
+    test_eric_from_hidden_padding()
+    test_eric_from_hidden_returns_normalized_entropy()
+    test_eric_from_hidden_no_full_vocab_materialization()
+    test_eric_legacy_internal_chunking_matches_unchunked_reference()
     print("\n" + "=" * 50)
     print("All attention constraint tests PASSED")

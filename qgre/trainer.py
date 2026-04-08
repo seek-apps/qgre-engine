@@ -18,6 +18,7 @@ from qgre.advantages import (
 from qgre.attention_bonds import (
     compute_bond_strength,
     compute_entropy_importance,
+    compute_entropy_importance_from_hidden,
     compute_normalized_entropy,
     select_attention_layer,
 )
@@ -152,15 +153,6 @@ class QGRETrainer:
         self.step_qualities = sq
         self.phase_qualities = build_phase_qualities(sq)
         self._sq_validated = False  # Validate step_qualities keys against first reward result
-
-        # Weight sync strategy validation — fail fast at init, not during training
-        if config.model.weight_sync_strategy == "merge":
-            raise ValueError(
-                "weight_sync_strategy='merge' is not currently supported. "
-                "MERGE strategy requires restore_for_training to be called, but the trainer "
-                "never calls it, so training will diverge after the first sync. "
-                "Use weight_sync_strategy='direct_copy' (default).",
-            )
 
         # Algorithm setup
         alg = config.algorithm
@@ -1155,31 +1147,37 @@ class QGRETrainer:
                         getattr(self, "_use_importance_proxy", False)
                         and self.config.algorithm.attention_constrained_advantage
                     ):
-                        # Attention unavailable but constraint enabled — use ERIC (entropy-regulated importance)
-                        # Compute completion logits for entropy (no_grad, just for importance signal)
+                        # Attention unavailable but constraint enabled — use ERIC (entropy-regulated importance).
+                        # Chunks the lm_head projection + softmax through seq in slices so we never
+                        # materialize the full [batch, seq, vocab] fp32 tensor. Peak per chunk ~450 MB
+                        # vs ~14 GB for the naive approach that crashed on 16 GB.
                         if self.global_step == 0 and not getattr(self, "_proxy_logged", False):
                             logging.getLogger(__name__).info(
-                                f"Attention constraint enabled (ERIC mode): entropy_position with "
+                                f"ERIC importance (chunked lm_head): mode={self.config.algorithm.eric_mode} "
                                 f"decay={self.config.algorithm.attention_position_decay}",
                             )
                             self._proxy_logged = True
-                        # Get completion portion of hidden states for entropy computation
-                        # This is VRAM-safe: we only materialize logits for completion tokens
                         with torch.no_grad():
-                            # Compute logits for completion tokens only (shifted by 1 for next-token)
-                            completion_logits = lm_head(hidden_states[:, :-1, :]).float()
-                        bond_strength = compute_entropy_importance(
-                            completion_logits,
-                            seq_len=completion_logits.shape[1],
-                            mode=self.config.algorithm.attention_constraint_mode,
-                            position_decay=self.config.algorithm.attention_position_decay,
-                        )
-                        # EGRS: compute normalized token entropy for 2x2 matrix
-                        if self.config.egrs.enabled:
-                            mb_token_entropy = compute_normalized_entropy(completion_logits)
-                        else:
-                            mb_token_entropy = None
-                        del completion_logits
+                            if self.config.egrs.enabled:
+                                bond_strength, mb_token_entropy = (
+                                    compute_entropy_importance_from_hidden(
+                                        hidden_states[:, :-1, :],
+                                        lm_head,
+                                        seq_len=mb_ids.shape[1],
+                                        mode=self.config.algorithm.eric_mode,
+                                        position_decay=self.config.algorithm.attention_position_decay,
+                                        return_normalized_entropy=True,
+                                    )
+                                )
+                            else:
+                                bond_strength = compute_entropy_importance_from_hidden(
+                                    hidden_states[:, :-1, :],
+                                    lm_head,
+                                    seq_len=mb_ids.shape[1],
+                                    mode=self.config.algorithm.eric_mode,
+                                    position_decay=self.config.algorithm.attention_position_decay,
+                                )
+                                mb_token_entropy = None
                     else:
                         bond_strength = None
                         mb_token_entropy = None
@@ -1275,19 +1273,21 @@ class QGRETrainer:
                     getattr(self, "_use_importance_proxy", False)
                     and self.config.algorithm.attention_constrained_advantage
                 ):
-                    # Attention unavailable but constraint enabled — use ERIC (entropy-regulated importance)
-                    # mb_logits already computed above, reuse for entropy
+                    # Attention unavailable but constraint enabled — use ERIC (entropy-regulated importance).
+                    # Non-fused path: mb_logits already materialized for logprobs; reuse it.
+                    # compute_entropy_importance chunks softmax internally so the 3× peak doesn't OOM.
                     if self.global_step == 0 and not getattr(self, "_proxy_logged", False):
                         logging.getLogger(__name__).info(
-                            f"Attention constraint enabled (ERIC mode): entropy_position with "
+                            f"ERIC importance (non-fused): mode={self.config.algorithm.eric_mode} "
                             f"decay={self.config.algorithm.attention_position_decay}",
                         )
                         self._proxy_logged = True
-                    # mb_logits is [batch, seq-1, vocab] from line 923
+                    # mb_logits is [batch, seq-1, vocab]; pass mb_ids.shape[1] so the output
+                    # pads to full seq_len and matches downstream token_advs shape.
                     bond_strength = compute_entropy_importance(
                         mb_logits,
-                        seq_len=mb_logits.shape[1],
-                        mode=self.config.algorithm.attention_constraint_mode,
+                        seq_len=mb_ids.shape[1],
+                        mode=self.config.algorithm.eric_mode,
                         position_decay=self.config.algorithm.attention_position_decay,
                     )
                 else:
@@ -3096,6 +3096,33 @@ class QGRETrainer:
                     raise
                 finally:
                     # Always restore clean weights — even if generate crashes.
+                    #
+                    # ORDER IS CRITICAL:
+                    #   1. weight_bus.restore_for_training(model)  — unmerge LoRA FIRST
+                    #   2. restore_lora()                          — restore dropout mask SECOND
+                    #
+                    # Why: with MERGE strategy, weight_bus.sync() merged the (possibly
+                    # dropped-out) LoRA into base weights before generate. To reverse,
+                    # restore_for_training must unmerge using the EXACT SAME LoRA state
+                    # that was merged (the dropped state). If we restored the dropout
+                    # mask first, restore_lora would replace the dropped LoRA with the
+                    # original, and the subsequent unmerge would use the wrong values —
+                    # base weights would end up at `original - drift` instead of `original`.
+                    #
+                    # For DIRECT_COPY strategy, restore_for_training is a no-op, so the
+                    # order doesn't matter in that path.
+                    try:
+                        weight_bus.restore_for_training(backend.weight_exporter, self.model)
+                    except Exception:
+                        logging.getLogger(__name__).exception(
+                            "weight_bus.restore_for_training failed in finally block. "
+                            "Model may be in merged state — halting to prevent LoRA corruption."
+                        )
+                        # This is a hard-fail: if unmerge broke, the next backward pass
+                        # will compute gradients against merged base weights, corrupting
+                        # the adapter permanently. Better to crash loudly than silently diverge.
+                        raise
+
                     # Don't sync to vLLM here — step-end sync (after training) handles it.
                     # If restore itself raises on the happy path (e.g. CUDA OOM mid-copy),
                     # log it but don't mask the successful generation: apply_lora_dropout's

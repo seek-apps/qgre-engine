@@ -19,6 +19,8 @@ Extracting attention from all layers (n_layers × batch × heads × seq × seq) 
 
 from __future__ import annotations
 
+from typing import Any, Literal, overload
+
 import torch
 import torch.nn.functional as F
 
@@ -221,6 +223,7 @@ def compute_entropy_importance(
     seq_len: int,
     mode: str = "entropy_position",
     position_decay: float | None = None,
+    chunk_size: int = 128,
 ) -> torch.Tensor:
     """Compute token importance using entropy-regulated causal weighting (ERIC).
 
@@ -246,6 +249,9 @@ def compute_entropy_importance(
         position_decay: How fast position weight decays. None = auto-compute from
                        seq_len using compute_causal_decay(). Manual values:
                        0.5 = sqrt decay, 1.0 = linear decay.
+        chunk_size: Number of seq positions to process per chunk when computing
+                   softmax/entropy. Prevents [batch, seq, vocab] fp32 materialization
+                   peaks. 128 keeps per-chunk cost at ~450 MB for vocab=151K, batch=4.
 
     Returns:
         Tensor of shape [batch, seq_len] with importance values in [0, 1].
@@ -253,12 +259,13 @@ def compute_entropy_importance(
 
     Technical notes:
         - Entropy is computed in float32 for numerical stability
-        - Log-sum-exp trick used to prevent overflow in softmax
+        - Softmax is chunked along seq dim to avoid 3× peak memory
         - Position weight uses (1 - t/seq_len)^decay for smooth decay
     """
     batch_size = logits.shape[0]
     device = logits.device
     logit_seq = logits.shape[1]
+    vocab_size = logits.shape[-1]
 
     # Handle edge cases
     if seq_len <= 0:
@@ -266,25 +273,27 @@ def compute_entropy_importance(
 
     # Use available logits (may be shorter than seq_len for edge cases)
     actual_len = min(seq_len, logit_seq)
-    completion_logits = logits[:, :actual_len, :]  # [batch, actual_len, vocab]
 
     # Auto-compute decay if not provided
     if position_decay is None:
         position_decay = compute_causal_decay(actual_len)
 
-    # Compute normalized entropy in float32 for stability
-    completion_logits_f32 = completion_logits.float()
-
-    # Log-softmax for numerical stability
-    log_probs = F.log_softmax(completion_logits_f32, dim=-1)
-    probs = log_probs.exp()
-
-    # Entropy: H = -sum(p * log(p))
-    entropy = -(probs * log_probs).sum(dim=-1)  # [batch, actual_len]
+    # Chunked entropy computation: process `chunk_size` seq positions at a time
+    # to avoid materializing the full [batch, seq, vocab] fp32 tensor. Peak per
+    # chunk: batch × chunk_size × vocab × 4 bytes × 3 (logits_f32 + log_probs + probs).
+    entropy_chunks = []
+    for start in range(0, actual_len, chunk_size):
+        end = min(start + chunk_size, actual_len)
+        chunk_logits = logits[:, start:end, :].float()  # [batch, chunk, vocab]
+        log_probs = F.log_softmax(chunk_logits, dim=-1)
+        probs = log_probs.exp()
+        chunk_entropy = -(probs * log_probs).sum(dim=-1)  # [batch, chunk]
+        entropy_chunks.append(chunk_entropy)
+        del chunk_logits, log_probs, probs
+    entropy = torch.cat(entropy_chunks, dim=1)  # [batch, actual_len]
 
     # R3-RSP-007: Normalize entropy using theoretical max (log vocab_size) instead of per-sample max
     # to avoid batch-dependent scaling. vocab_size is inferred from logits.shape[-1].
-    vocab_size = completion_logits_f32.shape[-1]
     theoretical_max_entropy = torch.log(
         torch.tensor(vocab_size, dtype=torch.float32, device=device)
     )
@@ -324,6 +333,149 @@ def compute_entropy_importance(
         importance = F.pad(importance, (0, pad_size), value=0.0)
 
     return importance.clamp(0.0, 1.0)
+
+
+@overload
+def compute_entropy_importance_from_hidden(
+    hidden_states: torch.Tensor,
+    lm_head: Any,
+    seq_len: int,
+    mode: str = ...,
+    position_decay: float | None = ...,
+    chunk_size: int = ...,
+    return_normalized_entropy: Literal[False] = ...,
+) -> torch.Tensor: ...
+
+
+@overload
+def compute_entropy_importance_from_hidden(
+    hidden_states: torch.Tensor,
+    lm_head: Any,
+    seq_len: int,
+    mode: str = ...,
+    position_decay: float | None = ...,
+    chunk_size: int = ...,
+    *,
+    return_normalized_entropy: Literal[True],
+) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+
+def compute_entropy_importance_from_hidden(
+    hidden_states: torch.Tensor,
+    lm_head: Any,
+    seq_len: int,
+    mode: str = "entropy_position",
+    position_decay: float | None = None,
+    chunk_size: int = 128,
+    return_normalized_entropy: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Chunked ERIC that projects hidden states through lm_head in slices.
+
+    Mirrors the discipline of chunked_logprobs_from_hidden: never materializes
+    the full [batch, seq, vocab] logits tensor. For each seq chunk we project,
+    compute softmax + entropy in fp32, and discard the chunk's logits. Peak
+    memory per chunk is ~3× (batch × chunk_size × vocab × 4 bytes).
+
+    Use this in the fused-logprobs path where hidden_states is already available
+    and materializing full logits would peak at 14+ GB on 16 GB cards. Use the
+    legacy compute_entropy_importance(logits, ...) when logits have already been
+    materialized for other reasons (non-fused path).
+
+    Args:
+        hidden_states: [batch, seq, hidden] — the slice of hidden states whose
+                       entropy you want. For next-token ERIC on a completion,
+                       pass hidden_states[:, :-1, :] so position i predicts token i+1.
+        lm_head: The callable language-model head (nn.Linear or equivalent).
+                 Must accept [*, hidden] and return [*, vocab].
+        seq_len: Target seq_len for the output. If hidden_states.shape[1] < seq_len,
+                 the output is zero-padded at the end so the result always has
+                 shape [batch, seq_len]. This matches the padding behaviour of
+                 compute_bond_strength and keeps downstream shape checks clean.
+        mode: Same vocabulary as compute_entropy_importance:
+              "entropy" | "position" | "entropy_position" (recommended).
+        position_decay: Optional manual position decay (see compute_causal_decay).
+        chunk_size: Seq positions per chunk. Default 128 keeps peak per chunk
+                    at ~450 MB for vocab=151K, batch=4.
+        return_normalized_entropy: If True, also return the per-token normalized
+                                   entropy tensor [batch, actual_len] so EGRS can
+                                   reuse it without a second chunked pass.
+
+    Returns:
+        importance: [batch, seq_len] in [0, 1]. High = anchor = dampen gradient.
+        (importance, normalized_entropy) if return_normalized_entropy=True,
+        where normalized_entropy is [batch, actual_len] (NOT padded).
+    """
+    batch_size = hidden_states.shape[0]
+    device = hidden_states.device
+    hidden_seq = hidden_states.shape[1]
+
+    if seq_len <= 0:
+        empty = torch.zeros(batch_size, 0, device=device)
+        if return_normalized_entropy:
+            return empty, empty
+        return empty
+
+    actual_len = min(seq_len, hidden_seq)
+    if position_decay is None:
+        position_decay = compute_causal_decay(actual_len)
+
+    # Chunked projection + entropy. Process hidden_states in seq chunks; for each
+    # chunk, project through lm_head, compute softmax + entropy in fp32, discard.
+    # Never holds more than `chunk_size` positions worth of full-vocab fp32 data.
+    entropy_chunks = []
+    # Probe vocab size from the first chunk's projection so we don't assume a
+    # specific lm_head interface beyond "callable returning [*, vocab]".
+    vocab_size: int | None = None
+    for start in range(0, actual_len, chunk_size):
+        end = min(start + chunk_size, actual_len)
+        hs_chunk = hidden_states[:, start:end, :]  # [batch, chunk, hidden]
+        chunk_logits = lm_head(hs_chunk).float()  # [batch, chunk, vocab]
+        if vocab_size is None:
+            vocab_size = chunk_logits.shape[-1]
+        log_probs = F.log_softmax(chunk_logits, dim=-1)
+        probs = log_probs.exp()
+        chunk_entropy = -(probs * log_probs).sum(dim=-1)  # [batch, chunk]
+        entropy_chunks.append(chunk_entropy)
+        del chunk_logits, log_probs, probs
+    entropy = torch.cat(entropy_chunks, dim=1)  # [batch, actual_len]
+
+    assert vocab_size is not None, "vocab_size probe failed — no chunks processed"
+    theoretical_max_entropy = torch.log(
+        torch.tensor(vocab_size, dtype=torch.float32, device=device)
+    ).clamp(min=1e-6)
+    entropy_norm = entropy / theoretical_max_entropy  # [batch, actual_len]
+    entropy_importance = 1.0 - entropy_norm
+
+    # Position weight: earlier tokens have more downstream dependencies
+    if actual_len == 1:
+        position_weight = torch.ones(batch_size, 1, device=device, dtype=torch.float32)
+    else:
+        assert actual_len > 1, f"CR-001: Position weight requires actual_len > 1, got {actual_len}"
+        positions = torch.arange(actual_len, device=device, dtype=torch.float32)
+        position_weight = (1.0 - positions / (actual_len - 1)) ** position_decay
+        position_weight = position_weight.unsqueeze(0).expand(batch_size, -1)
+
+    if mode == "entropy":
+        importance = entropy_importance
+    elif mode == "position":
+        importance = position_weight
+    elif mode == "entropy_position":
+        importance = entropy_importance * position_weight
+    else:
+        raise ValueError(
+            f"Unknown mode: {mode}. Must be 'entropy', 'position', or 'entropy_position'",
+        )
+
+    # Pad to requested seq_len if needed
+    if actual_len < seq_len:
+        pad_size = seq_len - actual_len
+        importance = F.pad(importance, (0, pad_size), value=0.0)
+
+    importance = importance.clamp(0.0, 1.0)
+
+    if return_normalized_entropy:
+        return importance, entropy_norm.clamp(0.0, 1.0)
+    return importance
 
 
 def apply_importance_constraint(

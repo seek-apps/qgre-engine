@@ -108,7 +108,7 @@ class HintRegistry:
             current_mastery: Current mastery score for decay calculation.
             current_step: Training step for tracking.
         """
-        # FIX 14: Validate hint token budget with safe boundary truncation
+        # Validate hint token budget (max 256 tokens)
         import logging
 
         max_hint_tokens = 256

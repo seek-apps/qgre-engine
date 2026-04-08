@@ -252,20 +252,19 @@ def _parse_raw_checkpoint(
         ValueError: If schema_version is missing or invalid.
         Other validation errors from CheckpointState.from_dict.
     """
-    # FIX 11: Validate raw_checkpoint is a dict
+    checkpoint_label = "Fallback checkpoint" if is_fallback else "Checkpoint"
+
     if not isinstance(raw, dict):
-        prefix = "Fallback checkpoint" if is_fallback else "Checkpoint"
         raise TypeError(
-            f"{prefix} file {path} contains a {type(raw).__name__}, "
+            f"{checkpoint_label} file {path} contains a {type(raw).__name__}, "
             "not a dict. File is corrupted or was not saved by qgre.save_checkpoint."
         )
 
     # C06-SCHEMA: Validate schema_version exists
     checkpoint_schema = raw.get("schema_version")
     if checkpoint_schema is None:
-        prefix = "Fallback checkpoint" if is_fallback else "Checkpoint"
         warnings.warn(
-            f"{prefix} {path} missing schema_version. "
+            f"{checkpoint_label} {path} missing schema_version. "
             f"Assuming old format, will migrate to StateSpec.",
             UserWarning,
             stacklevel=3,  # _parse_raw_checkpoint → load_checkpoint → caller
@@ -276,17 +275,15 @@ def _parse_raw_checkpoint(
     try:
         checkpoint_schema = int(raw.get("schema_version", 1))
     except (ValueError, TypeError) as e:
-        prefix = "Fallback checkpoint" if is_fallback else "Checkpoint"
         raise TypeError(
-            f"{prefix} {path} has invalid schema_version type: {type(checkpoint_schema).__name__}. "
+            f"{checkpoint_label} {path} has invalid schema_version type: {type(checkpoint_schema).__name__}. "
             f"Expected int. Cannot safely restore checkpoint. Error: {e}",
         ) from e
 
     # Schema version mismatch is now a warning, not an error (migration handles it)
     if checkpoint_schema != CHECKPOINT_SCHEMA_VERSION:
-        prefix = "Fallback checkpoint" if is_fallback else "Checkpoint"
         warnings.warn(
-            f"{prefix} schema version mismatch: checkpoint has version {checkpoint_schema}, "
+            f"{checkpoint_label} schema version mismatch: checkpoint has version {checkpoint_schema}, "
             f"current code expects version {CHECKPOINT_SCHEMA_VERSION}. "
             f"Migration will be attempted.",
             UserWarning,
@@ -300,16 +297,14 @@ def _parse_raw_checkpoint(
         required_keys = ["global_step"]
         for key in required_keys:
             if key not in raw:
-                prefix = "Fallback checkpoint" if is_fallback else "Checkpoint"
-                raise ValueError(f"{prefix} missing required key: {key}")
+                raise ValueError(f"{checkpoint_label} missing required key: {key}")
 
         # C07-TYPE: Explicit type coercion for global_step
         try:
             raw["global_step"] = int(raw["global_step"])
         except (ValueError, TypeError) as e:
-            prefix = "Fallback checkpoint" if is_fallback else "Checkpoint"
             raise TypeError(
-                f"{prefix} {path} has invalid global_step type: {type(raw['global_step']).__name__}. "
+                f"{checkpoint_label} {path} has invalid global_step type: {type(raw['global_step']).__name__}. "
                 f"Expected int. Error: {e}",
             ) from e
 
@@ -320,9 +315,8 @@ def _parse_raw_checkpoint(
             try:
                 raw["game_state"] = gamestate_from_dict(game_state_raw)
             except Exception as e:
-                prefix = "Fallback checkpoint" if is_fallback else "Checkpoint"
                 raise RuntimeError(
-                    f"Failed to restore game_state from {prefix.lower()} {path}. "
+                    f"Failed to restore game_state from {checkpoint_label.lower()} {path}. "
                     f"Checkpoint may be corrupted or from incompatible version. "
                     f"Original error: {e}",
                 ) from e

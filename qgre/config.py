@@ -24,7 +24,16 @@ class ModelConfig:
         0  # 0 = auto (max(64, lora_rank * 2)); vLLM rejects adapters with rank > this
     )
     weight_sync_strategy: str = (
-        "direct_copy"  # "direct_copy" (4-bit) or "merge" (full-precision deployment)
+        "direct_copy"
+        # "direct_copy": copy LoRA A/B → vLLM's stacked LoRA buffers each sync.
+        #   Base weights live in BOTH training and vLLM memory (duplicated).
+        #   No merge/unmerge cost. Default for backward compatibility.
+        # "merge": merge_adapter() bakes LoRA → base weights in-place pre-generate,
+        #   unmerge_adapter() lifts LoRA back out post-generate. Base weights shared
+        #   between training and vLLM via fast_inference colocation — no duplication.
+        #   Requires QGRETrainer's generate try/finally to call
+        #   weight_bus.restore_for_training() after every backend.generate().
+        #   Saves ~1.4 GB (duplicate base weights) + ~500 MB (vLLM LoRA buffer) on 1.7B.
     )
     pad_token: str = (
         ""  # Required — set per-model in YAML. Must NOT be EOS, stop token, or vision-reserved.
@@ -450,7 +459,23 @@ class AlgorithmConfig:
     attention_constraint_strength: float = (
         1.0  # Dampening multiplier (1.0 = standard, 2.0 = aggressive)
     )
+    # Two separate mode fields because the attention path and ERIC path have
+    # disjoint vocabularies — they are not interchangeable.
+    #
+    # attention_constraint_mode: used by compute_bond_strength (attention path).
+    #     Values: "max_received" | "sum_received" | "mean_received".
+    #     Only runs when output_attentions=True is available from the model.
+    #     Unsloth fast_inference currently blocks this (inplace kernels assert
+    #     output_attentions=False), so this path is dormant under fast_inference.
+    #
+    # eric_mode: used by compute_entropy_importance (ERIC path).
+    #     Values: "entropy" | "position" | "entropy_position" (recommended).
+    #     Runs as the entropy proxy under fast_inference. Entropy tracks model
+    #     commitment; low entropy = committed anchor = dampen gradient.
     attention_constraint_mode: str = (
+        "max_received"  # "max_received", "sum_received", or "mean_received"
+    )
+    eric_mode: str = (
         "entropy_position"  # "entropy", "position", or "entropy_position" (recommended)
     )
     attention_position_decay: float | None = (
@@ -535,7 +560,6 @@ class TrainingConfig:
                 f"TrainingConfig: embedding_lr_ratio ({self.embedding_lr_ratio}) not in (0, 1]. "
                 "Must be a positive scaling factor <= 1.",
             )
-        # FIX 3: save_freq bounds validation
         if self.save_freq < 0:
             raise ValueError(
                 f"training.save_freq must be >= 0 (0 disables checkpoints), got {self.save_freq}"

@@ -107,7 +107,6 @@ class LoRAVerifier:
 
         import torch
 
-        # FIX 4: Check restore_failed before generating
         if state is not None and state.restore_failed:
             raise RuntimeError(
                 "Weights are corrupted (restore_failed=True). "

@@ -157,7 +157,6 @@ class WeightLoader:
         # ELI-002/003: Lock protects ALL operations including dropout check and fast path
         # to prevent race conditions between state checks and transitions
         with self._lock:
-            # FIX 1: Check all sync preconditions via check_sync_allowed()
             # This gates on restore_failed, cache_stale, and dropout_active
             self._state.check_sync_allowed()
 

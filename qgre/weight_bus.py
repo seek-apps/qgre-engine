@@ -43,12 +43,12 @@ class WeightBus:
 
     def __init__(self, state: SyncState, strategy: SyncStrategy = SyncStrategy.DIRECT_COPY):
         self._state = state
-        # FIX 5: MERGE strategy is unsupported — restore_for_training is never called
-        if strategy == SyncStrategy.MERGE:
-            raise ValueError(
-                "MERGE strategy is not currently supported — restore_for_training is never called, "
-                "training will diverge after first sync. Use DIRECT_COPY."
-            )
+        # MERGE strategy: the trainer is responsible for calling restore_for_training
+        # AFTER backend.generate() to unmerge LoRA from base weights. Without that call,
+        # training diverges after the first sync because LoRA stays baked into base and
+        # the next forward pass sees a corrupted model. QGRETrainer's generate try/finally
+        # owns this contract. Callers constructing WeightBus with MERGE from elsewhere
+        # MUST mirror that finally-block pattern.
         self.strategy = strategy
         self._engine_id: int | None = None  # W5: Track engine identity to detect recreation
         self._sync_lock = threading.Lock()  # Protect engine_id checks and _initialized updates
@@ -78,7 +78,6 @@ class WeightBus:
             ctx: TrainingContext for device/dtype validation
             modules_to_save: Expected modules (e.g., ["lm_head"]). Warns if missing.
         """
-        # FIX 1: Gate MERGE strategy on restore_failed and cache_stale
         self._state.check_sync_allowed()
         with self._sync_lock:
             # R10: Handle None engine (lazy init) - skip engine_id tracking until engine exists

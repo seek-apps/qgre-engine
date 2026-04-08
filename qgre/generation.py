@@ -233,17 +233,29 @@ class UnslothBackend:
         _tf_logger = logging.getLogger("transformers.modeling_utils")
         _tf_level = _tf_logger.level
         _tf_logger.setLevel(logging.ERROR)
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=".*tie_word_embeddings.*")
-            model = FastLanguageModel.get_peft_model(
-                model,
-                r=self.model_config.lora_rank,
-                lora_alpha=self.model_config.lora_alpha,
-                target_modules=self.model_config.lora_target_modules,
-                modules_to_save=self.model_config.modules_to_save,
-                lora_dropout=0.0,
-                use_gradient_checkpointing="unsloth",
-            )
+
+        # Route get_peft_model through FastBaseModel (the "new model" path) so
+        # modules_to_save=["lm_head"] works with fast_inference=True. The default
+        # FastLlamaModel.get_peft_model path raises NotImplementedError when both
+        # are set. FastBaseModel's path has no such check — it just calls PEFT.
+        # from_pretrained hard-sets UNSLOTH_USE_NEW_MODEL=0 (llama.py:2212), so
+        # we flip it here, between from_pretrained and get_peft_model.
+        _orig_use_new_model = os.environ.get("UNSLOTH_USE_NEW_MODEL", "0")
+        os.environ["UNSLOTH_USE_NEW_MODEL"] = "1"
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=".*tie_word_embeddings.*")
+                model = FastLanguageModel.get_peft_model(
+                    model,
+                    r=self.model_config.lora_rank,
+                    lora_alpha=self.model_config.lora_alpha,
+                    target_modules=self.model_config.lora_target_modules,
+                    modules_to_save=self.model_config.modules_to_save,
+                    lora_dropout=0.0,
+                    use_gradient_checkpointing="unsloth",
+                )
+        finally:
+            os.environ["UNSLOTH_USE_NEW_MODEL"] = _orig_use_new_model
         _tf_logger.setLevel(_tf_level)
 
         # Null modules_to_save in PEFT config object so that when Unsloth's load_lora
@@ -581,15 +593,21 @@ class UnslothBackend:
             hints_used.append(hints_used_dict or {})
 
         lora_req = self.weight_loader.lora_request if self.weight_loader else None
-        if lora_req is None:
+        # With DIRECT_COPY strategy, vLLM holds LoRA A/B in a separate stacked buffer
+        # and needs a lora_request pointing at slot 1 for every generate call.
+        # With MERGE strategy, LoRA has been baked into the base weights in-place by
+        # weight_bus.sync() → exporter.merge_lora(), so vLLM should see the full merged
+        # weights directly and lora_request must be None — passing a LoRA request would
+        # apply LoRA a second time on top of already-merged weights.
+        if self._sync_strategy == SyncStrategy.DIRECT_COPY and lora_req is None:
             raise RuntimeError(
-                "LoRA request is None — cannot generate with base model. "
+                "LoRA request is None under DIRECT_COPY strategy — cannot generate with base model. "
                 "Ensure weight_loader.load_lora() was called before generation.",
             )
         outputs = self.model.fast_generate(  # type: ignore[union-attr]
             prompts,
             sampling_params=sampling_params,
-            lora_request=lora_req,
+            lora_request=lora_req,  # Intentionally None under MERGE strategy.
         )
 
         if len(outputs) != len(prompts):

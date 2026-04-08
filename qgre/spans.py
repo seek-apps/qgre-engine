@@ -248,8 +248,9 @@ def scored_spans_to_token_masks(
                     "Advantage signal lost for this span.",
                     stacklevel=2,
                 )
-            # FIX 11: Validate all token indices BEFORE mutating mask
-            # First pass: validate
+            # Validate and apply in single pass (hot path optimization)
+            is_first_span = has_any_first_occurrence and span_idx == 0
+            span_value = 1.0 if is_first_span else REPETITION_MARKER
             for c in range(cs, ce):
                 tok_idx = char_to_token[c]
                 if tok_idx == -1:
@@ -261,13 +262,6 @@ def scored_spans_to_token_masks(
                         f"char_range=({cs}, {ce}), max_char={max_char}. "
                         "Tokenizer or span detection is inconsistent."
                     )
-            # Second pass: apply (only after all validation passed)
-            is_first_span = has_any_first_occurrence and span_idx == 0
-            span_value = 1.0 if is_first_span else REPETITION_MARKER
-            for c in range(cs, ce):
-                tok_idx = char_to_token[c]
-                if tok_idx == -1:
-                    continue
                 mask[tok_idx] = span_value
         masks[quality_name] = mask
 
