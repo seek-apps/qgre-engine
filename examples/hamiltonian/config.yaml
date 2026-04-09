@@ -73,22 +73,14 @@ algorithm:
   attention_constraint_mode: max_received
   attention_sample_layer: -1  # Last layer
 
+  # Correctness-only qualities — no format scoring. RL teaches WHAT (math),
+  # SFT teaches HOW (formatting). Format scoring is the #1 reward hacking
+  # vector (gradient regularization paper arxiv:2602.18037).
   step_qualities:
-    1: [q_format, q_has_math]
-    2: [q_momentum_defined]
-    3: [q_T_uses_p]
-    4: [q_V_correct]
-    5: [q_correct_H]
-    6: [q_correct_dqdt, q_correct_dpdt, q_consistency]
-    7: [q_defines_momentum]
-    8: [q_T_in_momentum, q_H_in_momentum]
-    9: [q_correct_coefficient, q_derivative_correct]
-
-  # Map virtual steps (no segmenter region) to the region whose tokens carry their advantage
-  step_region_map:
-    7: 2    # q_defines_momentum → MOMENTUM section tokens (STEP_2)
-    8: 3    # q_T_in_momentum, q_H_in_momentum → KINETIC section tokens (STEP_3)
-    9: 6    # q_correct_coefficient, q_derivative_correct → EQUATIONS section tokens (STEP_6)
+    1: [q_kinetic, q_potential]       # Can the model get T and V right?
+    2: [q_hamiltonian]                # Can it compose H = T + V correctly?
+    3: [q_dqdt, q_dpdt]              # Can it derive Hamilton's equations?
+    4: [q_consistency]                # Are the equations consistent with H?
 
 training:
   total_steps: 7000

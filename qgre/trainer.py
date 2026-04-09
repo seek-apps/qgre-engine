@@ -3155,12 +3155,10 @@ class QGRETrainer:
                     meta = batch.metadata[i] if i < len(batch.metadata) else {}
                     rr = self.reward_fn(prompt, output.texts[i], meta)
                     # Empty-output floor: completions below min_completion_tokens get
-                    # negative reward AND zeroed quality scores. Both must be consistent
-                    # so that mastery tracking (which reads rr.scores) and advantage
-                    # computation (which reads rr.reward) see the same penalty signal.
+                    # a penalized copy with negative reward and zeroed quality scores.
+                    # RewardResult is frozen, so with_floor() creates a new instance.
                     if min_tokens > 0 and len(output.token_ids[i]) < min_tokens:
-                        rr.reward = -0.1
-                        rr.scores = dict.fromkeys(rr.scores, 0.0)
+                        rr = rr.with_floor(-0.1)
                     reward_results.append(rr)
 
                 # Validate: reward_results must match completions length after batch expansion

@@ -668,13 +668,27 @@ class PromptContext:
         return str(self.prompt_id)
 
 
-@dataclass
+@dataclass(frozen=True)
 class RewardResult:
     """Output of a reward function evaluation.
+
+    FROZEN: instances cannot be mutated after construction. This prevents the
+    "mutate for one consumer, break another" bug class where the trainer modifies
+    reward/scores for one purpose (e.g., min_completion_tokens floor) and downstream
+    consumers (display, mastery tracking, JSONL logging) see the corrupted values.
+
+    Use with_floor() to create a penalized copy when the trainer needs to override.
 
     The reward_fn scores completions and returns per-quality scores.
     The engine uses .scores to compute per-step advantages and manage phase gating.
     Phase is engine-managed via GameState. reward_fn should NOT set phase.
+
+    Contract:
+    - scores keys MUST match quality names in step_qualities config
+    - scored_spans char offsets are into the RAW completion text from vLLM decode
+    - Score range: 0.0 = completely wrong, 1.0 = completely right
+    - Overlapping spans are allowed (engine handles overlap normalization)
+    - First occurrence per quality gets positive advantage, repeats get penalty
     """
 
     reward: float
@@ -685,6 +699,20 @@ class RewardResult:
     # Character offsets into the completion text. When populated, the engine
     # uses these for per-token advantage assignment instead of the segmenter.
     # Reward functions that don't populate this field get the legacy segmenter path.
+
+    def with_floor(self, reward: float) -> RewardResult:
+        """Return a new RewardResult with floored reward and zeroed scores.
+
+        Used by the trainer's min_completion_tokens guard to penalize empty/short
+        completions without mutating the original reward function output.
+        The original instance is preserved for display and JSONL logging.
+        """
+        return RewardResult(
+            reward=reward,
+            scores=dict.fromkeys(self.scores, 0.0),
+            phase=self.phase,
+            scored_spans=self.scored_spans,
+        )
 
 
 @dataclass
