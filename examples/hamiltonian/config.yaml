@@ -96,6 +96,7 @@ training:
   warmup_steps: 10
   lr_scheduler: cosine
   save_freq: 50
+  kv_cache_flush_freq: 0  # Disabled — MERGE strategy shares memory, no VRAM leak
   gradient_accumulation_steps: 1
   mastery_threshold: 0.8
   stagnation_timeout: 50
