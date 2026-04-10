@@ -3121,10 +3121,13 @@ class QGRETrainer:
                             "weight_bus.restore_for_training failed in finally block. "
                             "Model may be in merged state — halting to prevent LoRA corruption."
                         )
-                        # This is a hard-fail: if unmerge broke, the next backward pass
-                        # will compute gradients against merged base weights, corrupting
-                        # the adapter permanently. Better to crash loudly than silently diverge.
                         raise
+                    # MERGE strategy creates temporary fp32 tensors during merge/unmerge
+                    # (dequantize → add LoRA → requantize via Params4bit). The CUDA allocator
+                    # holds the freed blocks as reserved memory, causing a slow VRAM leak
+                    # (~7 MiB/min). Flushing after each cycle prevents accumulation.
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
                     # Don't sync to vLLM here — step-end sync (after training) handles it.
                     # If restore itself raises on the happy path (e.g. CUDA OOM mid-copy),
@@ -3473,6 +3476,9 @@ class QGRETrainer:
                 # Skip if generation failed — stale weights shouldn't be synced
                 if backend.weight_loader is not None and generation_succeeded:
                     self._sync_weights_guarded(weight_bus, backend, reason="post-optimizer-step")
+                    # Flush CUDA cache after MERGE sync to prevent fragmentation buildup
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
                 # 7. Periodic vLLM KV cache flush to prevent VRAM leak (unsloth #3864)
                 flush_freq = self.config.training.kv_cache_flush_freq
