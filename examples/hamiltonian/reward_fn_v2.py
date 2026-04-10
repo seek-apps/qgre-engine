@@ -118,7 +118,7 @@ def _try_parse(expr_str: str) -> sp.Basic | None:
     try:
         with sympy_timeout(2):
             return sp.sympify(cleaned, locals=_SYMBOL_MAP)
-    except Exception:
+    except (SympyTimeoutError, sp.SympifyError, ValueError, TypeError, SyntaxError):
         return None
 
 
@@ -128,7 +128,7 @@ def _expressions_equivalent(student: sp.Basic, teacher: sp.Basic) -> bool:
         with sympy_timeout(3):
             diff = sp.simplify(student - teacher)
             return diff == 0 or sp.simplify(diff) == 0
-    except Exception:
+    except (SympyTimeoutError, sp.SympifyError, ValueError, TypeError):
         return False
 
 
@@ -240,6 +240,7 @@ def _find_correct_derivative(
     """
     teacher = _try_parse(ground_truth_str)
     if teacher is None:
+        logger.warning(f"Cannot parse derivative ground truth: {ground_truth_str}")
         return 0.0, []
 
     # Patterns that indicate a derivative of the right variable
@@ -332,7 +333,7 @@ def _score_consistency(
                 return 1.0
             if dqdt_ok or dpdt_ok:
                 return 0.5
-    except Exception:
+    except (SympyTimeoutError, sp.SympifyError, ValueError, TypeError):
         pass
     return 0.0
 
