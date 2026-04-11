@@ -205,8 +205,12 @@ class QGREDataLoader:
                 continue  # Filter overlong
 
             metadata = {col: row.get(col) for col in self.metadata_columns}
+            # Include system prompt in hash to distinguish prompts with different system contexts
+            hash_input = text
+            if self.system_prompt_column and row.get(self.system_prompt_column):
+                hash_input = row[self.system_prompt_column] + "\n" + text
             prompt_id = int.from_bytes(
-                hashlib.sha256(text.encode()).digest()[:8],
+                hashlib.sha256(hash_input.encode()).digest()[:8],
                 "big",
             )
             items.append(
