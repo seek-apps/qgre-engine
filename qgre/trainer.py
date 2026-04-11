@@ -1348,9 +1348,9 @@ class QGRETrainer:
             # Generation-time logprobs are shifted: gen_logprobs[t] = log P(token[t] | token[<t]),
             # so they align with mb_lp which is logprobs_from_logits(logits[:, :-1], ids[:, 1:]).
             if gen_logprobs_padded is not None:
-                mb_gen_lp = gen_logprobs_padded[
-                    mb_start:mb_end, 1:
-                ]  # Shift to match mb_lp indexing
+                # gen_logprobs_padded is already shifted by 1 at line 982.
+                # Do NOT shift again here — just slice the micro-batch.
+                mb_gen_lp = gen_logprobs_padded[mb_start:mb_end]
                 min_lp_len = min(mb_lp.shape[1], mb_gen_lp.shape[1])
                 mb_old_lp = mb_gen_lp[:, :min_lp_len]
                 # L5: Use -100 instead of -1e9 to prevent exp(inf) in KL computation

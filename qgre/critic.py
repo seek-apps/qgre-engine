@@ -226,12 +226,21 @@ class VPRMCritic(nn.Module):
             - critic_losses: quality_name → MSE loss tensor (for backward)
         """
         # Pool regions ONCE, then run both head sets against the same pools
-        step_ids_present = sorted({int(r.split("_")[1]) for r in regions if r.startswith("STEP_")})
-        # C01-DEVICE: Use ctx.device for tensor creation
-        region_ids = torch.tensor(
-            [int(r.split("_")[1]) if r.startswith("STEP_") else -1 for r in regions],
-            device=ctx.device,
+        # Same defensive parsing as forward() — user-provided segmenters may produce malformed labels
+        step_ids_present = sorted(
+            {int(r.split("_")[1]) for r in regions if r.startswith("STEP_") and "_" in r}
         )
+        # C01-DEVICE: Use ctx.device for tensor creation
+        region_ids_list = []
+        for r in regions:
+            if r.startswith("STEP_") and "_" in r:
+                try:
+                    region_ids_list.append(int(r.split("_")[1]))
+                except (ValueError, IndexError):
+                    region_ids_list.append(-1)
+            else:
+                region_ids_list.append(-1)
+        region_ids = torch.tensor(region_ids_list, device=ctx.device)
         region_pools: dict[str, torch.Tensor] = {}
         for step_id in step_ids_present:
             mask = (region_ids == step_id).float()

@@ -105,6 +105,14 @@ class QGREDataLoader:
                         f"Available columns: {list(row.keys())}. "
                         "Update metadata_columns in config or add missing columns to training data.",
                     )
+        # Validate system_prompt_column exists when configured
+        if self.system_prompt_column and prompts:
+            if self.system_prompt_column not in prompts[0]:
+                raise ValueError(
+                    f"system_prompt_column '{self.system_prompt_column}' not found in data. "
+                    f"Available columns: {list(prompts[0].keys())}. "
+                    "Set system_prompt_column to null or add the column to training data.",
+                )
         items = []
         for row in prompts:
             text = row[self.prompt_column]
