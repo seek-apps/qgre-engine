@@ -579,7 +579,7 @@ Test coverage spans every module: advantages, attention constraints, checkpoint 
 
 The Hamiltonian reward function (`examples/hamiltonian/reward_fn_v2.py`) demonstrates the design principle: correctness-only scoring.
 
-**No format scoring.** RL teaches WHAT (mathematical correctness). SFT teaches HOW (formatting). Format scoring is the primary reward hacking vector — the model learns to produce well-formatted wrong answers. This is documented in arXiv:2602.18037.
+**No format scoring.** RL teaches WHAT (mathematical correctness). SFT teaches HOW (formatting). Format scoring is the primary reward hacking vector — the model learns to produce well-formatted wrong answers ([arXiv:2602.18037](https://arxiv.org/abs/2602.18037)).
 
 The reward function:
 
