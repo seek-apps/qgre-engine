@@ -35,6 +35,7 @@ from qgre.nemo_extracted.loss_functions import ClippedPGLossFn
 from qgre.segments import Segmenter, uniform_segmenter
 from qgre.sync_state import SyncState
 from qgre.types import (
+    AlignedLossFrame,
     GameState,
     RewardResult,
     SampleData,
@@ -973,25 +974,21 @@ class QGRETrainer:
         else:
             kl_region_weights = None
 
-        # Response mask
+        # AlignedLossFrame: centralize ALL Level 1 shifts in one place.
+        # L1 shift ([:, 1:]) aligns from token space to next-token-prediction space.
+        # Shape validation happens inside build() — catches misalignment at construction.
         prompt_lengths = [0] * step.comp_tensor.shape[0]
-        response_mask = self.compute_response_mask(step.comp_tensor, prompt_lengths)[:, 1:]
-        # LLDS shift: Align advantages and logprobs with response mask (all skip first position)
-        padded_advs = step.padded_advs[:, 1:]
-        if gen_logprobs_padded is not None:
-            gen_logprobs_padded = gen_logprobs_padded[:, 1:]
+        raw_response_mask = self.compute_response_mask(step.comp_tensor, prompt_lengths)
+        aligned_frame = AlignedLossFrame.build(
+            response_mask=raw_response_mask,
+            padded_advs=step.padded_advs,
+            gen_logprobs_padded=gen_logprobs_padded,
+            kl_region_weights=kl_region_weights,
+        )
 
-        if response_mask.sum() == 0:
+        if aligned_frame.response_mask.sum() == 0:
             raise RuntimeError(
                 f"Step {self.global_step}: no response tokens in any completion — cannot compute loss.",
-            )
-
-        # TL-R2-06: Verify alignment between response_mask and advantages
-        if response_mask.shape != padded_advs.shape:
-            raise RuntimeError(
-                f"TL-R2-06: Response mask shape mismatch with advantages. "
-                f"response_mask.shape={response_mask.shape} vs padded_advs.shape={padded_advs.shape}. "
-                "Check LLDS shift logic.",
             )
 
         # Micro-batched forward + backward — avoids OOM on logits tensor
@@ -1013,8 +1010,8 @@ class QGRETrainer:
             mb_end = min(mb_start + micro_batch_size, actual_batch)
             mb_ids = step.comp_tensor[mb_start:mb_end]
             mb_attn_mask = step.comp_attention_mask[mb_start:mb_end]
-            mb_advs = padded_advs[mb_start:mb_end]
-            mb_mask = response_mask[mb_start:mb_end]
+            # L1-level view for EGRS mutation (before L2 shift in slice_for_microbatch)
+            mb_advs = aligned_frame.advantages[mb_start:mb_end]
             mb_hidden_states = None  # Set by fused/non-fused path when VPRM enabled
 
             # Ensure Unsloth training mode before EACH forward pass (not just at init).
@@ -1344,13 +1341,10 @@ class QGRETrainer:
                 mb_lp = logprobs_from_logits(mb_logits, mb_ids[:, 1:])
                 del mb_logits
 
-            # old_logprobs: generation-time logprobs for LLDS, or detached current logprobs as fallback.
-            # Generation-time logprobs are shifted: gen_logprobs[t] = log P(token[t] | token[<t]),
-            # so they align with mb_lp which is logprobs_from_logits(logits[:, :-1], ids[:, 1:]).
-            if gen_logprobs_padded is not None:
-                # gen_logprobs_padded is already shifted by 1 at line 982.
-                # Do NOT shift again here — just slice the micro-batch.
-                mb_gen_lp = gen_logprobs_padded[mb_start:mb_end]
+            # old_logprobs: generation-time logprobs for LLDS, or detached current logprobs.
+            # gen_logprobs is L1-shifted in aligned_frame (same coordinate as mb_lp).
+            if aligned_frame.gen_logprobs is not None:
+                mb_gen_lp = aligned_frame.gen_logprobs[mb_start:mb_end]
                 min_lp_len = min(mb_lp.shape[1], mb_gen_lp.shape[1])
                 mb_old_lp = mb_gen_lp[:, :min_lp_len]
                 # L5: Use -100 instead of -1e9 to prevent exp(inf) in KL computation
@@ -1561,30 +1555,23 @@ class QGRETrainer:
                                     current_step=self.global_step,
                                 )
 
-            # Align advantages + KL weights with logprob positions:
-            # mb_lp[t] = log P(token t+1 | tokens 0..t), so it needs advantage[t+1]
-            # Shift advantages and KL weights by 1 to match logprob indexing
-            mb_advs_shifted = mb_advs[:, 1:]  # advantage for token being predicted
-            # kl_region_weights already reindexed by SPO filter if applied
-            mb_kl_shifted = (
-                kl_region_weights[mb_start:mb_end, 1:] if kl_region_weights is not None else None
-            )
-            min_len = min(
-                mb_lp.shape[1], mb_old_lp.shape[1], mb_advs_shifted.shape[1], mb_mask.shape[1]
-            )
-            mb_kl_weights = mb_kl_shifted[:, :min_len] if mb_kl_shifted is not None else None
+            # AlignedLossFrame L2 shift: advantages[t+1] pairs with logprob[t].
+            # EGRS mutation of mb_advs happened above; slice_for_microbatch reads the mutated values.
+            mb_frame = aligned_frame.slice_for_microbatch(mb_start, mb_end)
+            loss_len = mb_frame.loss_len
+
             # Request per-token loss when computing per-quality metrics.
             # Coerce to bool — `use_spans and batch_token_masks` returns
             # the list itself on the truthy path, which is a latent type bug
             # the loss_fn signature doesn't accept.
             need_per_token = bool(use_spans and batch_token_masks)
             loss_result = self.loss_fn(
-                curr_logprobs=mb_lp[:, :min_len],
-                prev_logprobs=mb_old_lp[:, :min_len],
-                advantages=mb_advs_shifted[:, :min_len],
-                mask=mb_mask[:, :min_len].float(),
-                reference_logprobs=mb_old_lp[:, :min_len],
-                kl_region_weights=mb_kl_weights,
+                curr_logprobs=mb_lp[:, :loss_len],
+                prev_logprobs=mb_old_lp[:, :loss_len],
+                advantages=mb_frame.advantages,
+                mask=mb_frame.mask.float(),
+                reference_logprobs=mb_old_lp[:, :loss_len],
+                kl_region_weights=mb_frame.kl_weights,
                 return_per_token_loss=need_per_token,
             )
             if need_per_token:
@@ -1598,7 +1585,7 @@ class QGRETrainer:
             # direction (increases prob of sampled tokens instead of spreading mass).
             # See NeMo RL docs: "not recommended for direct backpropagation."
             with torch.no_grad():
-                neg_logprob_mean = -masked_mean(mb_lp[:, :min_len], mb_mask[:, :min_len].float())
+                neg_logprob_mean = -masked_mean(mb_lp[:, :loss_len], mb_frame.mask.float())
                 mb_metrics["neg_logprob_mean"] = neg_logprob_mean.item()
 
             # Per-quality loss computation (when using span-based advantages)
@@ -1621,13 +1608,13 @@ class QGRETrainer:
                                 # Loss is computed for positions predicting tokens [1..seq_len-1]
                                 # So q_mask[i] contributes to loss position i-1; we need q_mask[1:]
                                 q_mask_shifted = q_mask[1:]  # Always shift by 1
-                                # Align to min_len: truncate if longer (batch has longer samples),
+                                # Align to loss_len: truncate if longer (batch has longer samples),
                                 # pad with zeros if shorter (this sample is shorter than the batch max).
                                 # Padding positions contribute zero loss because they're masked out.
-                                if q_mask_shifted.shape[0] >= min_len:
-                                    q_mask_shifted = q_mask_shifted[:min_len]
+                                if q_mask_shifted.shape[0] >= loss_len:
+                                    q_mask_shifted = q_mask_shifted[:loss_len]
                                 else:
-                                    pad_len = min_len - q_mask_shifted.shape[0]
+                                    pad_len = loss_len - q_mask_shifted.shape[0]
                                     q_mask_shifted = torch.cat(
                                         [
                                             q_mask_shifted,
@@ -1639,9 +1626,9 @@ class QGRETrainer:
                                 q_mask_shifted = q_mask_shifted.to(mb_per_token_loss.device)
                                 # Sum actual per-token loss contribution for this quality's span
                                 q_loss = (
-                                    mb_per_token_loss[mb_i_inner] * q_mask_shifted[:min_len]
+                                    mb_per_token_loss[mb_i_inner] * q_mask_shifted[:loss_len]
                                 ).sum()
-                                q_count = q_mask_shifted[:min_len].sum()
+                                q_count = q_mask_shifted[:loss_len].sum()
                                 if q_count > 0:
                                     # Accumulate sum and count separately for proper averaging later
                                     loss_key = f"loss/{q_name}"
@@ -1664,7 +1651,7 @@ class QGRETrainer:
                 )
                 if group_correctness > lp_thresh:
                     # High correctness → add length penalty to encourage efficiency
-                    seq_lengths = mb_mask[:, :min_len].sum(dim=-1)
+                    seq_lengths = mb_frame.mask.sum(dim=-1)
                     mean_len = seq_lengths.mean()
                     length_penalty = lp_coef * (seq_lengths / max(mean_len, 1.0)).mean()
                     mb_loss = mb_loss + length_penalty
@@ -1676,15 +1663,15 @@ class QGRETrainer:
             llds_coef = self.config.algorithm.llds_coef
             if llds_coef > 0 and self._has_stored_logprobs:
                 llds_loss, llds_mask = compute_llds_loss(
-                    log_prob=mb_lp[:, :min_len],
-                    old_log_prob=mb_old_lp[:, :min_len],
-                    advantages=mb_advs_shifted[:, :min_len],
-                    response_mask=mb_mask[:, :min_len].float(),
+                    log_prob=mb_lp[:, :loss_len],
+                    old_log_prob=mb_old_lp[:, :loss_len],
+                    advantages=mb_frame.advantages,
+                    response_mask=mb_frame.mask.float(),
                 )
                 mb_loss = mb_loss + llds_coef * llds_loss
                 mb_metrics["llds_loss"] = llds_loss.item()
                 mb_metrics["llds_mask_ratio"] = llds_mask.sum().item() / max(
-                    mb_mask[:, :min_len].sum().item(), 1
+                    mb_frame.mask.sum().item(), 1
                 )
 
             # VPRM critic loss: weight by sample count and add to policy loss
@@ -1704,23 +1691,13 @@ class QGRETrainer:
                 and mb_entropy_adjustments is not None
                 and mb_token_entropy is not None
             ):
-                # Align with shifted positions (entropy_adjustments[t] applies to token t)
+                # Align with shifted positions (L2 shift for logprob coordinate)
                 adj_shifted = mb_entropy_adjustments[:, 1:]
                 ent_shifted = mb_token_entropy[:, 1:]
-                adj_min_len = min(adj_shifted.shape[1], ent_shifted.shape[1], min_len)
-                # MTO-003: Validate entropy_adjustments and mask have same sequence length
-                if adj_shifted.shape[1] != mb_mask.shape[1]:
-                    import warnings
-
-                    warnings.warn(
-                        f"MTO-003: EGRS entropy_adjustments shape[1]={adj_shifted.shape[1]} != "
-                        f"mb_mask shape[1]={mb_mask.shape[1]}. Misalignment may apply loss to wrong positions.",
-                        stacklevel=2,
-                    )
-                # Mask to completion tokens only
-                egrs_mask = mb_mask[:, :adj_min_len].float()
-                egrs_adj = adj_shifted[:, :adj_min_len]
-                egrs_ent = ent_shifted[:, :adj_min_len]
+                egrs_len = min(adj_shifted.shape[1], ent_shifted.shape[1], loss_len)
+                egrs_mask = mb_frame.mask[:, :egrs_len].float()
+                egrs_adj = adj_shifted[:, :egrs_len]
+                egrs_ent = ent_shifted[:, :egrs_len]
                 # Sum over tokens with positive adjustment (Q3 only), normalized by token count
                 egrs_token_count = egrs_mask.sum().clamp(min=1.0)
                 egrs_loss = -(egrs_adj * egrs_ent * egrs_mask).sum() / egrs_token_count

@@ -899,6 +899,109 @@ class TrainingStep:
         return filtered_idx
 
 
+# ─── Aligned tensor frames for loss computation ──────────────────────────────
+
+
+@dataclass
+class MicrobatchFrame:
+    """Microbatch tensors aligned to loss_len, ready for loss_fn.
+
+    All tensor seq dimensions equal loss_len. Logprob tensors (mb_lp,
+    mb_old_lp) must be truncated to [:, :loss_len] by the caller.
+    """
+
+    mask: torch.Tensor  # [mb, loss_len]
+    advantages: torch.Tensor  # [mb, loss_len]
+    kl_weights: torch.Tensor | None  # [mb, loss_len]
+    loss_len: int
+
+
+@dataclass
+class AlignedLossFrame:
+    """Pre-shifted tensors in Level-1 coordinate space.
+
+    Level 1 shift (applied at build()): skip position 0. All tensors
+    have shape [batch, L1_len] where L1_len = max_comp_len - 1.
+
+    Level 2 shift (applied at slice_for_microbatch): logprob[t] predicts
+    token[t+1], so advantage[t+1] pairs with logprob[t]. Applied to
+    advantages and kl_weights only; mask is truncated, not shifted.
+
+    Usage::
+
+        frame = AlignedLossFrame.build(response_mask, advs, gen_lp, kl_w)
+        # In microbatch loop:
+        mb_advs_l1 = frame.advantages[mb_start:mb_end]  # for EGRS mutation
+        # ... EGRS mutates mb_advs_l1 in-place ...
+        mb = frame.slice_for_microbatch(mb_start, mb_end)  # L2 shift
+        loss = loss_fn(lp[:, : mb.loss_len], advantages=mb.advantages, mask=mb.mask)
+    """
+
+    response_mask: torch.Tensor  # [batch, L1_len]
+    advantages: torch.Tensor  # [batch, L1_len]
+    gen_logprobs: torch.Tensor | None  # [batch, L1_len]
+    kl_weights: torch.Tensor | None  # [batch, L1_len]
+
+    @staticmethod
+    def build(
+        response_mask: torch.Tensor,
+        padded_advs: torch.Tensor,
+        gen_logprobs_padded: torch.Tensor | None,
+        kl_region_weights: torch.Tensor | None,
+    ) -> AlignedLossFrame:
+        """Apply Level 1 shift to all tensors and validate shape alignment.
+
+        All inputs are in raw token space [batch, max_comp_len].
+        All outputs are in L1 space [batch, max_comp_len - 1].
+        """
+        mask = response_mask[:, 1:]
+        advs = padded_advs[:, 1:]
+        gen_lp = gen_logprobs_padded[:, 1:] if gen_logprobs_padded is not None else None
+        kl_w = kl_region_weights[:, 1:] if kl_region_weights is not None else None
+
+        if advs.shape != mask.shape:
+            raise RuntimeError(
+                f"AlignedLossFrame: shape mismatch after L1 shift: "
+                f"advantages={advs.shape} vs response_mask={mask.shape}"
+            )
+        if gen_lp is not None and gen_lp.shape != mask.shape:
+            raise RuntimeError(
+                f"AlignedLossFrame: gen_logprobs shape {gen_lp.shape} != "
+                f"response_mask shape {mask.shape}"
+            )
+        if kl_w is not None and kl_w.shape != mask.shape:
+            raise RuntimeError(
+                f"AlignedLossFrame: kl_weights shape {kl_w.shape} != "
+                f"response_mask shape {mask.shape}"
+            )
+
+        return AlignedLossFrame(
+            response_mask=mask,
+            advantages=advs,
+            gen_logprobs=gen_lp,
+            kl_weights=kl_w,
+        )
+
+    def slice_for_microbatch(self, start: int, end: int) -> MicrobatchFrame:
+        """Slice batch dimension and apply Level 2 shift.
+
+        Level 2: advantages[t+1] pairs with logprob[t], so shift
+        advantages and kl_weights by [:, 1:]. Mask is truncated
+        (not shifted) to match the resulting loss_len.
+        """
+        mb_advs = self.advantages[start:end, 1:]
+        mb_kl = self.kl_weights[start:end, 1:] if self.kl_weights is not None else None
+        loss_len = mb_advs.shape[1]
+        mb_mask = self.response_mask[start:end, :loss_len]
+
+        return MicrobatchFrame(
+            mask=mb_mask,
+            advantages=mb_advs,
+            kl_weights=mb_kl,
+            loss_len=loss_len,
+        )
+
+
 @dataclass
 class SkillNode:
     """A node in the tutorial skill dependency DAG."""
