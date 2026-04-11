@@ -29,6 +29,21 @@ Typical reward per step: 0.667-0.833. VRAM: 11 GB steady, zero growth over 3000+
 
 The model started from zero. No SFT warmup. No Hamiltonian mechanics in pretraining. Phase-gated curriculum with a skill tree — freefall first, then spring, then compound systems, then boss problems (driven oscillator). The model learned what a Hamiltonian is through reinforcement alone.
 
+Here is what the model produces (step 3026, perfect score):
+
+```
+COORDINATES: q = y
+MOMENTUM: p = m dy/dt = 4.0 dy/dt
+KINETIC: T = p²/8
+POTENTIAL: V = 39.2 y
+HAMILTONIAN: H = p²/8 + 39.2 y
+EQUATIONS:
+  dq/dt = ∂H/∂p = p/4
+  dp/dt = -∂H/∂q = -39.2
+```
+
+All six qualities verified: T matches `p²/(2m)` with m=4, V matches `mgy`, H = T + V, dq/dt = ∂H/∂p, dp/dt = -∂H/∂q, and the model's own equations are consistent with its own Hamiltonian. Checked by sympy, not regex.
+
 ## Why This Exists
 
 Existing RL engines assume a specific deployment topology. verl requires 4-8 A100s and Ray. TRL requires a group of 8 completions per prompt. OpenRLHF requires a separate critic model. All three apply a single scalar reward uniformly across every token in the completion.
@@ -696,15 +711,53 @@ The project enforces strict linting via Ruff with 50+ rule sets enabled, Pyright
 
 ## References
 
-- **GRPO**: Shao et al., "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models" (2024)
-- **Dr.GRPO**: Liu et al., "Understanding R1-Zero-Like Training: A Critical Analysis of GRPO and Related Methods" (arXiv:2503.20783)
-- **LoRA-Pro**: Wang et al., "LoRA-Pro: Are Low-Rank Adapters Properly Optimized?" (ICLR 2025, arXiv:2407.18242)
-- **NoisyGRPO**: "Noise Injection Reveals Hidden Capabilities of Language Models" (NeurIPS 2025)
-- **ERPO**: Entropy-Regulated Policy Optimization for language model alignment
-- **math-verify**: HuggingFace Math-Verify library for expression parsing and equivalence verification
-- **NeMo RL**: NVIDIA NeMo RL v0.5.0 (Apache-2.0) — ClippedPGLossFn, KL divergence, LLDS, selective_log_softmax
-- **Gradient regularization**: arXiv:2602.18037 — format scoring as reward hacking vector
-- **GRPO-lambda**: GRPO with eligibility traces (ICLR 2026)
+### Core algorithms
+- **GRPO**: Shao et al., [DeepSeekMath: Pushing the Limits of Mathematical Reasoning](https://arxiv.org/abs/2402.03300) (2024). The group-relative baseline that QGRE's SPO extends to n=1.
+- **Dr.GRPO**: Liu et al., [Understanding R1-Zero-Like Training](https://arxiv.org/abs/2503.20783) (2025). Unbiased GRPO — removes length and std normalization.
+- **SPO**: [Single-stream Policy Optimization](https://arxiv.org/abs/2509.13232). Tencent, ICLR 2026. Persistent EMA baseline, n=1 completions.
+- **GDPO**: [Group Decomposed Policy Optimization](https://arxiv.org/abs/2601.05242). NVIDIA, Jan 2026. Per-step advantage normalization.
+- **VPRMs**: [Verifiable Process Rewards](https://arxiv.org/abs/2601.17223). IBM Research, Jan 2026. Per-region credit assignment.
+
+### Loss and regularization
+- **Comedy of Estimators**: Bengio et al., [KL Regularization in RL Training](https://arxiv.org/abs/2512.21852). ICLR 2026. k1/k2/k3 KL estimator selection.
+- **Archer**: [Dual-Token KL Constraints](https://openreview.net/forum?id=ee326398473daf76d49b49cda4dea9d699fbf61b). ICLR 2026. Region-specific KL (THINK vs FORMAT vs STEP).
+- **LLDS**: [Lazy Likelihood Displacement](https://arxiv.org/abs/2512.04220). UBC/Vector Institute, Dec 2025. Collapse prevention.
+- **DAPO**: [Decoupled Clip and Dynamic Sampling](https://arxiv.org/abs/2503.14476). ByteDance, 2025. Asymmetric dual clipping.
+
+### Exploration and curriculum
+- **NoisyGRPO**: [Noise Injection for RL Exploration](https://openreview.net/forum?id=rH0aOLyjYQ). NeurIPS 2025. LoRA dropout basis.
+- **Scaf-GRPO**: [Scaffolded Progressive Training](https://arxiv.org/abs/2510.19807). Feb 2026. Guidance exemption period principle.
+
+### LoRA and model adaptation
+- **LoRA-Pro**: Wang et al., [Are Low-Rank Adapters Properly Optimized?](https://arxiv.org/abs/2407.18242) ICLR 2025. Sylvester equation for LoRA gradient adjustment.
+- **Unsloth**: [unslothai/unsloth](https://github.com/unslothai/unsloth). Fast LoRA training with vLLM colocation.
+
+### Infrastructure
+- **NeMo RL**: [NVIDIA NeMo RL](https://github.com/NVIDIA/NeMo-RL) v0.5.0 (Apache-2.0). ClippedPGLossFn, KL divergence, LLDS, selective_log_softmax.
+- **math-verify**: [HuggingFace Math-Verify](https://github.com/huggingface/Math-Verify). Battle-tested expression parsing and equivalence verification.
+- **selective_log_softmax**: Romero, [TRL PR #2799](https://github.com/huggingface/trl/pull/2799). 37,000x memory reduction per position.
+
+---
+
+## Contributing
+
+QGRE is open source. Contributions are welcome.
+
+**Good first contributions:**
+- New reward functions for new domains (chemistry, code generation, legal reasoning)
+- New segmenters for different output formats
+- MLX backend for Mac training (same algorithm layer, different tensor ops)
+- Triton backward kernel (replace chunked PyTorch backward with tiled Triton)
+- Dashboard for live training visualization (the metrics are all in MLflow)
+
+**Before contributing:**
+1. Run `bash scripts/setup-dev.sh` to install pre-commit hooks (ruff, pyright, bandit)
+2. Run `pytest tests/ -q` to confirm all tests pass
+3. New features need tests. New reward functions need at least 5 test cases with known ground truth.
+
+**The design philosophy:** every module has one job. The engine composes them. If your contribution requires modifying 5 files, the abstraction boundary is probably wrong. Read the existing code first — the patterns are consistent.
+
+File an issue or open a PR at [github.com/torad-labs/qgre-engine](https://github.com/torad-labs/qgre-engine).
 
 ---
 
@@ -713,3 +766,7 @@ The project enforces strict linting via Ruff with 50+ rule sets enabled, Pyright
 Apache-2.0. See [LICENSE](LICENSE).
 
 `qgre/nemo_extracted/` contains code from NVIDIA NeMo RL (Apache-2.0), modified for single-GPU single-process operation.
+
+---
+
+Built by [Torad Labs](https://torad.ai).
